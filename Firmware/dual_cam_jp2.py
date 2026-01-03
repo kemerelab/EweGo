@@ -14,106 +14,6 @@ from datetime import datetime
 import shutil
 import subprocess
 
-# --- Optional PiOLED / SSD1306 support --------------------------------------
-
-try:
-    import board
-    import busio
-    import adafruit_ssd1306
-    from PIL import Image, ImageDraw, ImageFont
-    HAS_OLED_LIBS = True
-except ImportError:
-    HAS_OLED_LIBS = False
-
-
-def get_ip_address(interface="wlan0"):
-    """Return IPv4 address for the given interface or a short error string."""
-    try:
-        # Use `ip` command to query interface
-        output = subprocess.check_output(
-            ["ip", "-4", "addr", "show", interface],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        for line in output.splitlines():
-            line = line.strip()
-            if line.startswith("inet "):
-                # inet 192.168.1.10/24 ...
-                return line.split()[1].split("/")[0]
-    except Exception:
-        pass
-    return "no ip"
-
-
-def get_disk_free(path="/"):
-    """Return free disk space in GB as a short string."""
-    try:
-        du = shutil.disk_usage(path)
-        free_gb = du.free / (1024 ** 3)
-        return f"{free_gb:4.1f}G free"
-    except Exception:
-        return "disk ?"
-
-
-class DebugDisplay:
-    """Wrapper for an Adafruit PiOLED (SSD1306 128x32) debug display."""
-
-    def __init__(self):
-        self.enabled = False
-        self.display = None
-
-        if not HAS_OLED_LIBS:
-            print("PiOLED: libraries not available, skipping OLED init.")
-            return
-
-        try:
-            # Initialize I2C and display (default address 0x3C)
-            i2c = busio.I2C(board.SCL, board.SDA)
-            self.display = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
-            self.width = self.display.width
-            self.height = self.display.height
-
-            # Clear display
-            self.display.fill(0)
-            self.display.show()
-
-            # Create image buffer
-            self.image = Image.new("1", (self.width, self.height))
-            self.draw = ImageDraw.Draw(self.image)
-            # self.font = ImageFont.load_default()
-            self.font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 8)
-
-            self.enabled = True
-            print("PiOLED: display detected and initialized.")
-        except Exception as e:
-            print(f"PiOLED: not detected or failed to init ({e}), continuing without OLED.")
-            self.display = None
-            self.enabled = False
-
-    def show_lines(self, lines):
-        """Show up to 4 lines of text on the display."""
-        if not self.enabled or self.display is None:
-            return
-
-        # Clear image
-        self.draw.rectangle((0, 0, self.width, self.height), outline=0, fill=0)
-
-        # Draw each line (8px per line for 128x32 display)
-        for i, text in enumerate(lines[:4]):
-            y = i * 8 - 1
-            self.draw.text((0, y), text, font=self.font, fill=255)
-
-        # Push image to display
-        self.display.image(self.image)
-        self.display.show()
-
-    def show_message(self, message):
-        """Convenience: show a single message (wrapped into multiple lines)."""
-        if not self.enabled:
-            return
-        lines = message.split("\n")
-        self.show_lines(lines)
-
 
 # --- Camera / Recording code ------------------------------------------------
 
@@ -196,9 +96,6 @@ class MinimalRecorder:
         self.dir = Path(f"recordings/{self.session}")
         self.dir.mkdir(parents=True, exist_ok=True)
 
-        # Optional debug display
-        self.debug_display = DebugDisplay()
-
     def start(self):
         """Initialize and start recording"""
         print("Initializing cameras...")
@@ -206,18 +103,18 @@ class MinimalRecorder:
         # Camera 1
         self.cam1 = Picamera2(0)
         config1 = self.cam1.create_video_configuration(
-            main={"size": (2592, 1944), "format": "RGB888"},
-            controls={"FrameRate": 15},
-            buffer_count=8
+            main={"size": (1920, 1080), "format": "RGB888"},
+            controls={"FrameRate": 30},
+            buffer_count=16
         )
         self.cam1.configure(config1)
 
         # Camera 2
         self.cam2 = Picamera2(1)
         config2 = self.cam2.create_video_configuration(
-            main={"size": (2592, 1944), "format": "RGB888"},
-            controls={"FrameRate": 15},
-            buffer_count=8
+            main={"size": (1920, 1080), "format": "RGB888"},
+            controls={"FrameRate": 30},
+            buffer_count=16
         )
         self.cam2.configure(config2)
 
@@ -255,24 +152,13 @@ class MinimalRecorder:
         print(f"Format: Raw binary float64 (8 bytes per timestamp)")
         print(f"Expected interval: 33.33ms @ 30fps\n")
 
-        # Initial OLED message, if available
-        if self.debug_display.enabled:
-            ip = get_ip_address("wlan0")
-            disk = get_disk_free("/")
-            self.debug_display.show_lines([
-                f"IP: {ip}",
-                disk,
-                "C0 0f 0.0ms",
-                "C1 0f 0.0ms",
-            ])
-
         # Start stats thread
         threading.Thread(target=self.print_stats, daemon=True).start()
 
     def print_stats(self):
         """Print statistics every second and update OLED if present."""
         while self.running:
-            time.sleep(1)
+            time.sleep(10)
 
             stats1 = self.out1.get_stats()
             stats2 = self.out2.get_stats()
@@ -293,23 +179,6 @@ class MinimalRecorder:
 
                 print()
 
-            # Update OLED with compact info if available
-            if self.debug_display.enabled:
-                ip = get_ip_address("wlan0")
-                disk = get_disk_free("/")
-
-                # Use frame count and max interval directly from outputs
-                frames0 = self.out1.count
-                max0 = self.out1.interval_max if self.out1.intervals else 0.0
-                frames1 = self.out2.count
-                max1 = self.out2.interval_max if self.out2.intervals else 0.0
-
-                line1 = f"IP: {ip}"
-                line2 = disk
-                line3 = f"C0{frames0:9d}f  {max0:3.1f}ms"
-                line4 = f"C1{frames1:9d}f  {max1:3.1f}ms"
-
-                self.debug_display.show_lines([line1, line2, line3, line4])
 
     def stop(self):
         """Stop recording"""
@@ -318,10 +187,6 @@ class MinimalRecorder:
 
         print("\nStopping...")
         self.running = False
-
-        # Optional OLED message
-        if self.debug_display.enabled:
-            self.debug_display.show_message("Stopping...\n")
 
         # Stop recording
         self.cam1.stop_recording()

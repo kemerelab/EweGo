@@ -13,9 +13,10 @@ def raw_diag():
         # Step 1: Force the sensor's UART out of a "hung" state
         # We send a long string of nulls and then a reset command
         print("Attempting to force-clear the bus...")
-        ser.write(b'\x00\x00\x00\x00\x00') 
-        time.sleep(0.1)
+        ser.write(b'\x00' * 10) 
+        time.sleep(0.5)
         ser.reset_input_buffer()
+        time.sleep(0.1)
 
         # Step 2: Manually Read Chip ID (Reg 0x00)
         # Protocol: [Start 0xAA] [Read 0x01] [Reg 0x00] [Len 0x01]

@@ -16,6 +16,7 @@ import sys
 import time
 import struct
 import csv
+import json
 from datetime import datetime
 from pathlib import Path
 from enum import IntEnum
@@ -403,12 +404,13 @@ class BNO055:
 class IMULogger:
     """IMU data logger with CSV output"""
 
-    def __init__(self, port: str = "/dev/ttyAMA5", poll_rate_hz: float = 50.0):
+    def __init__(self, port: str = "/dev/ttyAMA5", poll_rate_hz: float = 50.0, t0_sidecar: str = None):
         self.sensor = BNO055(port=port)
         self.poll_interval = 1.0 / poll_rate_hz
         self.running = False
         self.log_file = None
         self.csv_writer = None
+        self.t0_sidecar =  t0_sidecar
         self._setup_signal_handlers()
 
     def _setup_signal_handlers(self):
@@ -536,6 +538,12 @@ class IMULogger:
                         temp,
                         calib.system, calib.gyro, calib.accel, calib.mag
                     ])
+                    
+                    # Write sidecar to JSON
+                    if self.t0_sidecar and sample_count == 0:
+                        t0_ns = time.time_ns()
+                        with open (self.t0_sidecar, "w") as f:
+                            json.dump({"t0_ns": t0_ns}, f)
 
                     # Flush every 10 samples
                     sample_count += 1
@@ -599,10 +607,17 @@ def main():
         default=50.0,
         help="Polling rate in Hz"
     )
+    
+    # Passing arg for writing to sidecar for t0 timestamp
+    parser.add_argument(
+        "--t0-sidecar",
+        default=None,
+        help="Path to write t0 timestamp JSON sidecar file"
+    )
 
     args = parser.parse_args()
 
-    logger = IMULogger(port=args.port, poll_rate_hz=args.rate)
+    logger = IMULogger(port=args.port, poll_rate_hz=args.rate, t0_sidecar=args.t0_sidecar)
     sys.exit(logger.run())
 
 

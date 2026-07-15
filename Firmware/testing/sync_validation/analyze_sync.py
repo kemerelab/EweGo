@@ -2,7 +2,7 @@
 """
 Cross-device sensor-sync validation for the EweGo fleet.
 
-Given two simultaneous `sensor_test.py` captures (one per device), this verifies
+Given two simultaneous `record_sensors.py` captures (one per device), this verifies
 that the audio and IMU data are time-synchronized across devices, and quantifies
 the residual offset and long-term drift.
 
@@ -269,18 +269,36 @@ def overview_figure(A, B, A_dir, B_dir, labels, out):
     ax[2, 0].set_xlabel("time (s)"); ax[2, 0].set_ylabel("normalized RMS"); ax[2, 0].legend(loc="upper right")
 
     keep = np.abs(alag - np.median(alag)) < 0.5
-    asl, aic = np.polyfit(ats[keep], alag[keep], 1)
-    ax[2, 1].plot(ats[keep], alag[keep], "o-", ms=3, label="8 s windows")
-    ax[2, 1].plot(ats[keep], aic + asl * ats[keep], "r--", label=f"fit: {asl*1e3:+.3f} ppm")
-    ax[2, 1].set_title(f"Audio lag over capture — drift {asl*1e3:+.3f} ppm")
+    # A pair with lag samples spread across many ms will have `keep.sum() < 2`
+    # after the ±0.5 ms filter. That's itself a signal (bad sync), but we can't
+    # fit a line through <2 points — emit the scatter without a drift fit and
+    # flag the pair as ppm/scatter = NaN in the summary.
+    if keep.sum() >= 2:
+        asl, aic = np.polyfit(ats[keep], alag[keep], 1)
+        ax[2, 1].plot(ats[keep], alag[keep], "o-", ms=3, label="8 s windows")
+        ax[2, 1].plot(ats[keep], aic + asl * ats[keep], "r--", label=f"fit: {asl*1e3:+.3f} ppm")
+        ax[2, 1].set_title(f"Audio lag over capture — drift {asl*1e3:+.3f} ppm")
+        audio_ppm = asl * 1e3
+        audio_scatter_us = alag[keep].std() * 1000
+    else:
+        ax[2, 1].plot(ats, alag, "o", ms=3, color="C3",
+                      label=f"all {len(alag)} windows (no median-close cluster)")
+        ax[2, 1].set_title(f"Audio lag — no clean cluster within ±0.5 ms of median "
+                           f"({keep.sum()}/{len(alag)} in-band)")
+        audio_ppm = float("nan")
+        audio_scatter_us = float(alag.std() * 1000) if len(alag) else float("nan")
+        print(f"  warning: only {keep.sum()}/{len(alag)} lag samples within "
+              f"±0.5 ms of median — pair likely has poor sync or dropped audio")
     ax[2, 1].set_xlabel("time (s)"); ax[2, 1].set_ylabel("lag (ms)"); ax[2, 1].legend(loc="upper right")
 
     fig.tight_layout(rect=[0, 0, 1, 0.975])
     fig.savefig(out, dpi=130)
     print(f"  saved {out}")
-    return dict(audio_ppm=asl * 1e3, audio_scatter_us=alag[keep].std() * 1000,
+    return dict(audio_ppm=audio_ppm, audio_scatter_us=audio_scatter_us,
                 imu_ppm=(np.polyfit(t, lag, 1)[0] * 1e3 if len(t) > 1 else float("nan")),
-                imu_events=len(t))
+                imu_events=len(t),
+                # Raw arrays for the multi-pair summary figure
+                _ats=ats, _alag=alag)
 
 
 def drift_diagnostic(A, B, labels, out):
@@ -325,26 +343,160 @@ def drift_diagnostic(A, B, labels, out):
     return dict(lag_first_ms=lag_first, lag_last_ms=lag_last)
 
 
+def summary_plot(rows, out, ref_label):
+    """Combined view: lag(t) for in-band pairs + drift/scatter bar charts for all pairs.
+
+    `rows` is the list of dicts collected in main(); each has `pair`, `audio_ppm`,
+    `audio_scatter_us`, `_ats`, `_alag`.
+    """
+    good = [r for r in rows if not np.isnan(r["audio_ppm"])]
+    all_labels = [r["other_label"] for r in rows]
+
+    fig, ax = plt.subplots(2, 1, figsize=(11, 8), gridspec_kw={"height_ratios": [3, 2]})
+    fig.suptitle(f"EweGo cross-device sync summary — reference: {ref_label}",
+                 fontsize=14, fontweight="bold")
+
+    # --- Row 1: lag(t) for pairs that produced a stable fit ---
+    if good:
+        for i, r in enumerate(good):
+            ats, alag = r["_ats"], r["_alag"]
+            keep = np.abs(alag - np.median(alag)) < 0.5
+            ax[0].plot(ats[keep], alag[keep], "o-", ms=4, lw=1.2,
+                       color=f"C{i}", label=f"{r['pair']}  ({r['audio_ppm']:+.2f} ppm)")
+            sl, ic = np.polyfit(ats[keep], alag[keep], 1)
+            ax[0].plot(ats[keep], ic + sl * ats[keep], "--", color=f"C{i}", alpha=0.5, lw=1)
+        ax[0].axhline(0, color="k", lw=0.6, alpha=0.5)
+        ax[0].set_ylabel("residual lag (ms)")
+        ax[0].set_xlabel("time in capture (s)")
+        ax[0].set_title("Residual audio lag over 5-min capture (8 s windows, GCC-PHAT 300 Hz–4 kHz)")
+        ax[0].legend(loc="upper right", ncol=1, fontsize=9)
+        ax[0].grid(alpha=0.3)
+
+        # Highlight the sub-ms envelope
+        yl = ax[0].get_ylim()
+        ax[0].axhspan(-1, 1, color="green", alpha=0.06, zorder=0,
+                      label="_sub-ms zone")
+        ax[0].set_ylim(yl)
+
+    # --- Row 2: drift ppm and scatter µs bar charts across ALL pairs ---
+    x = np.arange(len(rows))
+    ppms = [r["audio_ppm"] for r in rows]
+    scats = [r["audio_scatter_us"] for r in rows]
+
+    axb = ax[1]
+    axr = axb.twinx()
+
+    # Bars: drift ppm on left axis
+    good_mask = ~np.isnan(np.array(ppms, dtype=float))
+    bar_colors = ["C0" if g else "C3" for g in good_mask]
+    axb.bar(x - 0.18, [p if not np.isnan(p) else 0 for p in ppms], width=0.36,
+            color=bar_colors, edgecolor="k", label="drift (ppm, left axis)")
+    for xi, p in zip(x, ppms):
+        if np.isnan(p):
+            axb.text(xi - 0.18, 0, "OFF-\nSCALE", ha="center", va="bottom",
+                     fontsize=8, color="C3", fontweight="bold")
+        else:
+            axb.text(xi - 0.18, p, f"{p:+.2f}", ha="center",
+                     va="bottom" if p >= 0 else "top", fontsize=9)
+
+    # Bars: scatter µs on right axis (log to accommodate ewe5-style outliers)
+    axr.bar(x + 0.18, scats, width=0.36, color="none",
+            edgecolor="C1", hatch="//", linewidth=1.4,
+            label="scatter (µs, right axis, log)")
+    axr.set_yscale("log")
+    for xi, s in zip(x, scats):
+        if not np.isnan(s):
+            axr.text(xi + 0.18, s, f"{int(s)}", ha="center", va="bottom", fontsize=9,
+                     color="C1")
+
+    axb.set_xticks(x)
+    axb.set_xticklabels([r["pair"] for r in rows], rotation=0)
+    axb.set_ylabel("audio clock drift (ppm)", color="C0")
+    axr.set_ylabel("lag scatter (µs, log scale)", color="C1")
+    axb.axhline(0, color="k", lw=0.6, alpha=0.5)
+    axb.grid(axis="y", alpha=0.3)
+    axb.set_title("Per-pair drift and scatter — red bars = no stable GCC-PHAT peak "
+                  "(different acoustic environment or dropped audio)")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out, dpi=130)
+    print(f"  saved {out}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="EweGo cross-device sync validation")
-    ap.add_argument("dir_a", help="capture dir for device A (sensor_test_* or flat)")
-    ap.add_argument("dir_b", help="capture dir for device B")
+    ap.add_argument("dirs", nargs="+",
+                    help="capture dirs (sensor_test_* or flat). "
+                         "First is the reference; all others are compared against it. "
+                         "Passing 2 dirs reproduces the original A-vs-B behavior.")
     ap.add_argument("--out", default="results", help="output dir for figures")
-    ap.add_argument("--labels", default="deviceA,deviceB", help="comma-separated labels")
+    ap.add_argument("--labels", default=None,
+                    help="comma-separated labels for each dir (default: device1,device2,…)")
     args = ap.parse_args()
+
+    if len(args.dirs) < 2:
+        ap.error("need at least 2 capture dirs to compare")
+
     os.makedirs(args.out, exist_ok=True)
-    labels = args.labels.split(",")
 
-    A, B = AudioDev(args.dir_a), AudioDev(args.dir_b)
-    print("Overview figure:")
-    ov = overview_figure(A, B, args.dir_a, args.dir_b, labels, os.path.join(args.out, "sync_overview.png"))
-    print("Drift diagnostic:")
-    dd = drift_diagnostic(A, B, labels, os.path.join(args.out, "audio_drift_diagnostic.png"))
+    if args.labels:
+        labels = args.labels.split(",")
+        if len(labels) != len(args.dirs):
+            ap.error(f"got {len(labels)} labels for {len(args.dirs)} dirs")
+    else:
+        labels = [f"device{i+1}" for i in range(len(args.dirs))]
 
-    print("\nSummary")
-    print(f"  audio drift        : {ov['audio_ppm']:+.3f} ppm   (scatter {ov['audio_scatter_us']:.0f} µs)")
-    print(f"  audio lag first→last: {dd['lag_first_ms']:+.3f} → {dd['lag_last_ms']:+.3f} ms")
-    print(f"  IMU drift          : {ov['imu_ppm']:+.2f} ppm   ({ov['imu_events']} motion windows)")
+    # Load each device's audio once — capture opens fds and reads the WAV header.
+    devs = [AudioDev(d) for d in args.dirs]
+    ref_dir, ref_dev, ref_label = args.dirs[0], devs[0], labels[0]
+
+    # Preserve original filenames when only 2 devices, for backward compat.
+    def suffix(other_label):
+        return "" if len(args.dirs) == 2 else f"_{ref_label}_vs_{other_label}"
+
+    rows = []  # per-pair summary
+    for other_dir, other_dev, other_label in zip(args.dirs[1:], devs[1:], labels[1:]):
+        pair_labels = [ref_label, other_label]
+        print(f"\n=== {ref_label} vs {other_label} ===")
+
+        ov_path = os.path.join(args.out, f"sync_overview{suffix(other_label)}.png")
+        dd_path = os.path.join(args.out, f"audio_drift_diagnostic{suffix(other_label)}.png")
+
+        print("Overview figure:")
+        ov = overview_figure(ref_dev, other_dev, ref_dir, other_dir, pair_labels, ov_path)
+        print("Drift diagnostic:")
+        dd = drift_diagnostic(ref_dev, other_dev, pair_labels, dd_path)
+
+        rows.append(dict(
+            pair=f"{ref_label} vs {other_label}",
+            other_label=other_label,
+            audio_ppm=ov["audio_ppm"],
+            audio_scatter_us=ov["audio_scatter_us"],
+            lag_first_ms=dd["lag_first_ms"],
+            lag_last_ms=dd["lag_last_ms"],
+            imu_ppm=ov["imu_ppm"],
+            imu_events=ov["imu_events"],
+            _ats=ov["_ats"],
+            _alag=ov["_alag"],
+        ))
+
+    # Summary table
+    print("\n" + "=" * 78)
+    print("Summary")
+    print("=" * 78)
+    hdr = (f"  {'pair':<24}  {'audio ppm':>10}  {'scatter µs':>10}  "
+           f"{'lag first→last (ms)':>22}  {'IMU ppm':>8}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        imu_str = f"{r['imu_ppm']:+.2f}" if not np.isnan(r["imu_ppm"]) else "  —  "
+        print(f"  {r['pair']:<24}  {r['audio_ppm']:+10.3f}  {r['audio_scatter_us']:10.0f}  "
+              f"{r['lag_first_ms']:+8.3f} → {r['lag_last_ms']:+8.3f}  {imu_str:>8}")
+
+    # Combined summary figure across all pairs
+    if len(rows) >= 1:
+        print("\nSummary figure:")
+        summary_plot(rows, os.path.join(args.out, "sync_summary.png"), ref_label)
 
 
 if __name__ == "__main__":

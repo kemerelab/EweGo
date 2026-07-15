@@ -84,8 +84,8 @@ Raw captures (~0.5 GB/device) are **not committed** (gitignored). To regenerate:
 # 1. Capture simultaneously on both devices (laptop, two terminals or background).
 #    Keep music playing near both mics; for IMU drift, move both devices
 #    together periodically (e.g. on a shared swing) across the window.
-ssh user@10.55.8.1  'cd ~/EweGo && uv run python Firmware/sensor_test.py --no-gps'  # ~20 min, Ctrl-C
-ssh user@10.55.11.1 'cd ~/EweGo && uv run python Firmware/sensor_test.py --no-gps'
+ssh user@10.55.8.1  'cd ~/EweGo && uv run python Firmware/record_sensors.py --no-gps'  # ~20 min, Ctrl-C
+ssh user@10.55.11.1 'cd ~/EweGo && uv run python Firmware/record_sensors.py --no-gps'
 
 # 2. Pull each device's sensor_test_* dir to a local folder, then analyze:
 uv run --no-project --with numpy --with matplotlib \

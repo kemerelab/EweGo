@@ -53,7 +53,7 @@ Use the MAX17048 fuel gauge to trigger `shutdown -h now` when SOC drops below
 This is the simplest fix with zero performance impact.
 
 Could be implemented as:
-- A check in `sensor_test.py`'s fuel gauge monitoring loop
+- A check in `record_sensors.py`'s fuel gauge monitoring loop
 - Or a standalone systemd service that polls the fuel gauge
 
 ### Option 2: Read-only root overlay

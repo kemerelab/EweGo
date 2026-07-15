@@ -15,7 +15,7 @@ EweGo/
 │   ├── gps-test/       # u-blox ZED-X20P GPS (UART3 + UART4)
 │   ├── setup/          # Pi setup script (pi_setup.sh)
 │   ├── bugs/           # Known bugs, fixes, and documentation
-│   └── sensor_test.py  # Unified orchestrator (runs all sensors)
+│   └── record_sensors.py  # Unified orchestrator (runs all sensors)
 ├── Hardware/           # KiCad PCB design (submodule: eweSAW)
 ├── sensor_test_*/      # Recording output directories (gitignored)
 ├── pyproject.toml      # Python deps (pyserial, pyubx2, numpy, sounddevice; opencv as dev extra)
@@ -39,7 +39,7 @@ EweGo/
 - Strips trailing zero-padding on load (guard against None timestamp on final frame)
 - Run from recording dir: `uv run python /path/to/play_with_timestamps.py`
 
-### Sensor Test Orchestrator (`Firmware/sensor_test.py`)
+### Sensor Test Orchestrator (`Firmware/record_sensors.py`)
 - Launches all sensors as subprocesses with monitoring threads
 - Uses `FIRMWARE_DIR = Path(__file__).resolve().parent` for portable paths
 - IMU has retry logic (max_retries=3) for UART startup race conditions
@@ -100,7 +100,7 @@ EweGo/
   - Rsyncs using `.rsyncignore` (excludes Hardware/, .venv/, __pycache__/, .git/, recordings/, CLAUDE.md)
   - Prompts to run `pi_setup.sh` and reboot on the remote
   - Works over mesh (`10.42.0.N`) or infrastructure WiFi
-- Run test: `cd ~/EweGo && uv run python Firmware/sensor_test.py`
+- Run test: `cd ~/EweGo && uv run python Firmware/record_sensors.py`
 
 ## User Preferences
 - Prefers concise communication

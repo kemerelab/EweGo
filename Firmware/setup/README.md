@@ -133,7 +133,7 @@ Once `pi_setup.sh` has installed the sensors and `uv` venv:
 
 ```
 cd ~/EweGo
-uv run python Firmware/sensor_test.py
+uv run python Firmware/record_sensors.py
 ```
 
 This launches all sensors (dual cameras, IMU, GPS, audio, fuel gauge)

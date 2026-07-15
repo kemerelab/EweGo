@@ -14,19 +14,52 @@ import cv2
 import numpy as np
 
 
-def load_timestamps(timestamp_file):
-    """Load timestamps from binary file.
+TS_MAGIC = b"EWEGOTS2"  # 8 bytes — matches dual_cam_jp2.py::TS_MAGIC
 
-    Format: 64-bit little-endian integers, µs since boot (kernel monotonic clock).
-    Both cameras use the same clock so their values are directly comparable.
+
+def load_timestamps(timestamp_file):
+    """Load timestamps from binary file. Returns a list of µs values in the
+    CLOCK_MONOTONIC domain, so directly comparable across cameras and to
+    IMU/audio/GPS/fuel gauge timestamps.
+
+    Two on-disk formats, distinguished by an 8-byte magic header:
+
+    - NEW (magic "EWEGOTS2" then <qq per frame): (pi_us, rebased_us) pairs.
+      pi_us is time.monotonic_ns()//1000 at outputframe time. rebased_us is
+      picamera2's SoF-accurate delta since this encoder's first frame.
+      Reconstructed as pi_us[0] + rebased_us[i] to combine SoF-accurate
+      deltas with a global CLOCK_MONOTONIC anchor.
+
+    - OLD (no magic, raw <q per frame): single int64 µs. Semantics depend on
+      when the recording was made:
+        * Pre-4dc0b44 (Feb 2026 batch): kernel CLOCK_MONOTONIC µs. Usable directly.
+        * Post-4dc0b44 (Michigan Apr 2026 batch): encoder-relative µs starting
+          at 0. Cannot be aligned to other sensors without a recovered t0.
+      This loader doesn't distinguish those cases — it just returns the raw
+      values and lets callers do the right thing per recording provenance.
     """
-    raw = []
     with open(timestamp_file, 'rb') as f:
-        while True:
-            data = f.read(8)
-            if not data:
-                break
-            raw.append(struct.unpack('<q', data)[0])
+        header = f.read(len(TS_MAGIC))
+        body = f.read() if header == TS_MAGIC else header + f.read()
+
+    if header == TS_MAGIC:
+        # NEW format: <qq per frame. Anchor + SoF-accurate rebased delta.
+        n = len(body) // 16
+        pairs = struct.unpack(f'<{2 * n}q', body[:n * 16])
+        pi_vals = list(pairs[0::2])
+        rebased = list(pairs[1::2])
+        # Strip trailing (0, 0) pairs — shutdown artifact if encoder emits None.
+        while pi_vals and pi_vals[-1] == 0 and rebased[-1] == 0:
+            pi_vals.pop()
+            rebased.pop()
+        if not pi_vals:
+            return []
+        anchor = pi_vals[0]
+        return [anchor + r for r in rebased]
+
+    # OLD format: <q per frame.
+    n = len(body) // 8
+    raw = list(struct.unpack(f'<{n}q', body[:n * 8]))
 
     # Strip trailing zeros — can occur if the encoder sends a None timestamp
     # on the final frame during shutdown (written as 0 by the recorder).
@@ -73,7 +106,7 @@ def play_video(mjpeg_file, timestamps, flip=True):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Video: {total_frames} frames")
     print(f"Timestamps: {len(timestamps)} entries")
-    print(f"Duration: {timestamps[-1] / 1e6:.2f} seconds")
+    print(f"Duration: {(timestamps[-1] - timestamps[0]) / 1e6:.2f} seconds")
     print(f"Press 'q' to quit, SPACE to pause/resume")
 
     frame_idx = 0
@@ -526,7 +559,7 @@ def convert_to_mp4(mjpeg_file, timestamps, output_file):
     total_frames = len(timestamps)
 
     # Calculate average FPS for output
-    duration_sec = timestamps[-1] / 1e6
+    duration_sec = (timestamps[-1] - timestamps[0]) / 1e6
     avg_fps = total_frames / duration_sec
 
     print(f"Converting {mjpeg_file} -> {output_file}")

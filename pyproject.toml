@@ -16,3 +16,10 @@ dev = [
     "opencv-python>=4.13.0.92",
     "numpy",
 ]
+
+[tool.codespell]
+# Ref: https://github.com/codespell-project/codespell#using-a-config-file
+skip = '.git,.gitignore,.gitattributes,*.pdf'
+check-hidden = true
+# ignore-regex = ''
+# ignore-words-list = ''

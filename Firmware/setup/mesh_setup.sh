@@ -129,6 +129,12 @@ iw dev "$IFACE" ibss join ewego-mesh 2437 NOHT fixed-freq "$CELL"
 
 batctl meshif bat0 if add "$IFACE" 2>/dev/null || true
 
+# Raise OGM broadcast rate from default 1000ms → 250ms (4 Hz). Faster mesh
+# convergence, tighter TQ resolution, quicker dead-link detection. Costs
+# ~2% extra broadcast airtime — negligible on a mesh whose primary purpose
+# is time sync.
+batctl meshif bat0 orig_interval 250 2>/dev/null || true
+
 ip link set bat0 up
 ip addr flush dev bat0
 ip addr add "${MESH_IP}/24" dev bat0

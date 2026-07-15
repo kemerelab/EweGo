@@ -32,7 +32,6 @@ error() { echo -e "${RED}[✗]${NC} $*"; }
 ACTION="${1:-join}"
 SUFFIX="${2:-100}"
 MESH_IP="10.42.0.${SUFFIX}"
-CELL="02:12:34:56:78:9A"   # Must match all EweGo devices
 
 # Auto-detect WiFi interface (wlan0 on Pi, wlp* on most laptops)
 IFACE="${EWEGO_IFACE:-}"
@@ -144,8 +143,14 @@ case "$ACTION" in
 
         # Join the IBSS cell (2437 MHz = channel 6, 2.4 GHz). NOHT is required —
         # the Pi's BCM43455 (and many other drivers) reject HT20 in IBSS mode.
+        # We intentionally do NOT pass `fixed-freq <BSSID>`: on mt76x2u (and some
+        # other USB chipsets), specifying a fixed BSSID causes the adapter to
+        # "create" its own IBSS cell rather than merge with the Pis' existing
+        # one, and its broadcast RX path won't decode peer OGMs in that state —
+        # batman-adv ends up with zero neighbors. Letting the kernel auto-merge
+        # picks up whichever BSSID the Pi mesh has settled on.
         info "Joining IBSS cell ewego-mesh..."
-        sudo iw dev "$IFACE" ibss join ewego-mesh 2437 NOHT fixed-freq "$CELL"
+        sudo iw dev "$IFACE" ibss join ewego-mesh 2437 NOHT
 
         # Add wlan0 to batman
         info "Adding $IFACE to batman mesh..."

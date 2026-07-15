@@ -1,0 +1,65 @@
+[Unit]
+Description=EweGo Unified Sensor Logger (record_sensors.py)
+Documentation=file:///home/user/EweGo/Firmware/record_sensors.py
+
+# Chrony must be sync'd before we start recording — otherwise the wall-time
+# column in clock_sync.csv is garbage until the first NTP exchange completes.
+# The whole point of clock_sync.csv is the linear monotonic→wall fit, so
+# starting before chrony has stabilized would poison the fit.
+After=chrony.service time-sync.target
+Wants=chrony.service
+
+# Not tied to network-online.target on purpose: recording is 100% local file
+# I/O. It should keep going through mesh outages, and it should be startable
+# even if the mesh never came up (single-Pi field debugging).
+
+# StartLimit* live in [Unit] in modern systemd (RestartSec / Restart live in
+# [Service]). 10-in-5-min ceiling — see rationale below.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=user
+Group=user
+WorkingDirectory=/home/user/EweGo
+
+# Absolute path — a non-login systemd unit doesn't source ~/.profile, so uv
+# isn't on PATH. This is the exact path `pi_setup.sh` section 2 installs to.
+# Field-observed 2026-07-06: mesh_monitor's ssh-based launch hit this trap
+# ("uv: command not found") until we switched to the absolute path.
+ExecStart=/home/user/.local/bin/uv run python Firmware/record_sensors.py --no-gps
+
+# Clean shutdown: record_sensors.py's SIGINT handler (see record_sensors.py:65)
+# forwards to every child recorder and waits up to 10 s for them to drain
+# their buffers and close their WAV/CSV headers cleanly. Give systemd a
+# matching window before it escalates to SIGTERM/SIGKILL.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# Crash resilience within a session:
+#   - `on-failure` restarts only on non-zero exit (crashes, watchdog SIGKILLs
+#     of the parent, subprocess cascade deaths). Clean `systemctl stop` gives
+#     exit 0 via SIGINT, so operator-initiated stop actually stops.
+#   - 5 s pause between restarts lets kernel writeback settle, fuel gauge
+#     I2C bus recover, camera CSI reset finish.
+#   - 10-restart-in-5-min ceiling stops runaway restart storms when hardware
+#     is fundamentally broken (camera cable pulled, ALSA device unrecoverable,
+#     SD card returning EIO). Better to sit idle and log the failure than to
+#     burn SD writes forever.
+Restart=on-failure
+RestartSec=5
+
+# Everything record_sensors.py prints goes to the journal. Since section 8.5 of
+# pi_setup.sh made the journal persistent, post-crash forensics (which is
+# why we built this) can pull all of it via `journalctl -u ewego-sensor -b -1`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ewego-sensor
+
+[Install]
+# WantedBy is present so `systemctl enable ewego-sensor` works — per-Pi opt-in
+# for unattended field boot-and-record. The default install path in
+# pi_setup.sh does NOT enable it; a fresh Pi boots idle and needs mesh_monitor's
+# `r` (or `sudo systemctl start ewego-sensor`) to begin recording.
+WantedBy=multi-user.target

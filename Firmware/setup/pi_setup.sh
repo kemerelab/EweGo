@@ -269,6 +269,25 @@ else
         warn "No /dev/pps0 yet — GPS/PPS sources will be enabled after reboot"
     fi
 
+    # Uniform orphan mode: EVERY node gets the same `local stratum 10 orphan`.
+    # chrony's orphan election picks the active anchor among reachable nodes
+    # by lowest reference ID (= lowest mesh IP); everyone else follows it at
+    # stratum 11. Any subset of devices works (deploy only ewe4/5/6 → ewe4
+    # anchors) — no designated-anchor devices.
+    #
+    # `orphan` (not plain `local`) is essential: the local clock stays a
+    # last-resort that defers to any real source and to any active orphan
+    # with a smaller reference ID. History: an earlier all-orphan design was
+    # reverted after a Pi with wedged IBSS unicast self-promoted and stranded
+    # itself; that gap is now covered by the boot pre-sync (§7.6), and by
+    # orphan demotion + `makestep 1.0 -1` re-stepping once a wedge clears.
+    sudo mkdir -p /etc/chrony/conf.d
+    LOCAL_CONF="/etc/chrony/conf.d/local-fallback.conf"
+    echo "local stratum 10 orphan" | sudo tee "$LOCAL_CONF" > /dev/null
+    info "Local fallback: stratum 10 orphan (anchor elected by lowest mesh IP)"
+    sudo chown root:root "$LOCAL_CONF"
+    sudo chmod 644 "$LOCAL_CONF"
+
     info "Enabling chrony service..."
     sudo systemctl enable chrony
 
@@ -279,6 +298,98 @@ else
         info "Chrony configured (GPS PPS on GPIO 6 via /dev/pps0, mesh peers 10.42.0.1-16, internet fallback)"
     fi
 fi
+
+# --------------------------------------------------------------------------
+# 7.5 Wall-clock save/restore (no RTC, no fake-hwclock package needed)
+# --------------------------------------------------------------------------
+# The CM4 has no battery-backed RTC. Without a saved timestamp, a reboot can
+# bring a node back minutes-to-hours stale; if that node is the ewe1 orphan
+# anchor, the flock splits into time islands that reject each other as
+# falsetickers (2026-07-08 field incident: anchor came back 24 min behind →
+# 2-vs-6 island split). A 1-minute save bounds post-reboot staleness to ~60 s,
+# which chrony's `makestep 1.0 -1` immediately corrects once peers respond.
+info "Installing wall-clock save/restore units..."
+sudo mkdir -p /var/lib/ewego
+
+sudo tee /etc/systemd/system/ewego-clock-save.service > /dev/null << 'EOF'
+[Unit]
+Description=EweGo: save wall clock (RTC substitute)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/touch /var/lib/ewego/clock
+EOF
+
+sudo tee /etc/systemd/system/ewego-clock-save.timer > /dev/null << 'EOF'
+[Unit]
+Description=EweGo: save wall clock every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo tee /etc/systemd/system/ewego-clock-restore.service > /dev/null << 'EOF'
+[Unit]
+Description=EweGo: restore wall clock from last save
+DefaultDependencies=no
+Before=chrony.service sysinit.target
+After=local-fs.target
+ConditionPathExists=/var/lib/ewego/clock
+
+[Service]
+Type=oneshot
+# Only step forward — never move the clock back at boot.
+ExecStart=/bin/sh -c 'saved=$(stat -c %%Y /var/lib/ewego/clock); now=$(date +%%s); [ "$now" -lt "$saved" ] && date -s "@$saved" || true'
+
+[Install]
+WantedBy=sysinit.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now ewego-clock-save.timer > /dev/null 2>&1
+sudo systemctl enable ewego-clock-restore.service > /dev/null 2>&1
+info "Clock save/restore installed (1-min saves → ≤60s staleness after reboot)"
+
+# --------------------------------------------------------------------------
+# 7.6 Boot pre-sync: defer to flock consensus before self-anchoring
+# --------------------------------------------------------------------------
+# Root cause of the 2026-07-08 time-island split: a node rebooted with a
+# stale clock and asserted its orphan local reference. Orphan mode ignores
+# sources at stratum >= its own, so the rebooted anchor could never rejoin
+# the consensus it had seeded — the rest of the flock (correctly) outvoted
+# it as a falseticker and the islands stayed split. Fix: before chronyd
+# starts, one-shot step (`chronyd -q`) against any peer still serving flock
+# time. Succeeds → node rejoins at ~0 offset, no split. No peer answers
+# within 25 s (whole-flock cold boot) → proceed on the restored clock as
+# before. Runs once per boot (/run flag), not on service restarts. Installed
+# on every node since every node is now anchor-capable (uniform orphan).
+PRESYNC_SOURCES=""
+for i in $(seq 1 16); do
+    [ "$i" = "$DEVICE_NUM" ] && continue
+    PRESYNC_SOURCES="$PRESYNC_SOURCES 'server 10.42.0.$i iburst maxdelay 0.5'"
+done
+PRESYNC_SOURCES="$PRESYNC_SOURCES 'server 10.42.0.100 iburst maxdelay 0.5'"
+sudo mkdir -p /etc/systemd/system/chrony.service.d
+sudo tee /etc/systemd/system/chrony.service.d/ewego-presync.conf > /dev/null << EOF
+[Unit]
+# Pre-sync needs the mesh up to reach peers (best-effort if it isn't).
+After=ewego-mesh.service
+
+[Service]
+# '-' prefix: a failed pre-sync (no peers reachable) must not block chronyd.
+# '+' prefix: run with full privileges — Debian's chrony.service sandboxing
+# applies to ExecStartPre too, and without it chronyd -q dies with
+# "Not superuser" (and /run is read-only), silently skipping the pre-sync.
+# maxdistance 16 accepts peers whose root dispersion grew while coasting.
+ExecStartPre=-+/bin/sh -c "[ -e /run/ewego-presync-done ] || /usr/sbin/chronyd -q -t 25 'maxdistance 16' $PRESYNC_SOURCES; touch /run/ewego-presync-done"
+EOF
+sudo systemctl daemon-reload
+info "Boot pre-sync installed (one-shot step to flock consensus at boot)"
 
 # --------------------------------------------------------------------------
 # 8. /boot/firmware/config.txt (hardware overlays)
@@ -367,6 +478,91 @@ EOF
 fi
 
 # --------------------------------------------------------------------------
+# 8.5 Persistent systemd journal
+# --------------------------------------------------------------------------
+# Default on Raspberry Pi OS is volatile — /var/log/journal/ doesn't exist
+# out of the box, AND there's a vendor drop-in at
+# /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf that sets
+# Storage=volatile. That means every crash, watchdog reset, undervoltage
+# warning, or OOM kill vanishes with the reboot.
+#
+# During the Michigan field trials (2026-04-13) the hardware watchdog fired
+# mid-recording on multiple Pis (files ended with kilobytes of NUL bytes,
+# the fingerprint of unflushed writeback), but we couldn't investigate
+# because journal logs were gone. Persistent journal closes that loop:
+# `journalctl --list-boots` then shows a history, and `journalctl -b -1`
+# pulls the last-second-before-reboot after the fresh boot.
+#
+# We override via a drop-in at /etc/systemd/journald.conf.d/ — files under
+# /etc/ take precedence over /usr/lib/ regardless of numeric prefix. Editing
+# /etc/systemd/journald.conf directly does NOT work because the rpi vendor
+# drop-in wins the concatenation order (verified 2026-07-08).
+#
+# Cost: journal files live under /var/log/journal at ~10 MB/day worst case.
+# systemd rotates them by default; nothing to babysit.
+info "Enabling persistent systemd journal (via /etc drop-in)..."
+sudo mkdir -p /var/log/journal /etc/systemd/journald.conf.d
+sudo tee /etc/systemd/journald.conf.d/99-ewego-persistent.conf > /dev/null <<'EOF'
+# Override /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf
+# which defaults to Storage=volatile. Installed by pi_setup.sh.
+[Journal]
+Storage=persistent
+EOF
+sudo systemctl restart systemd-journald
+sleep 1
+sudo journalctl --flush 2>/dev/null || true
+info "  journal storage: $(sudo systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -E '^Storage=' | tail -1) — logs now survive reboots"
+
+# --------------------------------------------------------------------------
+# 8.6 Recording service (ewego-sensor.service)
+# --------------------------------------------------------------------------
+# Wraps `uv run python Firmware/record_sensors.py --no-gps` in a systemd unit so
+# that:
+#   1. `Restart=on-failure` auto-resumes after crashes and hardware-watchdog
+#      resets. Michigan 2026-04-13: watchdog fired mid-recording on multiple
+#      Pis, sessions were dead until an operator noticed and hit `r`.
+#   2. mesh_monitor's [r] key can drive `systemctl start` cleanly, replacing
+#      the fragile `setsid nohup ... &` pattern that made ssh hang.
+#   3. Persistent journal (section 8.5) captures everything record_sensors.py
+#      prints — post-crash forensics via `journalctl -u ewego-sensor -b -1`.
+#
+# Deployment choice (per user 2026-07-08): install but DO NOT enable. A
+# fresh Pi boots idle; the operator triggers recording via mesh_monitor.
+# Individual Pis can opt into unattended boot-and-record with a manual
+# `sudo systemctl enable ewego-sensor` — no re-run of pi_setup.sh needed.
+info "Installing ewego-sensor.service (unit only — not enabled)..."
+sudo install -m 644 -o root -g root \
+    "$EWEGO_DIR/Firmware/setup/ewego-sensor.service" \
+    /etc/systemd/system/ewego-sensor.service
+sudo systemctl daemon-reload
+
+# --- sudoers drop-in ---
+# mesh_monitor sends `sudo -n systemctl enable/disable/start/stop ewego-sensor`
+# over ssh. `-n` fails immediately if a password is required, so the operator
+# user needs NOPASSWD for exactly the commands mesh_monitor uses. `enable
+# --now` / `disable --now` are the current [r]/[s] handlers because they
+# survive reboots (crash-resilience across power cycles) — plain start/stop
+# stays whitelisted for manual debugging over ssh. `reset-failed` clears
+# a stuck failed-state so `enable --now` can proceed after a bad prior run.
+# Anything broader would be a needlessly loose grant. `visudo -c -f`
+# validates syntax before install; a malformed sudoers file locks you out
+# of sudo.
+info "Installing /etc/sudoers.d/ewego-sensor..."
+TMP_SUDOERS="$(mktemp)"
+cat > "$TMP_SUDOERS" <<EOF
+# Passwordless systemctl for the EweGo recording service. Installed by
+# pi_setup.sh section 8.6. Used by mesh_monitor's [r] and [s] keys.
+$USER ALL=(ALL) NOPASSWD: /bin/systemctl start ewego-sensor.service, /bin/systemctl stop ewego-sensor.service, /bin/systemctl status ewego-sensor.service, /bin/systemctl enable ewego-sensor.service, /bin/systemctl disable ewego-sensor.service, /bin/systemctl enable --now ewego-sensor.service, /bin/systemctl disable --now ewego-sensor.service, /bin/systemctl reset-failed ewego-sensor.service
+EOF
+if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null; then
+    sudo install -m 440 -o root -g root "$TMP_SUDOERS" /etc/sudoers.d/ewego-sensor
+    info "  sudoers grant installed for user '$USER'"
+else
+    warn "  sudoers file failed syntax check — NOT installed. mesh_monitor [r]/[s] won't work until fixed."
+fi
+rm -f "$TMP_SUDOERS"
+
+# --------------------------------------------------------------------------
 # 9. Summary
 # --------------------------------------------------------------------------
 echo ""
@@ -382,6 +578,8 @@ echo "   - python3-picamera2, i2c-tools, python3-smbus2, libportaudio2 via apt"
 echo "   - uv + Python venv synced from uv.lock (pyserial, pyubx2, numpy, sounddevice)"
 echo "   - i2c-dev + dwc2/libcomposite kernel modules (NCM gadget) on boot"
 echo "   - config.txt: disable-bt, dual cameras, audio hat, GPS, IMU, fuel gauge"
+echo "   - Persistent systemd journal (survives reboots for post-hoc debugging)"
+echo "   - ewego-sensor.service (recording unit; install only, not enabled)"
 echo ""
 echo " Mesh networking: NOT configured (run mesh_setup.sh to enable)"
 echo ""
@@ -394,7 +592,7 @@ echo "   GPIO 14/15 - Debug console (ttyAMA0, 115200 baud) — Bluetooth disable
 echo "   CAM0/CAM1  - Dual IMX708 cameras"
 echo ""
 echo " To test sensors after reboot:"
-echo "   cd ~/EweGo && uv run python Firmware/sensor_test.py"
+echo "   cd ~/EweGo && uv run python Firmware/record_sensors.py"
 echo ""
 echo "============================================================================"
 echo ""

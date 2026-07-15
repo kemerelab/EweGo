@@ -29,7 +29,7 @@ python find_serial_port.py
 
 This will show all available serial ports. Look for something like:
 - macOS: `/dev/tty.usbserial-0001`
-- Linux/Pi: `/dev/ttyAMA4' # We're conected to UART4 Cound be `/dev/ttyUSB0` or `/dev/ttyACM0` if testing
+- Linux/Pi: `/dev/ttyAMA4' # We're connected to UART4. Could be `/dev/ttyUSB0` or `/dev/ttyACM0` if testing
 
 ### Step 2: Edit Configuration
 

@@ -22,4 +22,5 @@ dev = [
 skip = '.git,.gitignore,.gitattributes,*.pdf'
 check-hidden = true
 # ignore-regex = ''
-# ignore-words-list = ''
+# ser - conventional pyserial variable name for a serial.Serial instance
+ignore-words-list = 'ser'

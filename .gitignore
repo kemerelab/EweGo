@@ -3,6 +3,12 @@ sensor_test_*/
 recordings/
 Data/
 
+# Ad-hoc capture/export videos at the repo root
+*.mp4
+
+# Hardware working files
+Hardware/Case/Archive.zip
+
 # Claude config files
 .claude/
 

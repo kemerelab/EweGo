@@ -15,6 +15,15 @@ from pyubx2 import UBXReader
 import socket
 import csv
 
+try:
+    from chrony_shm import ChronyShmWriter
+except ImportError:
+    # Same-directory import when running as a script from a different CWD
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    from chrony_shm import ChronyShmWriter
+
 class TimeSync:
     """Track GPS time vs system time correlation"""
     
@@ -150,6 +159,18 @@ class GPSLogger:
         # Time synchronization
         self.timesync = TimeSync(self.log_filename_base)
         self.last_timesync_log_us = 0
+
+        # Chrony SHM refclock feed. Publishes each valid NAV-PVT time sample
+        # into SHM segment 0 so chrony's `refclock SHM 0 refid GPS` can select
+        # it, and the paired `refclock PPS ... lock GPS` can then use PPS for
+        # sub-µs alignment. Silent no-op if SHM setup fails (e.g. unusual
+        # kernel, no /dev/shm) — chrony just falls back to mesh peers.
+        try:
+            self.chrony_shm = ChronyShmWriter(unit=0, precision=-1)
+            print(f"✓ Chrony SHM refclock feed active (segment 0, key 0x{self.chrony_shm.key:x})")
+        except OSError as e:
+            self.chrony_shm = None
+            print(f"⚠ Chrony SHM setup failed: {e} — GPS time will log but not feed chrony")
         
         # Statistics
         self.stats = {
@@ -288,23 +309,40 @@ class GPSLogger:
                         # Store carrier solution status for RTK detection
                         self.stats['last_carr_soln'] = getattr(parsed_msg, 'carrSoln', 0)
                         
-                        # Log time synchronization every 10 seconds
-                        if monotonic_us - self.last_timesync_log_us >= 10_000_000:
-                            try:
-                                gps_datetime = datetime(
-                                    parsed_msg.year, parsed_msg.month, parsed_msg.day,
-                                    parsed_msg.hour, parsed_msg.min, parsed_msg.second,
-                                    microsecond=int(parsed_msg.nano / 1000),
-                                    tzinfo=timezone.utc  # GPS time is UTC-based
-                                )
-                                
-                                # Calculate GPS week and time of week
+                        # Build GPS wall time on every NAV-PVT so we can feed
+                        # chrony's SHM refclock at ~1 Hz (NAV-PVT rate). The
+                        # CSV timesync log stays at 10 s cadence to keep the
+                        # file small.
+                        try:
+                            gps_datetime = datetime(
+                                parsed_msg.year, parsed_msg.month, parsed_msg.day,
+                                parsed_msg.hour, parsed_msg.min, parsed_msg.second,
+                                microsecond=int(parsed_msg.nano / 1000),
+                                tzinfo=timezone.utc  # GPS time is UTC-based
+                            )
+                            gps_timestamp = gps_datetime.timestamp()
+
+                            # Feed chrony's SHM refclock. Only publish when the
+                            # NAV-PVT time is marked "fully resolved" — before
+                            # that, year/month/etc. may be placeholders.
+                            # pyubx2 exposes the valid-bitfield flags as
+                            # separate attrs (validDate, validTime,
+                            # fullyResolved). Some firmware versions omit
+                            # `fullyResolved`; fall back to the `valid` byte.
+                            if self.chrony_shm is not None:
+                                fully_resolved = getattr(parsed_msg, "fullyResolved", None)
+                                if fully_resolved is None:
+                                    # `valid` bitfield: bit 2 = fullyResolved
+                                    fully_resolved = bool(getattr(parsed_msg, "valid", 0) & 0x04)
+                                if fully_resolved:
+                                    self.chrony_shm.publish(gps_timestamp, wall_time_s)
+
+                            # Sparse CSV log every 10 s
+                            if monotonic_us - self.last_timesync_log_us >= 10_000_000:
                                 gps_epoch = datetime(1980, 1, 6, tzinfo=timezone.utc)
                                 delta = gps_datetime - gps_epoch
                                 gps_week = int(delta.total_seconds() / (7 * 24 * 3600))
                                 gps_tow = delta.total_seconds() % (7 * 24 * 3600)
-                                
-                                # Log correlation
                                 self.timesync.log(
                                     monotonic_us,
                                     wall_time_s,
@@ -313,14 +351,10 @@ class GPSLogger:
                                     gps_tow,
                                     parsed_msg.numSV
                                 )
-
-                                # Calculate offset for display
-                                gps_timestamp = gps_datetime.timestamp()
                                 self.stats['time_offset'] = wall_time_s - gps_timestamp
-
                                 self.last_timesync_log_us = monotonic_us
-                            except:
-                                pass
+                        except Exception:
+                            pass
                     elif not parsed_msg:
                         # Track parse errors
                         parse_errors += 1
@@ -443,7 +477,11 @@ class GPSLogger:
             print(f"✓ Log file closed: {self.log_filename}")
         
         self.timesync.close()
-        
+
+        if self.chrony_shm is not None:
+            self.chrony_shm.close()
+            print("✓ Chrony SHM refclock feed closed")
+
         if self.ntrip:
             self.ntrip.close()
         

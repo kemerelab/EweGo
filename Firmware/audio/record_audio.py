@@ -5,6 +5,7 @@ Writes a WAV file and a per-block timestamps CSV with monotonic clock anchors.
 """
 
 import csv
+import os
 import queue
 import sys
 import time
@@ -62,6 +63,8 @@ def record_audio(filename=None, duration=None, device=None):
 
             ts_writer = csv.writer(ts_f, lineterminator='\n')
             ts_writer.writerow(['monotonic_us', 'sample_index'])
+            ts_fd = ts_f.fileno()
+            last_fsync = time.monotonic()
 
             with sd.InputStream(**stream_kwargs):
                 while True:
@@ -74,6 +77,21 @@ def record_audio(filename=None, duration=None, device=None):
                     wav_f.writeframes(chunk.tobytes())
                     ts_writer.writerow([mono_us, total_frames])
                     total_frames += BLOCKSIZE
+
+                    # os.fsync() the timestamps CSV every ~1 s so kernel
+                    # writeback actually hits the SD card. Michigan
+                    # 2026-04-13: hardware watchdog reset produced kilobytes
+                    # of trailing NUL bytes on companion CSVs; the WAV
+                    # survived because wave.close() finalizes the RIFF
+                    # header on context-manager exit. Timestamps have no
+                    # such saving throw so they need explicit sync.
+                    # Runs in the main thread — NOT inside the sounddevice
+                    # callback which is a real-time thread.
+                    now = time.monotonic()
+                    if now - last_fsync >= 1.0:
+                        ts_f.flush()
+                        os.fsync(ts_fd)
+                        last_fsync = now
 
     except KeyboardInterrupt:
         print("\nRecording stopped by user")

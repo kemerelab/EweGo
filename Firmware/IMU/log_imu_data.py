@@ -11,6 +11,7 @@ Features:
 - Comprehensive sensor data capture
 """
 
+import os
 import serial
 import signal
 import sys
@@ -526,6 +527,7 @@ class IMULogger:
         self.running = True
         sample_count = 0
         error_count = 0
+        last_fsync = time.monotonic()  # cadence-batched os.fsync — see below
 
         try:
             while self.running:
@@ -554,10 +556,18 @@ class IMULogger:
                         calib.system, calib.gyro, calib.accel, calib.mag
                     ])
 
-                    # Flush every 10 samples
+                    # Flush every 10 samples (100 ms), plus os.fsync() every
+                    # ~1 s so kernel writeback actually hits the SD card.
+                    # Michigan 2026-04-13: hardware watchdog reset produced
+                    # kilobytes of trailing NUL bytes on companion CSVs; the
+                    # cadence-batched fsync caps that data loss at <1 s.
                     sample_count += 1
                     if sample_count % 10 == 0:
                         self.log_file.flush()
+                        now_mono = time.monotonic()
+                        if now_mono - last_fsync >= 1.0:
+                            os.fsync(self.log_file.fileno())
+                            last_fsync = now_mono
 
                     # Print status
                     print(f"\r[{sample_count:6d}] "

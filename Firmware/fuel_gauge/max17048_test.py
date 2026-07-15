@@ -4,6 +4,7 @@ MAX17048 Fuel Gauge Test Script
 For Raspberry Pi - I2C Bus 1 (SDA/SCL on GPIO pins 2/3)
 """
 
+import os
 import smbus2
 import time
 import sys
@@ -319,12 +320,16 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
                 print(f"{elapsed_s:6.1f}   {voltage:6.3f}      {soc:5.2f}    {alert_str}")
                 reading_count += 1
 
-                # Log to file if enabled
+                # Log to file if enabled. Per-row flush + fsync: this writer
+                # runs at 0.5 Hz so per-row fsync (2 sync ops/min) is
+                # negligible SD wear, and it caps power-loss data loss at one
+                # sample. See Michigan 2026-04-13 NUL-tail signature.
                 if csv_writer:
                     try:
                         csv_writer.writerow([now_us, f"{elapsed_s:.2f}",
                                            f"{voltage:.4f}", f"{soc:.3f}", alert_str])
-                        file_handle.flush()  # Flush immediately for crash robustness
+                        file_handle.flush()
+                        os.fsync(file_handle.fileno())
                     except Exception as e:
                         print(f"✗ Error writing to log: {e}")
             else:
@@ -334,6 +339,7 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
                         csv_writer.writerow([now_us, f"{elapsed_s:.2f}",
                                            'ERROR', 'ERROR', 'ERROR'])
                         file_handle.flush()
+                        os.fsync(file_handle.fileno())
                     except Exception as e:
                         print(f"✗ Error writing to log: {e}")
 

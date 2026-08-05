@@ -474,6 +474,9 @@ gpu_mem=256
 # 'otg' and depends on the OTG_ID pin being pulled correctly, which varies
 # across carrier boards. Forcing peripheral makes gadget mode reliable.
 dtoverlay=dwc2,dr_mode=peripheral
+
+[pi4]
+otg_mode=1
 EOF
 fi
 

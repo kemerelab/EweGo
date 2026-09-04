@@ -13,7 +13,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 |---|---|
 | `/opt/ewego/Firmware/` | the `Firmware/` tree from this repository |
 | `/opt/ewego/pylib/` | pyubx2 (+ pynmeagps, pyrtcm), vendored pure-Python wheels |
-| apt packages | `python3-picamera2`, `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc` — installed inside the image at build time |
+| apt packages | `python3-picamera2`, `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc`, `ffmpeg` — installed inside the image at build time |
 | `/etc/systemd/system/ewego-*.service` | `ewego-sensors` (all sensors via `sensor_test.py`), `ewego-dualcam`, `ewego-gps`. **Installed but not enabled.** |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
 | `/etc/ewego-image-release` | version tag and build date |

@@ -7,3 +7,6 @@ python3-smbus2
 python3-serial
 i2c-tools
 psmisc
+# ffmpeg for ad-hoc streaming/transcoding tests with USB cameras (not used
+# by the recording scripts).
+ffmpeg

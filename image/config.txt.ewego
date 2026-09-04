@@ -1,0 +1,33 @@
+# === EweGo Hardware Configuration ===
+# Appended to /boot/firmware/config.txt by image/inject-ewego.sh.
+# Same block that Firmware/setup/pi_setup.sh writes. dtparam=ant2 (external
+# antenna) is inserted at the top of the file separately, and [cm4]
+# otg_mode=1 (USB host mode for webcams) is verified separately.
+[all]
+enable_uart=1
+
+# Disable Bluetooth: frees the PL011 UART so the console on GPIO 14/15
+# (TX0/RX0) is the stable ttyAMA0 and serial0 aliases to it. The stock
+# cmdline.txt console=serial0,115200 then lands there.
+dtoverlay=disable-bt
+
+# Camera configuration (dual IMX708 on CSI). Harmless when using USB cameras.
+camera_auto_detect=0
+dtoverlay=imx708,cam0
+dtoverlay=imx708,cam1
+
+# Audio (stereo PDM mics through the voicehat soundcard overlay)
+dtoverlay=googlevoicehat-soundcard
+
+# GPS UART3 + UART4 (u-blox ZED-X20P; data on UART4 = GPIO 8/9)
+dtoverlay=uart3
+dtoverlay=uart4
+
+# IMU UART5 (BNO055 on GPIO 12/13)
+dtoverlay=uart5
+
+# Fuel gauge MAX17048 on I2C bus 1 (GPIO 2/3)
+dtparam=i2c_arm=on
+
+# GPU memory for H.264 encoding
+gpu_mem=256

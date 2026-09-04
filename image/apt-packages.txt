@@ -1,0 +1,9 @@
+# Debian / Raspberry Pi OS packages installed inside the image at build time
+# (image/inject-ewego.sh runs apt-get in an emulated chroot). One per line.
+# Same set that Firmware/setup/pi_setup.sh installed by hand, plus pyserial
+# and psmisc (fuser, used by sensor_test.py).
+python3-picamera2
+python3-smbus2
+python3-serial
+i2c-tools
+psmisc

@@ -1,0 +1,21 @@
+[Unit]
+Description=EweGo GPS logger (raw UBX + time sync CSV)
+Documentation=file:///opt/ewego/Firmware/gps-test/GPS_SERVICE_SETUP.md
+After=local-fs.target
+StartLimitIntervalSec=200
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ewego
+Environment=PYTHONPATH=/opt/ewego/pylib
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs
+# gps_logger.py stops cleanly on KeyboardInterrupt
+KillSignal=SIGINT
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# Pure-Python packages that Debian does not ship. Downloaded as wheels by
+# image/vendor-pylib.sh and unpacked into /opt/ewego/pylib on the image.
+# pyubx2 pulls in pynmeagps and pyrtcm, also pure Python.
+pyubx2>=1.2.59

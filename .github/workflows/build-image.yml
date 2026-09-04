@@ -1,0 +1,150 @@
+name: build-image
+
+# Builds a ready-to-flash Raspberry Pi OS Lite image with the EweGo firmware
+# baked in (see image/README.md). Checks run on every push; the image itself
+# is built on version tags (git tag v0.1.0 && git push --tags), which also
+# publishes a GitHub Release, or on demand via workflow_dispatch.
+
+on:
+  push:
+    branches: [main, phase-a-image]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BASE_IMAGE_URL: https://downloads.raspberrypi.com/raspios_lite_arm64_latest
+  OUT_IMAGE: ewego-raspios-lite-arm64.img
+
+jobs:
+  # Cheap checks on every push: scripts parse and lint, the Python firmware
+  # at least compiles, and the vendored packages are really pure Python.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Shell scripts
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          bash -n image/*.sh
+          shellcheck -S warning image/*.sh
+      - name: Python firmware compiles
+        run: git ls-files 'Firmware/*.py' 'Firmware/**/*.py' | xargs python3 -m py_compile
+      - name: Unit files have the required sections
+        run: |
+          for u in image/units/*.service; do
+            for s in Unit Service Install; do
+              grep -q "^\[$s\]" "$u" || { echo "$u: missing [$s]"; exit 1; }
+            done
+          done
+      - name: Vendor pure-Python packages
+        run: bash image/vendor-pylib.sh build/pylib
+      - uses: actions/upload-artifact@v6
+        with:
+          name: pylib
+          path: build/pylib
+          retention-days: 7
+
+  # The real build: download the official image, grow it, inject the
+  # firmware, run apt inside it under emulation, compress, checksum, and
+  # write the Raspberry Pi Imager metadata. Everything happens here at
+  # build time so the collar needs no network and no first-boot step.
+  image:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          name: pylib
+          path: build/pylib
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static binfmt-support rsync xz-utils fdisk e2fsprogs jq
+          # binfmt must hand aarch64 binaries to qemu for the chroot apt step
+          ls /proc/sys/fs/binfmt_misc/ | grep -q aarch64 || { echo "aarch64 binfmt not registered"; exit 1; }
+
+      - name: Download official Raspberry Pi OS Lite (arm64)
+        run: |
+          BASE=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$BASE_IMAGE_URL")
+          echo "BASE_IMAGE=$(basename "$BASE" .img.xz)" >> "$GITHUB_ENV"
+          echo "Base image: $BASE"
+          curl -fsSL -o raspios.img.xz "$BASE"
+          xz -d raspios.img.xz
+          ls -la raspios.img
+
+      - name: Inject EweGo firmware
+        env:
+          EWEGO_VERSION: ${{ github.ref_name }}
+        run: sudo -E bash image/inject-ewego.sh raspios.img --pylib build/pylib
+
+      - name: Compress, checksum, and Imager metadata
+        run: |
+          mv raspios.img "$OUT_IMAGE"
+
+          # Detect the first-boot mechanism (Bookworm: systemd firstrun,
+          # Trixie: cloud-init) for imager.json. Mount read-only with journal
+          # replay disabled so the hash computed next stays valid.
+          LOOP=$(sudo losetup -fP --show "$OUT_IMAGE"); sudo partx -a "$LOOP" 2>/dev/null || true
+          mkdir -p rootmnt && sudo mount -o ro,noload "${LOOP}p2" rootmnt
+          if [ -d rootmnt/etc/cloud ]; then INIT=cloudinit; else INIT=systemd; fi
+          echo "--- /etc/ewego-image-release"; cat rootmnt/etc/ewego-image-release
+          echo "--- units"; ls -la rootmnt/etc/systemd/system/ewego-*
+          echo "--- pylib"; ls rootmnt/opt/ewego/pylib
+          echo "--- picamera2"; ls -d rootmnt/usr/lib/python3/dist-packages/picamera2
+          sudo umount rootmnt && sudo losetup -d "$LOOP"
+
+          EXTRACT_SIZE=$(stat -c%s "$OUT_IMAGE")
+          EXTRACT_SHA256=$(sha256sum "$OUT_IMAGE" | cut -d' ' -f1)
+
+          xz -T0 -6 "$OUT_IMAGE"
+          sha256sum "$OUT_IMAGE.xz" > "$OUT_IMAGE.xz.sha256"
+          ls -la "$OUT_IMAGE.xz"
+
+          TAG="${{ github.ref_name }}"
+          jq -n \
+            --arg name "EweGo collar (Raspberry Pi OS Lite arm64 + EweGo $TAG)" \
+            --arg desc "Official Raspberry Pi OS Lite ($BASE_IMAGE) with the EweGo firmware preinstalled. Set hostname, user, Wi-Fi and SSH in Imager's customisation step." \
+            --arg url "https://github.com/${{ github.repository }}/releases/download/$TAG/$OUT_IMAGE.xz" \
+            --arg rd "$(date +%Y-%m-%d)" --arg init "$INIT" \
+            --argjson es "$EXTRACT_SIZE" --arg esha "$EXTRACT_SHA256" \
+            --argjson ds "$(stat -c%s "$OUT_IMAGE.xz")" \
+            '{os_list: [{name:$name, description:$desc, url:$url, release_date:$rd,
+              extract_size:$es, extract_sha256:$esha, image_download_size:$ds,
+              init_format:$init, devices:["pi4-64bit","pi5-64bit"]}]}' > imager.json
+          cat imager.json
+
+      # Manual runs (no tag) keep the image as a workflow artifact for a few
+      # days instead of publishing a release.
+      - uses: actions/upload-artifact@v6
+        if: "!startsWith(github.ref, 'refs/tags/v')"
+        with:
+          name: ${{ env.OUT_IMAGE }}
+          path: |
+            ${{ env.OUT_IMAGE }}.xz
+            ${{ env.OUT_IMAGE }}.xz.sha256
+            imager.json
+          retention-days: 3
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" --clobber \
+            "$OUT_IMAGE.xz" "$OUT_IMAGE.xz.sha256" imager.json \
+            image/inject-ewego.sh image/inject-ewego-mac.sh image/vendor-pylib.sh
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## EweGo image $TAG
+          - Base: $BASE_IMAGE
+          - Imager repository URL: \`https://github.com/${{ github.repository }}/releases/latest/download/imager.json\`
+          - Download: https://github.com/${{ github.repository }}/releases/download/$TAG/$OUT_IMAGE.xz
+          EOF

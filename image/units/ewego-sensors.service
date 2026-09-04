@@ -1,0 +1,23 @@
+[Unit]
+Description=EweGo sensor recorder (all sensors, via Firmware/sensor_test.py)
+Documentation=file:///opt/ewego/Firmware/setup/REQUIREMENTS.md
+After=local-fs.target
+
+[Service]
+Type=simple
+# Runs as root in this phase: the scripts open /dev/ttyAMA4, /dev/ttyAMA5,
+# /dev/i2c-1, the cameras, and the ALSA device directly.
+WorkingDirectory=/opt/ewego
+Environment=PYTHONPATH=/opt/ewego/pylib
+Environment=PYTHONUNBUFFERED=1
+# sensor_test.py writes a new /opt/ewego/sensor_test_<timestamp>/ per start.
+ExecStart=/usr/bin/python3 /opt/ewego/Firmware/sensor_test.py
+# sensor_test.py forwards SIGINT to its children and waits for them, so let
+# it do the shutdown; systemd only kills leftovers after the timeout.
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=30
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

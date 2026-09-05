@@ -152,6 +152,16 @@ done
 # make sure a re-run never leaves a stale enable symlink behind
 rm -f "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.service
 
+# The only unit enabled by default is the web test console (port 8080,
+# no authentication), so a freshly flashed collar can be exercised from a
+# browser. Recording units stay disabled until started deliberately.
+ENABLE_UNITS="ewego-webtest.service"
+install -d "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
+for u in $ENABLE_UNITS; do
+    log "Enabling $u"
+    ln -sf "/etc/systemd/system/$u" "$ROOT_MNT/etc/systemd/system/multi-user.target.wants/$u"
+done
+
 # --- rootfs: kernel modules and release marker ----------------------------
 echo i2c-dev > "$ROOT_MNT/etc/modules-load.d/ewego.conf"
 {
@@ -236,5 +246,6 @@ fi
 
 sync
 log "done: EweGo $EWEGO_VERSION injected into $TARGET"
-echo "    units installed but not enabled: $(ls "$IMAGE_DIR"/units | tr '\n' ' ')"
-echo "    enable on the collar with: sudo systemctl enable --now ewego-sensors"
+echo "    units installed: $(ls "$IMAGE_DIR"/units | tr '\n' ' ')"
+echo "    enabled by default: $ENABLE_UNITS (web console at http://<host>:8080)"
+echo "    start recording on the collar with: sudo systemctl start ewego-sensors"

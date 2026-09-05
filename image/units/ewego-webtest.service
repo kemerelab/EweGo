@@ -1,0 +1,17 @@
+[Unit]
+Description=EweGo web test console on port 8080 (no authentication)
+Documentation=file:///opt/ewego/Firmware/webtest/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Root: it starts/stops the other ewego units and opens the sensor devices.
+ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/webtest/ewego_webtest.py --port 8080
+Environment=PYTHONPATH=/opt/ewego/pylib
+Environment=EWEGO_DIR=/opt/ewego
+RuntimeDirectory=ewego-webtest
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

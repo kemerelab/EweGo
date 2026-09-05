@@ -14,7 +14,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | `/opt/ewego/Firmware/` | the `Firmware/` tree from this repository |
 | `/opt/ewego/pylib/` | pyubx2 (+ pynmeagps, pyrtcm), vendored pure-Python wheels |
 | apt packages | `python3-picamera2`, `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc`, `ffmpeg` — installed inside the image at build time |
-| `/etc/systemd/system/ewego-*.service` | `ewego-sensors` (all sensors via `sensor_test.py`), `ewego-dualcam`, `ewego-gps`. **Installed but not enabled.** |
+| `/etc/systemd/system/ewego-*.service` | `ewego-sensors` (all sensors via `sensor_test.py`), `ewego-dualcam`, `ewego-gps`: **installed but not enabled**. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
 | `/etc/ewego-image-release` | version tag and build date |
 | `config.txt` | `dtparam=ant2` at the top (external antenna); the hardware block from `pi_setup.sh` appended (UART console on GPIO 14/15, cameras, audio, GPS UART3/4, IMU UART5, I2C); `[cm4] otg_mode=1` verified (USB host mode, for webcams) |
@@ -32,7 +32,9 @@ the same place relative to the tree as when running from `~/EweGo` by hand.
    step (hostname, user, Wi-Fi, SSH key) available.
 2. Flash, boot. The collar joins the configured Wi-Fi and is reachable as
    `<hostname>.local`, or on the UART console (TX0/RX0, 115200 baud).
-3. Start recording when you want it:
+   Open `http://<hostname>.local:8080/` for the test console: device
+   presence, battery, clock, and a button per sensor, plus a live camera view.
+3. Start recording when you want it (or from the console's Units card):
 
        sudo systemctl start ewego-sensors      # this boot only
        sudo systemctl enable --now ewego-sensors   # every boot

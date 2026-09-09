@@ -22,6 +22,13 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 - **GPS**: raw read of the port at a chosen baud rate (counts UBX sync
   words, NMEA sentences, RTCM headers), and start/stop/journal of the logger
   unit. The raw read refuses to run while the logger owns the port.
+- **PPS**: the status strip shows whether `/dev/pps0` (GPS TP1 on GPIO 6)
+  exists, whether edges are arriving, the sequence count, the measured rate,
+  and the system clock's offset from the top of the GPS second at the last
+  edge (near 0 ms once the clock is on GPS time). "PPS watch" on the GPS
+  card prints each edge for N seconds with the interval since the previous
+  one, so jitter and missed pulses are visible. TP1 only pulses once the
+  receiver has a fix.
 - **Audio**: record N seconds from the voicehat card and play it back in
   the browser.
 - **Camera**: live MJPEG view (choose device, size, fps), snapshot, and

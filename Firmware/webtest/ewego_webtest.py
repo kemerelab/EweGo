@@ -101,6 +101,50 @@ def battery():
         return {"error": str(e)}
 
 
+_PPS_LAST = {}   # device -> (monotonic, seq) from the previous status call, for rate
+
+
+def read_pps_assert(dev="pps0"):
+    """Parse /sys/class/pps/<dev>/assert: '<realtime seconds>.<ns>#<sequence>'."""
+    try:
+        raw = Path(f"/sys/class/pps/{dev}/assert").read_text().strip()
+    except OSError:
+        return None
+    if "#" not in raw:
+        return None
+    ts, seq = raw.split("#", 1)
+    try:
+        return {"ts": float(ts), "seq": int(seq)}
+    except ValueError:
+        return None
+
+
+def pps_status():
+    """State of the GPS time pulse on /dev/pps0 (TP1 on GPIO 6)."""
+    devs = sorted(p.name for p in Path("/sys/class/pps").glob("pps*")) if Path("/sys/class/pps").exists() else []
+    if not devs:
+        return {"present": False, "error": "no /dev/pps* (is dtoverlay=pps-gpio,gpiopin=6 in config.txt?)"}
+    dev = devs[0]
+    a = read_pps_assert(dev)
+    if a is None:
+        return {"present": True, "device": dev, "pulses": False, "seq": 0, "age_s": None, "rate_hz": None,
+                "note": "no pulse yet: TP1 only runs once the receiver has a fix"}
+    now_m = time.monotonic()
+    rate = None
+    prev = _PPS_LAST.get(dev)
+    if prev and now_m - prev[0] >= 1.5:
+        rate = (a["seq"] - prev[1]) / (now_m - prev[0])
+    if not prev or now_m - prev[0] >= 1.5:
+        _PPS_LAST[dev] = (now_m, a["seq"])
+    age = time.time() - a["ts"]
+    return {
+        "present": True, "device": dev, "pulses": age < 2.5 and a["seq"] > 0,
+        "seq": a["seq"], "age_s": round(age, 3), "rate_hz": None if rate is None else round(rate, 3),
+        # fractional second of the edge in the system clock: ~0 when the clock is on GPS time
+        "clock_offset_ms": round(((a["ts"] + 0.5) % 1.0 - 0.5) * 1000, 1),
+    }
+
+
 def audio_card():
     """Return (card index, name) of the voicehat card, or None."""
     try:
@@ -171,6 +215,7 @@ def status():
         "disk": {"free_gb": round(du.free / 1e9, 2), "total_gb": round(du.total / 1e9, 2),
                  "path": str(EWEGO)},
         "battery": battery(),
+        "pps": pps_status(),
         "devices": devs,
         "audio_card": {"index": card[0], "name": card[1]} if card else None,
         "video": video_devices(),
@@ -303,6 +348,44 @@ def test_gps_raw(write, q):
             write(b"  e.g. " + m.group(0)[:120] + b"\n")
 
 
+def test_pps(write, q):
+    """Watch the time pulse for N seconds: one line per edge with the
+    interval since the previous edge and the system clock's offset from the
+    top of the second."""
+    secs = int(q.get("seconds", ["10"])[0])
+    st = pps_status()
+    if not st.get("present"):
+        write((st["error"] + "\n").encode())
+        return
+    dev = st["device"]
+    write(f"Watching /dev/{dev} (GPS TP1 on GPIO 6) for {secs}s. "
+          f"Offset = system clock minus nearest whole second at the edge; "
+          f"near 0 ms means the system clock is on GPS time.\n".encode())
+    write(b"   seq        edge time (UTC)        interval    offset\n")
+    last = read_pps_assert(dev)
+    last_seq = last["seq"] if last else -1
+    last_ts = last["ts"] if last else None
+    seen = 0
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        time.sleep(0.02)
+        a = read_pps_assert(dev)
+        if not a or a["seq"] == last_seq:
+            continue
+        interval = "" if last_ts is None else f"{(a['ts'] - last_ts) * 1000:9.3f} ms"
+        offset = ((a["ts"] + 0.5) % 1.0 - 0.5) * 1000
+        t = time.strftime("%H:%M:%S", time.gmtime(a["ts"])) + f".{int((a['ts'] % 1) * 1e6):06d}"
+        write(f"{a['seq']:6d}   {t}   {interval:>13s}   {offset:+8.1f} ms\n".encode())
+        if a["seq"] - last_seq > 1 and last_seq >= 0:
+            write(f"        (missed {a['seq'] - last_seq - 1} edge(s) between reads)\n".encode())
+        last_seq, last_ts = a["seq"], a["ts"]
+        seen += 1
+    if seen == 0:
+        write(b"no edges seen. TP1 only pulses once the receiver has a fix; check the GPS fix in the logger journal.\n")
+    else:
+        write(f"{seen} edges in {secs}s\n".encode())
+
+
 def test_audio(write, q):
     secs = int(q.get("seconds", ["5"])[0])
     dev = audio_device()
@@ -355,6 +438,7 @@ TESTS = {
     "fuel": (test_fuel, None),
     "imu": (test_imu, "imu"),
     "gps-raw": (test_gps_raw, "gps"),
+    "pps": (test_pps, None),
     "audio": (test_audio, "audio"),
     "alsa": (test_alsa, None),
     "camera-info": (test_camera_info, "camera"),
@@ -619,6 +703,7 @@ PAGE = r"""<!doctype html>
   <span id="release"></span>
   <span id="clock"></span>
   <span id="batt"></span>
+  <span id="pps"></span>
   <span id="disk"></span>
   <span id="load"></span>
   <span id="ips"></span>
@@ -671,6 +756,8 @@ PAGE = r"""<!doctype html>
     <button class="primary" onclick="run('gps-raw','out-gps','&seconds='+val('gps-s')+'&baud='+val('gps-b'))">Raw read</button>
     <input id="gps-s" value="3" size="3"> s at
     <select id="gps-b"><option>460800</option><option>230400</option><option>115200</option><option>38400</option><option>9600</option></select>
+    <button onclick="run('pps','out-gps','&seconds='+val('pps-s'))">PPS watch</button>
+    <input id="pps-s" value="10" size="3"> s
     <button onclick="unit('ewego-gps','start')">Start logger</button>
     <button onclick="unit('ewego-gps','stop')">Stop logger</button>
     <button onclick="journal('ewego-gps','out-gps')">Logger journal</button>
@@ -730,6 +817,10 @@ async function refresh() {
     $('clock').innerHTML = 'clock ' + (s.clock.synchronized ? '<span class="ok">synced</span>' : '<span class="bad">NOT synced</span>') + ' ' + s.clock.utc + ' UTC';
     $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>'
         : 'battery ' + s.battery.voltage + ' V · ' + s.battery.soc + ' %';
+    const p = s.pps;
+    $('pps').innerHTML = !p.present ? '<span class="bad">PPS: no device</span>'
+        : (p.pulses ? '<span class="ok">PPS live</span> seq ' + p.seq + (p.rate_hz != null ? ' · ' + p.rate_hz.toFixed(2) + ' Hz' : '') + ' · clock ' + (p.clock_offset_ms >= 0 ? '+' : '') + p.clock_offset_ms + ' ms'
+                    : '<span class="bad">PPS: no pulse</span>' + (p.seq ? ' (last ' + Math.round(p.age_s) + ' s ago)' : ' (waiting for fix)'));
     $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
     $('load').textContent = 'load ' + s.load.map(x => x.toFixed(2)).join(' ') + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
     $('ips').textContent = s.ips.join(' ');

@@ -211,19 +211,26 @@ if [ -f "$ROOT_MNT/etc/cloud/cloud.cfg" ]; then
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src).read()
-m = re.search(r"^cloud_config_modules:[ \t]*\n((?:[ \t]+-.*\n|[ \t]*#.*\n|[ \t]*\n)+)", text, re.M)
-if not m:
-    sys.exit("error: cloud_config_modules list not found in " + src)
-items = [l for l in m.group(1).splitlines() if l.strip().startswith("-")]
-kept = [l for l in items if "package" not in l.lower()]
-if len(kept) == len(items):
-    sys.exit("error: no package module found in cloud_config_modules of " + src)
+out = ("# EweGo: everything is installed at image build time. Do not let cloud-init\n"
+       "# (Raspberry Pi Imager's user-data) install or upgrade packages at first boot.\n"
+       "package_update: false\npackage_upgrade: false\npackage_reboot_if_required: false\n")
+removed = 0
+# The package module may sit in any of the three stage lists depending on
+# the cloud-init version; rewrite every list that contains it.
+for key in ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules"):
+    m = re.search(r"^" + key + r":[ \t]*\n((?:[ \t]+-.*\n|[ \t]*#.*\n|[ \t]*\n)+)", text, re.M)
+    if not m:
+        continue
+    items = [l for l in m.group(1).splitlines() if l.strip().startswith("-")]
+    kept = [l for l in items if "package" not in l.lower()]
+    if len(kept) != len(items):
+        removed += len(items) - len(kept)
+        out += key + ":\n" + "\n".join(kept) + "\n"
+if not removed:
+    sys.exit("error: no package module found in any cloud-init module list of " + src)
 with open(dst, "w") as f:
-    f.write("# EweGo: everything is installed at image build time. Do not let cloud-init\n"
-            "# (Raspberry Pi Imager's user-data) install or upgrade packages at first boot.\n"
-            "package_update: false\npackage_upgrade: false\npackage_reboot_if_required: false\n"
-            "cloud_config_modules:\n" + "\n".join(kept) + "\n")
-print("cloud-init: removed %d package module(s), kept %d" % (len(items) - len(kept), len(kept)))
+    f.write(out)
+print("cloud-init: removed %d package module entr%s" % (removed, "y" if removed == 1 else "ies"))
 PY
 fi
 

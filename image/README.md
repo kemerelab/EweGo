@@ -17,7 +17,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | `/etc/systemd/system/ewego-*.service` | `ewego-sensors` (all sensors via `sensor_test.py`), `ewego-dualcam`, `ewego-gps`: **installed but not enabled**. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
 | `/etc/ewego-image-release` | version tag and build date |
-| `config.txt` | `dtparam=ant2` at the top (external antenna); the hardware block from `pi_setup.sh` appended (UART console on GPIO 14/15, cameras, audio, GPS UART3/4, GPS PPS on GPIO 6 as `/dev/pps0`, IMU UART5, I2C); `[cm4] otg_mode=1` verified (USB host mode, for webcams) |
+| `config.txt` | `dtparam=ant2` at the top (external antenna); the hardware block from `pi_setup.sh` appended (UART console on GPIO 14/15, cameras, audio, GPS UART4 with GPIO 4/5 left as unpulled inputs, GPS PPS on GPIO 6 as `/dev/pps0`, IMU UART5, I2C); `[cm4] otg_mode=1` verified (USB host mode, for webcams) |
 | `cmdline.txt` | untouched: `console=serial0,115200` stays, and `serial0` is `ttyAMA0` on TX0/RX0 |
 
 Recordings from `ewego-sensors` land in `/opt/ewego/sensor_test_<timestamp>/`,

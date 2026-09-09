@@ -19,10 +19,13 @@ dtoverlay=imx708,cam1
 # Audio (stereo PDM mics through the voicehat soundcard overlay)
 dtoverlay=googlevoicehat-soundcard
 
-# GPS UART3 + UART4 (u-blox ZED-X20P; data on UART4 = GPIO 8/9,
-# module UART2 on UART3 = GPIO 4/5, unused)
-dtoverlay=uart3
+# GPS data: module UART1 on Pi UART4 (GPIO 8/9)
 dtoverlay=uart4
+
+# GPIO 4/5 go to the GNSS header as UART3 but are unused: leave them as
+# plain inputs with no pull so nothing on the Pi side can drive or bias the
+# module's second UART. Re-enable with dtoverlay=uart3 if it is ever needed.
+gpio=4,5=ip,pn
 
 # GPS time pulse (TP1 / GPS_TIME_1) on GPIO 6 -> /dev/pps0
 dtoverlay=pps-gpio,gpiopin=6

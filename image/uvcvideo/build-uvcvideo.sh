@@ -60,6 +60,11 @@ options uvcvideo max_payload=$MAX_PAYLOAD
 EOF
 log "max_payload=$MAX_PAYLOAD set in /etc/modprobe.d/ewego-uvc.conf"
 
+# The module only matches this kernel. Hold the kernel packages so an
+# 'apt upgrade' on a collar cannot swap the kernel and silently drop the cap.
+log "Holding kernel packages at $KVER"
+apt-mark hold linux-image-rpi-v8 linux-image-rpi-2712 "linux-image-$KVER" 2>/dev/null | grep -v '^$' || true
+
 log "Removing build tools"
 apt-get purge -y -q $BUILD_PKGS "$HEADERS_PKG" >/dev/null
 apt-get autoremove -y -q --purge >/dev/null

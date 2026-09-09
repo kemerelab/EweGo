@@ -677,9 +677,19 @@ def test_uvc_probe(write, q):
         write(f"cannot set uvcvideo trace: {e}\n".encode())
         return
     rc, before = sh(["bash", "-c", "dmesg | wc -l"])
-    rc, mp = sh(["cat", "/sys/module/uvcvideo/parameters/max_payload"])
+    rc_mp, mp = sh(["cat", "/sys/module/uvcvideo/parameters/max_payload"])
     rc, mi = sh(["bash", "-c", "modinfo -F filename uvcvideo"])
-    write(f"uvcvideo: {mi.strip()}  max_payload={mp.strip() if rc == 0 and mp.strip() else 'not available (stock module)'}\n".encode())
+    rc, kv = sh(["uname", "-r"])
+    write(f"running kernel: {kv.strip()}\n".encode())
+    write(f"uvcvideo in use: {mi.strip()}\n".encode())
+    write(f"max_payload: {mp.strip() if rc_mp == 0 and mp.strip() else 'NOT AVAILABLE (stock module loaded)'}\n".encode())
+    rc, inv = sh(["bash", "-c", "for d in /lib/modules/*; do echo \"  $d: $(ls $d/updates 2>/dev/null | tr '\\n' ' ')\"; done; "
+                  "echo '  modprobe.d:'; cat /etc/modprobe.d/ewego-uvc.conf 2>/dev/null | grep -v '^#' || echo '  (no ewego-uvc.conf)'; "
+                  "grep EWEGO_VERSION /etc/ewego-image-release 2>/dev/null"])
+    write(b"module inventory (kernel dir: files in updates/):\n" + inv.encode())
+    if rc_mp != 0:
+        write(b"-> the patched module is not loaded. If the running kernel does not match the directory that\n"
+              b"   holds updates/uvcvideo.ko, the image was built for a different kernel than it boots.\n")
     write(f"Probing {dev} at {size} {fps} fps MJPG with uvcvideo trace on ...\n".encode())
     argv = ["v4l2-ctl", "-d", dev, f"--set-fmt-video=width={w},height={h},pixelformat=MJPG",
             f"--set-parm={fps}", "--stream-mmap", "--stream-poll", "--stream-count=10", "--stream-to=/dev/null"]

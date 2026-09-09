@@ -745,6 +745,25 @@ def test_serial_ports(write, q):
                    write)
 
 
+def test_firstboot(write, q):
+    """Who ran apt on this card, and what first-boot automation is configured."""
+    stream_process(["bash", "-c",
+                    "echo '== apt history (kernel/upgrade entries)'; "
+                    "grep -B2 -A4 -E 'linux-image|Upgrade:' /var/log/apt/history.log 2>/dev/null | head -60 || echo none; "
+                    "echo; echo '== Imager / cloud-init user-data (package directives)'; "
+                    "grep -n -iE 'package|apt|upgrade' /boot/firmware/user-data 2>/dev/null || echo '(no user-data or no package lines)'; "
+                    "echo; echo '== cloud-init config package/upgrade settings'; "
+                    "grep -rn -iE 'package_(update|upgrade)|package-update' /etc/cloud/ 2>/dev/null || echo '(none)'; "
+                    "echo; echo '== cloud-init log: apt activity'; "
+                    "grep -iE 'apt|package' /var/log/cloud-init.log 2>/dev/null | grep -viE 'debug' | tail -n 20 || echo '(no cloud-init log)'; "
+                    "echo; echo '== unattended-upgrades / apt timers'; "
+                    "systemctl list-timers --all --no-pager 2>/dev/null | grep -iE 'apt|unattended' || echo '(no apt timers)'; "
+                    "dpkg -l unattended-upgrades 2>/dev/null | tail -n 1; "
+                    "echo; echo '== kernel packages and holds'; "
+                    "dpkg -l 'linux-image-*' 2>/dev/null | grep '^[hi]i' ; apt-mark showhold 2>/dev/null"],
+                   write)
+
+
 def test_config(write, q):
     stream_process(["bash", "-c", "grep -v '^#' /boot/firmware/config.txt | grep -v '^$'; echo; "
                     "echo cmdline.txt:; cat /boot/firmware/cmdline.txt"], write)
@@ -767,6 +786,7 @@ TESTS = {
     "i2c": (test_i2c, None),
     "serial": (test_serial_ports, None),
     "config": (test_config, None),
+    "firstboot": (test_firstboot, None),
 }
 
 
@@ -1039,6 +1059,7 @@ PAGE = r"""<!doctype html>
     <button onclick="run('usb','out-devs')">USB tree</button>
     <button onclick="run('alsa','out-devs')">ALSA cards</button>
     <button onclick="run('config','out-devs')">config.txt</button>
+    <button onclick="run('firstboot','out-devs')">apt / first-boot history</button>
     <button onclick="run('dmesg','out-devs')">dmesg tail</button>
   </div>
   <pre id="out-devs"></pre>

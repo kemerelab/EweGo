@@ -10,3 +10,7 @@ psmisc
 # ffmpeg for ad-hoc streaming/transcoding tests with USB cameras (not used
 # by the recording scripts).
 ffmpeg
+# avahi-daemon gives <hostname>.local. Raspberry Pi Imager's cloud-init
+# user-data would otherwise apt-install it at first boot; the image disables
+# that module, so it has to be here.
+avahi-daemon

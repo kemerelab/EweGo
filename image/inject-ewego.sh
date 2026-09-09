@@ -197,6 +197,36 @@ for u in $ENABLE_UNITS; do
     ln -sf "/etc/systemd/system/$u" "$ROOT_MNT/etc/systemd/system/multi-user.target.wants/$u"
 done
 
+# --- rootfs: no apt at first boot -------------------------------------------
+# Raspberry Pi Imager's cloud-init user-data asks for package installs and
+# a full upgrade on first boot ("packages: [avahi-daemon]",
+# "package_upgrade: true"). That needs network, takes minutes, and replaced
+# the kernel under the patched uvcvideo once. Everything is baked in here
+# instead (avahi-daemon is in apt-packages.txt), so drop cloud-init's
+# package module from the module list. user-data cannot re-enable a module
+# that is not in the list.
+if [ -f "$ROOT_MNT/etc/cloud/cloud.cfg" ]; then
+    log "Disabling cloud-init package installs/upgrades at first boot"
+    python3 - "$ROOT_MNT/etc/cloud/cloud.cfg" "$ROOT_MNT/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg" <<'PY'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+m = re.search(r"^cloud_config_modules:[ \t]*\n((?:[ \t]+-.*\n|[ \t]*#.*\n|[ \t]*\n)+)", text, re.M)
+if not m:
+    sys.exit("error: cloud_config_modules list not found in " + src)
+items = [l for l in m.group(1).splitlines() if l.strip().startswith("-")]
+kept = [l for l in items if "package" not in l.lower()]
+if len(kept) == len(items):
+    sys.exit("error: no package module found in cloud_config_modules of " + src)
+with open(dst, "w") as f:
+    f.write("# EweGo: everything is installed at image build time. Do not let cloud-init\n"
+            "# (Raspberry Pi Imager's user-data) install or upgrade packages at first boot.\n"
+            "package_update: false\npackage_upgrade: false\npackage_reboot_if_required: false\n"
+            "cloud_config_modules:\n" + "\n".join(kept) + "\n")
+print("cloud-init: removed %d package module(s), kept %d" % (len(items) - len(kept), len(kept)))
+PY
+fi
+
 # --- rootfs: kernel modules and release marker ----------------------------
 echo i2c-dev > "$ROOT_MNT/etc/modules-load.d/ewego.conf"
 {

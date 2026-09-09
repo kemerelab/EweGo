@@ -133,6 +133,8 @@ jobs:
           echo "--- picamera2"; ls -d rootmnt/usr/lib/python3/dist-packages/picamera2
           echo "--- patched uvcvideo"; ls -la rootmnt/lib/modules/*/updates/uvcvideo.ko; cat rootmnt/etc/modprobe.d/ewego-uvc.conf
           echo "--- ewego-cam"; ls -la rootmnt/usr/local/bin/ewego-cam; file rootmnt/usr/local/bin/ewego-cam; ls rootmnt/etc/ewego/
+          echo "--- cloud-init: no apt at first boot"; cat rootmnt/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg
+          echo "--- kernels and holds"; ls rootmnt/lib/modules/; sudo chroot rootmnt apt-mark showhold 2>/dev/null || grep -A1 'linux-image' rootmnt/var/lib/dpkg/status | grep -c hold
           sudo umount rootmnt && sudo losetup -d "$LOOP"
 
           EXTRACT_SIZE=$(stat -c%s "$OUT_IMAGE")

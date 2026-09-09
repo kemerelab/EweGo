@@ -57,6 +57,14 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   port: values for the collar's hub after `ewego-cam --list`). Bench next:
   single-camera 10 min run, then both units at once; compare the summary
   intervals with hwtimestamps=0/1.
+- v0.4.3 (2026-09-09): Raspberry Pi Imager's cloud-init user-data ran apt at
+  first boot (avahi-daemon install + package_upgrade) and replaced the kernel
+  (6.18.34 -> 6.18.39), so the patched uvcvideo built for the image kernel
+  was not loaded. Fixed in the image: cloud-init's package module is
+  stripped from `cloud_final_modules` via
+  `/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg`, avahi-daemon is baked in,
+  kernel packages are held. Reflash from v0.4.3 or later; never run apt on
+  a collar. Console has an "apt / first-boot history" button.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

@@ -602,6 +602,9 @@ def test_uvc_probe(write, q):
         write(f"cannot set uvcvideo trace: {e}\n".encode())
         return
     rc, before = sh(["bash", "-c", "dmesg | wc -l"])
+    rc, mp = sh(["cat", "/sys/module/uvcvideo/parameters/max_payload"])
+    rc, mi = sh(["bash", "-c", "modinfo -F filename uvcvideo"])
+    write(f"uvcvideo: {mi.strip()}  max_payload={mp.strip() if rc == 0 and mp.strip() else 'not available (stock module)'}\n".encode())
     write(f"Probing {dev} at {size} {fps} fps MJPG with uvcvideo trace on ...\n".encode())
     argv = ["v4l2-ctl", "-d", dev, f"--set-fmt-video=width={w},height={h},pixelformat=MJPG",
             f"--set-parm={fps}", "--stream-mmap", "--stream-poll", "--stream-count=10", "--stream-to=/dev/null"]

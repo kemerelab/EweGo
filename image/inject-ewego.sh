@@ -11,8 +11,11 @@
 #   --pylib DIR   directory produced by vendor-pylib.sh (pure-Python packages
 #                 that Debian does not ship). Default: <repo>/build/pylib
 #   --no-apt      skip the apt step (for quick tests of the file injection)
+#   --no-uvc      skip building the patched uvcvideo module (see uvcvideo/)
 #   --grow SIZE   grow an image FILE by SIZE before injecting (default 1G,
 #                 0 to disable). Ignored for block devices.
+# Environment:
+#   UVC_MAX_PAYLOAD  bytes per microframe each camera may reserve (default 2048)
 #
 # What it does to the target:
 #   rootfs: /opt/ewego/                          Firmware tree from this repo
@@ -22,6 +25,10 @@
 #           /etc/ewego-image-release             version + build date
 #           apt packages from apt-packages.txt   installed inside the image
 #                                                through an emulated chroot
+#           /lib/modules/<ver>/updates/uvcvideo.ko  patched UVC driver with a
+#                                                max_payload cap, built in the
+#                                                same chroot (uvcvideo/README.md)
+#           /etc/modprobe.d/ewego-uvc.conf       options uvcvideo max_payload=2048
 #   boot:   config.txt                           dtparam=ant2 at the top,
 #                                                hardware block appended,
 #                                                [cm4] otg_mode=1 verified
@@ -44,14 +51,17 @@ IMAGE_DIR="$REPO_ROOT/image"
 TARGET=""
 PYLIB="$REPO_ROOT/build/pylib"
 DO_APT=1
+DO_UVC=1
 GROW="1G"
+UVC_MAX_PAYLOAD=${UVC_MAX_PAYLOAD:-2048}
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --pylib)  PYLIB=$2; shift 2 ;;
         --no-apt) DO_APT=0; shift ;;
+        --no-uvc) DO_UVC=0; shift ;;
         --grow)   GROW=$2; shift 2 ;;
-        -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
         -*)       die "unknown option $1" ;;
         *)        [ -z "$TARGET" ] || die "unexpected argument $1"; TARGET=$1; shift ;;
     esac
@@ -65,6 +75,11 @@ for f in apt-packages.txt config.txt.ewego units; do
     [ -e "$IMAGE_DIR/$f" ] || die "missing $IMAGE_DIR/$f"
 done
 command -v rsync >/dev/null || die "rsync is required"
+if [ "$DO_UVC" -eq 1 ]; then
+    command -v git >/dev/null || die "git is required to fetch the uvcvideo source (or pass --no-uvc)"
+    command -v python3 >/dev/null || die "python3 is required to patch the uvcvideo source (or pass --no-uvc)"
+    [ "$DO_APT" -eq 1 ] || die "--no-uvc is required together with --no-apt (the module is built in the chroot)"
+fi
 
 APT_PACKAGES=$(grep -Ev '^\s*(#|$)' "$IMAGE_DIR/apt-packages.txt" | xargs)
 EWEGO_VERSION=${EWEGO_VERSION:-$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)}
@@ -203,15 +218,39 @@ if [ "$DO_APT" -eq 1 ]; then
     printf '#!/bin/sh\nexit 101\n' > "$ROOT_MNT/usr/sbin/policy-rc.d"
     chmod 755 "$ROOT_MNT/usr/sbin/policy-rc.d"
 
-    if ! chroot "$ROOT_MNT" /usr/bin/env -i \
+    in_chroot() {
+        chroot "$ROOT_MNT" /usr/bin/env -i \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             HOME=/root LC_ALL=C.UTF-8 LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
-            bash -c "apt-get update -q && \
-                     apt-get install -y -q --no-install-recommends $APT_PACKAGES && \
-                     apt-get clean && rm -rf /var/lib/apt/lists/*"; then
+            "$@"
+    }
+
+    if ! in_chroot bash -c "apt-get update -q && \
+                            apt-get install -y -q --no-install-recommends $APT_PACKAGES"; then
         echo "hint: 'Exec format error' means aarch64 emulation is not set up — install qemu-user-static and binfmt-support" >&2
         die "apt step failed"
     fi
+
+    # --- patched uvcvideo module (see uvcvideo/README.md) ------------------
+    if [ "$DO_UVC" -eq 1 ]; then
+        KVER=$(ls "$ROOT_MNT/lib/modules" | grep -- '-rpi-v8$' | sort -V | tail -1)
+        [ -n "$KVER" ] || die "no *-rpi-v8 kernel in the image"
+        KBRANCH="rpi-$(echo "$KVER" | cut -d. -f1,2).y"
+        log "Fetching uvcvideo source from raspberrypi/linux $KBRANCH for kernel $KVER"
+        git clone -q --depth 1 --filter=blob:none --sparse --branch "$KBRANCH" \
+            https://github.com/raspberrypi/linux.git "$WORK/rpi-linux"
+        git -C "$WORK/rpi-linux" sparse-checkout set --no-cone drivers/media/usb/uvc >/dev/null
+        rm -rf "$ROOT_MNT/tmp/uvc-src"
+        cp -a "$WORK/rpi-linux/drivers/media/usb/uvc" "$ROOT_MNT/tmp/uvc-src"
+        rm -rf "$WORK/rpi-linux"
+        python3 "$IMAGE_DIR/uvcvideo/patch-uvcvideo.py" "$ROOT_MNT/tmp/uvc-src"
+        install -m 755 "$IMAGE_DIR/uvcvideo/build-uvcvideo.sh" "$ROOT_MNT/tmp/build-uvcvideo.sh"
+        log "Building the patched uvcvideo inside the image (emulated; takes a few minutes)"
+        in_chroot env MAX_PAYLOAD="$UVC_MAX_PAYLOAD" bash /tmp/build-uvcvideo.sh || die "uvcvideo build failed"
+        rm -f "$ROOT_MNT/tmp/build-uvcvideo.sh"
+    fi
+
+    in_chroot bash -c "apt-get clean && rm -rf /var/lib/apt/lists/*"
 
     rm -f "$ROOT_MNT/usr/sbin/policy-rc.d"
     rm -f "$ROOT_MNT/etc/resolv.conf"

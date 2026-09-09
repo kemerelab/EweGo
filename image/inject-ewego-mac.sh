@@ -42,7 +42,7 @@ docker run --rm --privileged \
     -v "$REPO_ROOT":/repo:ro \
     debian:stable-slim \
     bash -c "apt-get update -qq >/dev/null && \
-             apt-get install -y -qq rsync fdisk e2fsprogs unzip python3-pip >/dev/null && \
+             apt-get install -y -qq rsync fdisk e2fsprogs unzip python3-pip git ca-certificates >/dev/null && \
              /repo/image/vendor-pylib.sh /tmp/pylib && \
              /repo/image/inject-ewego.sh /img/$IMG_NAME --pylib /tmp/pylib $*"
 

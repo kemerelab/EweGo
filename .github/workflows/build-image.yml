@@ -26,10 +26,18 @@ jobs:
       - name: Shell scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          bash -n image/*.sh
-          shellcheck -S warning image/*.sh
+          bash -n image/*.sh image/uvcvideo/*.sh
+          shellcheck -S warning image/*.sh image/uvcvideo/*.sh
       - name: Python firmware compiles
-        run: git ls-files 'Firmware/*.py' 'Firmware/**/*.py' | xargs python3 -m py_compile
+        run: git ls-files 'Firmware/*.py' 'Firmware/**/*.py' 'image/**/*.py' | xargs python3 -m py_compile
+      - name: uvcvideo patch applies to the current Pi kernel source
+        run: |
+          mkdir -p uvc-src
+          for f in uvc_driver.c uvc_video.c uvcvideo.h; do
+            curl -fsSL -o uvc-src/$f https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/drivers/media/usb/uvc/$f
+          done
+          python3 image/uvcvideo/patch-uvcvideo.py uvc-src
+          grep -c uvc_max_payload_param uvc-src/uvc_video.c
       - name: Unit files have the required sections
         run: |
           for u in image/units/*.service; do
@@ -97,6 +105,7 @@ jobs:
           echo "--- units"; ls -la rootmnt/etc/systemd/system/ewego-*
           echo "--- pylib"; ls rootmnt/opt/ewego/pylib
           echo "--- picamera2"; ls -d rootmnt/usr/lib/python3/dist-packages/picamera2
+          echo "--- patched uvcvideo"; ls -la rootmnt/lib/modules/*/updates/uvcvideo.ko; cat rootmnt/etc/modprobe.d/ewego-uvc.conf
           sudo umount rootmnt && sudo losetup -d "$LOOP"
 
           EXTRACT_SIZE=$(stat -c%s "$OUT_IMAGE")

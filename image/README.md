@@ -16,6 +16,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | apt packages | `python3-picamera2`, `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc`, `ffmpeg` — installed inside the image at build time |
 | `/etc/systemd/system/ewego-*.service` | `ewego-sensors` (all sensors via `sensor_test.py`), `ewego-dualcam`, `ewego-gps`: **installed but not enabled**. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
+| `/lib/modules/<ver>/updates/uvcvideo.ko`, `/etc/modprobe.d/ewego-uvc.conf` | patched UVC driver with a `max_payload=2048` cap so two MJPEG cameras fit on the CM4's single USB 2.0 bus; built in the chroot at image build time (see `uvcvideo/README.md`) |
 | `/etc/ewego-image-release` | version tag and build date |
 | `config.txt` | `dtparam=ant2` at the top (external antenna); the hardware block from `pi_setup.sh` appended (UART console on GPIO 14/15, cameras, audio, GPS UART4 with GPIO 4/5 left as unpulled inputs, GPS PPS on GPIO 6 as `/dev/pps0`, IMU UART5, I2C); `[cm4] otg_mode=1` verified (USB host mode, for webcams) |
 | `cmdline.txt` | untouched: `console=serial0,115200` stays, and `serial0` is `ttyAMA0` on TX0/RX0 |

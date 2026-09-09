@@ -49,10 +49,17 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
 - v0.3.1 = first image with the patched module, built green (image kernel
   6.18.34+rpt-rpi-v8; the injector follows whatever kernel the image has).
   Next: confirm on the collar (Bandwidth probe should log "capping
-  requested bandwidth 3060 to 2048", drop test with both cameras PASS), then write
-  `ewego-cam`, a standalone static C V4L2 recorder (MJPEG frames +
-  int64 µs kernel timestamps + seq/flags index, drop accounting via
-  sequence gaps; design in plan §4).
+  requested bandwidth 3060 to 2048", drop test with both cameras PASS).
+- v0.4.0 adds `ewego-cam` (`Firmware/uvccam/`, static C V4L2 recorder:
+  MJPEG + int64 µs kernel timestamps + index + summary.json, exit 2 on any
+  lost frame; `--device port:1.3` selects by hub port), units
+  `ewego-cam@camera1/2` reading `/etc/ewego/cam-*.conf` (disabled; set the
+  port: values for the collar's hub after `ewego-cam --list`). Bench next:
+  single-camera 10 min run, then both units at once; compare the summary
+  intervals with hwtimestamps=0/1.
+- After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
+  configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
+  burst reads; then a systemd target replacing sensor_test.py.
 - Known limits: NetworkManager still in use (SD corruption after power
   loss, bug 001, until low-battery shutdown lands); NTRIP caster
   hard-coded to 192.168.1.213 in gps_logger.py; no RTC on the CM4.

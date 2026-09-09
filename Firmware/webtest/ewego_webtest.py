@@ -428,20 +428,32 @@ def test_dualcam(write, q):
         return
     w, h = size.split("x")
     count = secs * fps
+    stagger = float(q.get("stagger", ["1.0"])[0])
     write(f"Capturing {count} frames ({secs}s at {fps} fps, {size} MJPG) from {len(devs)} camera(s) "
-          f"simultaneously to /dev/null.\nDrop detection uses the kernel sequence number of each buffer; "
-          f"a gap means the frame was lost between camera and driver.\n\n".encode())
+          f"simultaneously to /dev/null, starts staggered by {stagger:g}s.\n"
+          f"Drop detection uses the kernel sequence number of each buffer; "
+          f"a gap means the frame was lost between camera and driver.\n".encode())
+    rc, quirks = sh(["cat", "/sys/module/uvcvideo/parameters/quirks"])
+    write(f"uvcvideo quirks={quirks.strip() or '?'} (128 = bandwidth fix)\n\n".encode())
+    rc, dmesg_before = sh(["bash", "-c", "dmesg | wc -l"])
 
     stats = {d: {"frames": 0, "first": None, "last": None, "gaps": 0, "lost": 0, "gap_at": [],
                  "errors": 0, "bytes": 0, "t0": None, "t1": None, "dt_min": None, "dt_max": 0.0,
-                 "last_ts": None, "tail": []} for d in devs}
+                 "last_ts": None, "tail": [], "started": None} for d in devs}
     procs = {}
-    for d in devs:
+    for i, d in enumerate(devs):
+        if i and stagger > 0:
+            time.sleep(stagger)
+        # --stream-poll: use select() with v4l2-ctl's timeout instead of a
+        # blocking DQBUF, so a camera that starts but never delivers a frame
+        # reports "select timeout" instead of hanging until we kill it.
         argv = ["v4l2-ctl", "-d", d, f"--set-fmt-video=width={w},height={h},pixelformat=MJPG",
-                f"--set-parm={fps}", "--stream-mmap", f"--stream-count={count}",
+                f"--set-parm={fps}", "--stream-mmap", "--stream-poll", f"--stream-count={count}",
                 "--stream-to=/dev/null", "--verbose"]
         procs[d] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+        stats[d]["started"] = time.monotonic()
+        write(f"  started {d}\n".encode())
 
     def reader(d):
         s = stats[d]
@@ -482,15 +494,23 @@ def test_dualcam(write, q):
     threads = [threading.Thread(target=reader, args=(d,), daemon=True) for d in devs]
     for t in threads:
         t.start()
+    killed = set()
     try:
-        deadline = time.monotonic() + secs + 15
+        deadline = time.monotonic() + secs + 15 + stagger * len(devs)
         while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
             time.sleep(2)
-            write(("  " + "   ".join(f"{d}: {stats[d]['frames']} frames, {stats[d]['lost']} lost"
-                                     for d in devs) + "\n").encode())
+            parts = []
+            for d in devs:
+                s = stats[d]
+                note = ""
+                if s["frames"] == 0 and procs[d].poll() is None and time.monotonic() - s["started"] > 4:
+                    note = " (streaming but NO frames yet)"
+                parts.append(f"{d}: {s['frames']} frames, {s['lost']} lost{note}")
+            write(("  " + "   ".join(parts) + "\n").encode())
     finally:
-        for p in procs.values():
+        for d, p in procs.items():
             if p.poll() is None:
+                killed.add(d)
                 try:
                     os.killpg(os.getpgid(p.pid), signal.SIGTERM)
                 except ProcessLookupError:
@@ -505,19 +525,41 @@ def test_dualcam(write, q):
         rc = procs[d].returncode
         dur = (s["t1"] - s["t0"]) if s["t0"] is not None and s["t1"] is not None else 0
         eff = (s["frames"] - 1) / dur if dur > 0 and s["frames"] > 1 else 0
-        write(f"  {d}: exit {rc}, {s['frames']}/{count} frames, {s['lost']} lost in {s['gaps']} gap(s)"
+        how = "killed by the test after the deadline" if d in killed else f"exit {rc}"
+        write(f"  {d}: {how}, {s['frames']}/{count} frames, {s['lost']} lost in {s['gaps']} gap(s)"
               f"{' at ' + ', '.join(s['gap_at']) if s['gap_at'] else ''}, {s['errors']} error-flagged\n".encode())
         if s["frames"] > 1:
             write(f"      {eff:.2f} fps effective, interval min {s['dt_min'] * 1000:.1f} / max {s['dt_max'] * 1000:.1f} ms, "
                   f"{s['bytes'] / max(dur, 1e-9) / 1e6:.1f} MB/s, {s['bytes'] / s['frames'] / 1e3:.0f} KB/frame\n".encode())
         if s["frames"] < count or s["lost"] or s["errors"] or rc != 0:
             ok = False
-            if s["tail"]:
-                write(("      last v4l2-ctl output: " + " | ".join(s["tail"]) + "\n").encode())
-    write((b"PASS: no frames lost on any camera\n" if ok else b"FAIL: see above\n"))
-    rc, out = sh(["bash", "-c", "dmesg -T | grep -iE 'uvcvideo|usb [0-9]' | tail -n 8"])
-    if out.strip():
-        write(b"\nrecent kernel USB/UVC messages:\n" + out.encode())
+            write(("      v4l2-ctl said: " + (" | ".join(s["tail"]) if s["tail"] else "(nothing)") + "\n").encode())
+            if s["frames"] == 0:
+                write(b"      no frames at all. If v4l2-ctl reported 'No space left on device' the USB bandwidth\n"
+                      b"      reservation failed: try 'Reload uvcvideo with quirks=128' below and rerun. If it just\n"
+                      b"      timed out with no message, the stream started but the bus or hub never delivered\n"
+                      b"      data: try 1280x720 or 15 fps, check hub power, and see lsusb -t below.\n")
+    write((b"\nPASS: no frames lost on any camera\n" if ok else b"\nFAIL: see above\n"))
+    rc, out = sh(["bash", "-c", f"dmesg -T | tail -n +{int(dmesg_before.strip() or 0) + 1} | tail -n 20"])
+    write(b"\nkernel messages during the test:\n" + (out.encode() if out.strip() else b"  (none)\n"))
+    rc, out = sh(["lsusb", "-t"])
+    write(b"\nUSB tree:\n" + out.encode())
+
+
+def test_uvc_quirk(write, q):
+    """Reload the uvcvideo module with or without the bandwidth quirk.
+    Fails harmlessly if a camera is open."""
+    on = q.get("on", ["1"])[0] == "1"
+    rc, cur = sh(["cat", "/sys/module/uvcvideo/parameters/quirks"])
+    write(f"current uvcvideo quirks={cur.strip()}\n".encode())
+    argv = ["bash", "-c", "modprobe -r uvcvideo && modprobe uvcvideo " + ("quirks=128" if on else "") +
+            " && sleep 1 && cat /sys/module/uvcvideo/parameters/quirks && ls /dev/video*"]
+    rc = stream_process(argv, write)
+    if rc != 0:
+        write(b"reload failed: is a camera in use (live view, recorder)? Stop it and retry.\n")
+    else:
+        write(b"note: this lasts until reboot. To make it permanent, put 'options uvcvideo quirks=128'\n"
+              b"in /etc/modprobe.d/uvcvideo.conf (the plan has this going into the image).\n")
 
 
 def test_usb(write, q):
@@ -553,6 +595,7 @@ TESTS = {
     "alsa": (test_alsa, None),
     "camera-info": (test_camera_info, "camera"),
     "dualcam": (test_dualcam, "camera"),
+    "uvc-quirk": (test_uvc_quirk, "camera"),
     "usb": (test_usb, None),
     "dmesg": (test_dmesg, None),
     "i2c": (test_i2c, None),
@@ -901,6 +944,9 @@ PAGE = r"""<!doctype html>
   <div class="row">
     <button class="primary" onclick="dualcam()">Drop test: all cameras at once</button>
     <input id="dc-s" value="20" size="3"> s at the size and fps above, no streaming, frames discarded
+    · stagger <input id="dc-st" value="1" size="3"> s
+    <button onclick="run('uvc-quirk','out-cam','&on=1')">Reload uvcvideo with quirks=128</button>
+    <button onclick="run('uvc-quirk','out-cam','&on=0')">Reload without</button>
   </div>
   <img id="cam" alt="">
   <pre id="out-cam"></pre>
@@ -1001,7 +1047,7 @@ function camLive(on) {
 function dualcam() {
   camLive(false);
   const devs = Array.from($('cam-dev').options).map(o => o.value).join(',');
-  run('dualcam', 'out-cam', '&seconds=' + val('dc-s') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
+  run('dualcam', 'out-cam', '&seconds=' + val('dc-s') + '&stagger=' + val('dc-st') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
 }
 
 function camSnap() {

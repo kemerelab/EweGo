@@ -23,7 +23,7 @@ SRC=/tmp/uvc-src
 [ -f "$SRC/uvc_video.c" ] || die "$SRC does not contain the uvcvideo source"
 grep -q uvc_max_payload_param "$SRC/uvc_video.c" || die "$SRC is not patched (run patch-uvcvideo.py first)"
 
-kver() { ls /lib/modules | grep -- '-rpi-v8$' | sort -V | tail -1; }
+kver() { find /lib/modules -mindepth 1 -maxdepth 1 -name '*-rpi-v8' -printf '%f\n' | sort -V | tail -1; }
 KVER=$(kver)
 [ -n "$KVER" ] || die "no *-rpi-v8 kernel under /lib/modules"
 log "Kernel in image: $KVER"

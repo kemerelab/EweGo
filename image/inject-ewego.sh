@@ -233,7 +233,7 @@ if [ "$DO_APT" -eq 1 ]; then
 
     # --- patched uvcvideo module (see uvcvideo/README.md) ------------------
     if [ "$DO_UVC" -eq 1 ]; then
-        KVER=$(ls "$ROOT_MNT/lib/modules" | grep -- '-rpi-v8$' | sort -V | tail -1)
+        KVER=$(find "$ROOT_MNT/lib/modules" -mindepth 1 -maxdepth 1 -name '*-rpi-v8' -printf '%f\n' | sort -V | tail -1)
         [ -n "$KVER" ] || die "no *-rpi-v8 kernel in the image"
         KBRANCH="rpi-$(echo "$KVER" | cut -d. -f1,2).y"
         log "Fetching uvcvideo source from raspberrypi/linux $KBRANCH for kernel $KVER"

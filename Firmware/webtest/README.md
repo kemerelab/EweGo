@@ -34,6 +34,13 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 - **Camera**: live MJPEG view (choose device, size, fps), snapshot, and
   the camera's format list. The live view uses `v4l2-ctl` exactly as the
   SSH streaming test does.
+- **Drop test, all cameras at once**: captures N seconds from every camera
+  simultaneously to `/dev/null` (no streaming, nothing written) and
+  reports, per camera, frames received versus expected, frames lost
+  according to the kernel's per-buffer sequence numbers and where the gaps
+  were, error-flagged frames, effective fps, min/max inter-frame interval,
+  and data rate, then PASS/FAIL and any recent UVC/USB kernel messages.
+  This is the bench test for two cameras on a hub.
 - **All-sensors recorder**: start/stop `ewego-sensors`, journal, sessions.
 
 ## Running it

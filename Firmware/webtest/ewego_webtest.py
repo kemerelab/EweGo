@@ -410,6 +410,116 @@ def test_camera_info(write, q):
     stream_process(["v4l2-ctl", "-d", dev, "--get-fmt-video"], write)
 
 
+_SEQ_RE = re.compile(r"seq:\s*(\d+)")
+_TS_RE = re.compile(r"ts:\s*(\d+\.\d+)")
+_BYTES_RE = re.compile(r"bytesused:\s*(\d+)")
+
+
+def test_dualcam(write, q):
+    """Capture from several cameras at once to /dev/null and account for
+    dropped frames using the kernel's per-buffer sequence numbers, as
+    printed by v4l2-ctl --verbose. No streaming, no files."""
+    secs = int(q.get("seconds", ["20"])[0])
+    size = q.get("size", ["1920x1080"])[0]
+    fps = int(q.get("fps", ["30"])[0])
+    devs = [d for d in q.get("devs", [""])[0].split(",") if d] or [v["dev"] for v in video_devices()]
+    if not devs:
+        write(b"no cameras found\n")
+        return
+    w, h = size.split("x")
+    count = secs * fps
+    write(f"Capturing {count} frames ({secs}s at {fps} fps, {size} MJPG) from {len(devs)} camera(s) "
+          f"simultaneously to /dev/null.\nDrop detection uses the kernel sequence number of each buffer; "
+          f"a gap means the frame was lost between camera and driver.\n\n".encode())
+
+    stats = {d: {"frames": 0, "first": None, "last": None, "gaps": 0, "lost": 0, "gap_at": [],
+                 "errors": 0, "bytes": 0, "t0": None, "t1": None, "dt_min": None, "dt_max": 0.0,
+                 "last_ts": None, "tail": []} for d in devs}
+    procs = {}
+    for d in devs:
+        argv = ["v4l2-ctl", "-d", d, f"--set-fmt-video=width={w},height={h},pixelformat=MJPG",
+                f"--set-parm={fps}", "--stream-mmap", f"--stream-count={count}",
+                "--stream-to=/dev/null", "--verbose"]
+        procs[d] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+
+    def reader(d):
+        s = stats[d]
+        for raw in procs[d].stdout:
+            line = raw.decode(errors="replace")
+            m = _SEQ_RE.search(line)
+            if not m:
+                s["tail"].append(line.strip())
+                s["tail"] = s["tail"][-6:]
+                continue
+            seq = int(m.group(1))
+            s["frames"] += 1
+            if s["first"] is None:
+                s["first"] = seq
+            elif seq != s["last"] + 1:
+                s["gaps"] += 1
+                s["lost"] += seq - s["last"] - 1
+                if len(s["gap_at"]) < 8:
+                    s["gap_at"].append(f"{s['last']}->{seq}")
+            s["last"] = seq
+            if "error" in line.lower():
+                s["errors"] += 1
+            mb = _BYTES_RE.search(line)
+            if mb:
+                s["bytes"] += int(mb.group(1))
+            mt = _TS_RE.search(line)
+            if mt:
+                ts = float(mt.group(1))
+                if s["t0"] is None:
+                    s["t0"] = ts
+                elif s["last_ts"] is not None:
+                    dt = ts - s["last_ts"]
+                    s["dt_min"] = dt if s["dt_min"] is None else min(s["dt_min"], dt)
+                    s["dt_max"] = max(s["dt_max"], dt)
+                s["t1"] = ts
+                s["last_ts"] = ts
+
+    threads = [threading.Thread(target=reader, args=(d,), daemon=True) for d in devs]
+    for t in threads:
+        t.start()
+    try:
+        deadline = time.monotonic() + secs + 15
+        while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
+            time.sleep(2)
+            write(("  " + "   ".join(f"{d}: {stats[d]['frames']} frames, {stats[d]['lost']} lost"
+                                     for d in devs) + "\n").encode())
+    finally:
+        for p in procs.values():
+            if p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        for t in threads:
+            t.join(timeout=3)
+
+    write(b"\nResult:\n")
+    ok = True
+    for d in devs:
+        s = stats[d]
+        rc = procs[d].returncode
+        dur = (s["t1"] - s["t0"]) if s["t0"] is not None and s["t1"] is not None else 0
+        eff = (s["frames"] - 1) / dur if dur > 0 and s["frames"] > 1 else 0
+        write(f"  {d}: exit {rc}, {s['frames']}/{count} frames, {s['lost']} lost in {s['gaps']} gap(s)"
+              f"{' at ' + ', '.join(s['gap_at']) if s['gap_at'] else ''}, {s['errors']} error-flagged\n".encode())
+        if s["frames"] > 1:
+            write(f"      {eff:.2f} fps effective, interval min {s['dt_min'] * 1000:.1f} / max {s['dt_max'] * 1000:.1f} ms, "
+                  f"{s['bytes'] / max(dur, 1e-9) / 1e6:.1f} MB/s, {s['bytes'] / s['frames'] / 1e3:.0f} KB/frame\n".encode())
+        if s["frames"] < count or s["lost"] or s["errors"] or rc != 0:
+            ok = False
+            if s["tail"]:
+                write(("      last v4l2-ctl output: " + " | ".join(s["tail"]) + "\n").encode())
+    write((b"PASS: no frames lost on any camera\n" if ok else b"FAIL: see above\n"))
+    rc, out = sh(["bash", "-c", "dmesg -T | grep -iE 'uvcvideo|usb [0-9]' | tail -n 8"])
+    if out.strip():
+        write(b"\nrecent kernel USB/UVC messages:\n" + out.encode())
+
+
 def test_usb(write, q):
     stream_process(["lsusb", "-t"], write)
     stream_process(["lsusb"], write)
@@ -442,6 +552,7 @@ TESTS = {
     "audio": (test_audio, "audio"),
     "alsa": (test_alsa, None),
     "camera-info": (test_camera_info, "camera"),
+    "dualcam": (test_dualcam, "camera"),
     "usb": (test_usb, None),
     "dmesg": (test_dmesg, None),
     "i2c": (test_i2c, None),
@@ -787,6 +898,10 @@ PAGE = r"""<!doctype html>
     <button onclick="run('camera-info','out-cam','&dev='+encodeURIComponent(val('cam-dev')))">Formats</button>
     <span id="cam-msg"></span>
   </div>
+  <div class="row">
+    <button class="primary" onclick="dualcam()">Drop test: all cameras at once</button>
+    <input id="dc-s" value="20" size="3"> s at the size and fps above, no streaming, frames discarded
+  </div>
   <img id="cam" alt="">
   <pre id="out-cam"></pre>
 </section>
@@ -881,6 +996,12 @@ function camLive(on) {
   const [w, h] = val('cam-size').split('x');
   img.src = '/api/stream?dev=' + encodeURIComponent(val('cam-dev')) + '&w=' + w + '&h=' + h + '&fps=' + val('cam-fps') + '&t=' + Date.now();
   $('cam-msg').textContent = 'live';
+}
+
+function dualcam() {
+  camLive(false);
+  const devs = Array.from($('cam-dev').options).map(o => o.value).join(',');
+  run('dualcam', 'out-cam', '&seconds=' + val('dc-s') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
 }
 
 function camSnap() {

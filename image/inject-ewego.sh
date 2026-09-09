@@ -207,30 +207,42 @@ done
 # that is not in the list.
 if [ -f "$ROOT_MNT/etc/cloud/cloud.cfg" ]; then
     log "Disabling cloud-init package installs/upgrades at first boot"
-    python3 - "$ROOT_MNT/etc/cloud/cloud.cfg" "$ROOT_MNT/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg" <<'PY'
-import re, sys
-src, dst = sys.argv[1], sys.argv[2]
-text = open(src).read()
+    python3 - "$ROOT_MNT/etc/cloud" "$ROOT_MNT/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg" <<'PY'
+import glob, re, sys
+cloud_dir, dst = sys.argv[1], sys.argv[2]
 out = ("# EweGo: everything is installed at image build time. Do not let cloud-init\n"
        "# (Raspberry Pi Imager's user-data) install or upgrade packages at first boot.\n"
        "package_update: false\npackage_upgrade: false\npackage_reboot_if_required: false\n")
 removed = 0
-# The package module may sit in any of the three stage lists depending on
-# the cloud-init version; rewrite every list that contains it.
-for key in ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules"):
-    m = re.search(r"^" + key + r":[ \t]*\n((?:[ \t]+-.*\n|[ \t]*#.*\n|[ \t]*\n)+)", text, re.M)
-    if not m:
+lists = {}
+# The module lists may live in cloud.cfg or in a cloud.cfg.d/ drop-in, and
+# the package module may sit in any stage list depending on the version.
+# Rewrite every list that contains it; the last definition wins in cloud-init.
+for path in [cloud_dir + "/cloud.cfg"] + sorted(glob.glob(cloud_dir + "/cloud.cfg.d/*.cfg")):
+    if path == dst:
         continue
-    items = [l for l in m.group(1).splitlines() if l.strip().startswith("-")]
+    try:
+        text = open(path).read()
+    except OSError:
+        continue
+    for key in ("cloud_init_modules", "cloud_config_modules", "cloud_final_modules"):
+        m = re.search(r"^" + key + r":[ \t]*\n((?:[ \t]+-.*\n|[ \t]*#.*\n|[ \t]*\n)+)", text, re.M)
+        if m:
+            lists[key] = (path, [l for l in m.group(1).splitlines() if l.strip().startswith("-")])
+for key, (path, items) in lists.items():
     kept = [l for l in items if "package" not in l.lower()]
     if len(kept) != len(items):
         removed += len(items) - len(kept)
         out += key + ":\n" + "\n".join(kept) + "\n"
+        print("cloud-init: %s in %s: removed %d package module entr%s" %
+              (key, path, len(items) - len(kept), "y" if len(items) - len(kept) == 1 else "ies"))
 if not removed:
-    sys.exit("error: no package module found in any cloud-init module list of " + src)
+    print("warning: no package module found in any cloud-init module list; "
+          "writing only package_update/upgrade: false. Module lists seen:")
+    for key, (path, items) in lists.items():
+        print("  %s (%s): %s" % (key, path, ", ".join(l.strip() for l in items)))
 with open(dst, "w") as f:
     f.write(out)
-print("cloud-init: removed %d package module entr%s" % (removed, "y" if removed == 1 else "ies"))
 PY
 fi
 

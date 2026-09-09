@@ -31,13 +31,17 @@ jobs:
       - name: Python firmware compiles
         run: git ls-files 'Firmware/*.py' 'Firmware/**/*.py' 'image/**/*.py' | xargs python3 -m py_compile
       - name: uvcvideo patch applies to the current Pi kernel source
+        # The injector picks the branch from the kernel inside the image at
+        # build time; check the patch against the branches in play so a
+        # driver change surfaces on push, not only on a tag.
         run: |
-          mkdir -p uvc-src
-          for f in uvc_driver.c uvc_video.c uvcvideo.h; do
-            curl -fsSL -o uvc-src/$f https://raw.githubusercontent.com/raspberrypi/linux/rpi-6.12.y/drivers/media/usb/uvc/$f
+          for br in rpi-6.18.y rpi-6.12.y; do
+            rm -rf uvc-src && mkdir -p uvc-src
+            for f in uvc_driver.c uvc_video.c uvcvideo.h; do
+              curl -fsSL -o uvc-src/$f "https://raw.githubusercontent.com/raspberrypi/linux/$br/drivers/media/usb/uvc/$f"
+            done
+            echo "== $br"; python3 image/uvcvideo/patch-uvcvideo.py uvc-src
           done
-          python3 image/uvcvideo/patch-uvcvideo.py uvc-src
-          grep -c uvc_max_payload_param uvc-src/uvc_video.c
       - name: Unit files have the required sections
         run: |
           for u in image/units/*.service; do

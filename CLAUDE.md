@@ -46,9 +46,10 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   kernel. Decision: patched uvcvideo with a `max_payload` cap (2048),
   built in the image chroot — see `image/uvcvideo/README.md`. Options
   "different camera" and "second USB bus" are not available.
-- In progress: v0.3.0 = first image with the patched module. Next: confirm
-  on the collar (Bandwidth probe should log "capping requested bandwidth
-  3060 to 2048", drop test with both cameras PASS), then write
+- v0.3.1 = first image with the patched module, built green (image kernel
+  6.18.34+rpt-rpi-v8; the injector follows whatever kernel the image has).
+  Next: confirm on the collar (Bandwidth probe should log "capping
+  requested bandwidth 3060 to 2048", drop test with both cameras PASS), then write
   `ewego-cam`, a standalone static C V4L2 recorder (MJPEG frames +
   int64 µs kernel timestamps + seq/flags index, drop accounting via
   sequence gaps; design in plan §4).

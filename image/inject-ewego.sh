@@ -10,6 +10,9 @@
 # Options:
 #   --pylib DIR   directory produced by vendor-pylib.sh (pure-Python packages
 #                 that Debian does not ship). Default: <repo>/build/pylib
+#   --bin DIR     directory of cross-compiled static binaries to install into
+#                 /usr/local/bin (ewego-cam ...). Default: <repo>/build/bin;
+#                 skipped with a warning if absent
 #   --no-apt      skip the apt step (for quick tests of the file injection)
 #   --no-uvc      skip building the patched uvcvideo module (see uvcvideo/)
 #   --grow SIZE   grow an image FILE by SIZE before injecting (default 1G,
@@ -50,6 +53,7 @@ IMAGE_DIR="$REPO_ROOT/image"
 
 TARGET=""
 PYLIB="$REPO_ROOT/build/pylib"
+BINDIR="$REPO_ROOT/build/bin"
 DO_APT=1
 DO_UVC=1
 GROW="1G"
@@ -58,6 +62,7 @@ UVC_MAX_PAYLOAD=${UVC_MAX_PAYLOAD:-2048}
 while [ $# -gt 0 ]; do
     case "$1" in
         --pylib)  PYLIB=$2; shift 2 ;;
+        --bin)    BINDIR=$2; shift 2 ;;
         --no-apt) DO_APT=0; shift ;;
         --no-uvc) DO_UVC=0; shift ;;
         --grow)   GROW=$2; shift 2 ;;
@@ -158,6 +163,21 @@ log "Installing vendored Python packages to /opt/ewego/pylib"
 rm -rf "$ROOT_MNT/opt/ewego/pylib"
 install -d "$ROOT_MNT/opt/ewego/pylib"
 cp -a "$PYLIB"/. "$ROOT_MNT/opt/ewego/pylib/"
+
+# --- rootfs: compiled binaries and their config ---------------------------
+if [ -d "$BINDIR" ]; then
+    for b in "$BINDIR"/*; do
+        [ -f "$b" ] || continue
+        log "Installing /usr/local/bin/$(basename "$b")"
+        install -m 755 "$b" "$ROOT_MNT/usr/local/bin/$(basename "$b")"
+    done
+else
+    echo "warning: no binaries directory at $BINDIR (ewego-cam will be missing); pass --bin DIR" >&2
+fi
+install -d "$ROOT_MNT/etc/ewego"
+for f in "$IMAGE_DIR"/ewego/*.conf; do
+    install -m 644 "$f" "$ROOT_MNT/etc/ewego/$(basename "$f")"
+done
 
 # --- rootfs: units (installed, deliberately not enabled) ------------------
 log "Installing systemd units (not enabled)"

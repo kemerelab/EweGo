@@ -1,0 +1,18 @@
+[Unit]
+Description=EweGo USB camera recorder (%i)
+Documentation=file:///opt/ewego/Firmware/uvccam/README.md
+After=local-fs.target
+
+[Service]
+Type=notify
+# One file per camera: /etc/ewego/cam-camera1.conf, /etc/ewego/cam-camera2.conf
+EnvironmentFile=/etc/ewego/cam-%i.conf
+ExecStart=/usr/local/bin/ewego-cam --device ${DEVICE} --size ${SIZE} --fps ${FPS} --out ${OUT_DIR} --name %i ${EXTRA_ARGS}
+# ewego-cam stops the stream, flushes and writes its summary on SIGINT/SIGTERM
+KillSignal=SIGINT
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

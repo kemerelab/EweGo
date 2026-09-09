@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 
 EWEGO = Path(os.environ.get("EWEGO_DIR", "/opt/ewego"))
 RUN_DIR = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/ewego-webtest"))
-UNITS = ["ewego-sensors", "ewego-gps", "ewego-dualcam"]
+UNITS = ["ewego-sensors", "ewego-gps", "ewego-dualcam", "ewego-cam@camera1", "ewego-cam@camera2"]
 GPS_PORT = "/dev/ttyAMA4"
 GPS_BAUD = 460800
 IMU_PORT = "/dev/ttyAMA5"
@@ -799,7 +799,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
-        m = re.fullmatch(r"/api/unit/([a-z0-9-]+)/(start|stop|restart)", u.path)
+        m = re.fullmatch(r"/api/unit/([a-z0-9@-]+)/(start|stop|restart)", u.path)
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
@@ -962,7 +962,7 @@ PAGE = r"""<!doctype html>
   <h2>Units</h2>
   <table><thead><tr><th>unit</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody id="units"></tbody></table>
   <div class="row">
-    <select id="jr-unit"><option>ewego-sensors</option><option>ewego-gps</option><option>ewego-dualcam</option><option>ewego-webtest</option></select>
+    <select id="jr-unit"><option>ewego-sensors</option><option>ewego-gps</option><option>ewego-dualcam</option><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-webtest</option></select>
     <button onclick="journal()">Journal tail</button>
     <button onclick="listSessions()">Sessions</button>
   </div>

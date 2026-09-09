@@ -165,23 +165,34 @@ def audio_device():
 
 
 def video_devices():
-    """Capture nodes, one per camera, from v4l2-ctl --list-devices."""
-    rc, out = sh(["v4l2-ctl", "--list-devices"])
+    """USB cameras only: one capture node per camera.
+
+    The kernel names every UVC capture node /dev/v4l/by-path/<...>-usb-<port>-video-index0
+    (index1 is the camera's metadata node), and the Pi's own codec/ISP/HEVC
+    nodes have no USB by-path entry, so this skips them. The by-path name
+    doubles as a stable label for the physical hub port."""
     devs = []
-    if rc == 0:
-        block_name, first = None, None
-        for line in out.splitlines() + [""]:
-            if line and not line.startswith(("\t", " ")):
-                if first:
-                    devs.append({"dev": first, "name": block_name})
-                block_name, first = line.strip().rstrip(":"), None
-            elif line.strip().startswith("/dev/video") and first is None:
-                first = line.strip()
-        if first:
-            devs.append({"dev": first, "name": block_name})
-    if not devs:
-        devs = [{"dev": str(p), "name": p.name}
-                for p in sorted(Path("/dev").glob("video*"))]
+    for p in sorted(Path("/dev/v4l/by-path").glob("*usb*-video-index0")) if Path("/dev/v4l/by-path").exists() else []:
+        dev = os.path.realpath(p)
+        node = Path("/sys/class/video4linux") / os.path.basename(dev)
+        try:
+            name = (node / "name").read_text().strip()
+        except OSError:
+            name = ""
+        m = re.search(r"usb-([\d.:]+)-video", p.name)
+        devs.append({"dev": dev, "name": name, "port": m.group(1) if m else p.name, "by_path": str(p)})
+    if devs:
+        return devs
+    # fallback: any node whose driver is uvcvideo (older udev without by-path)
+    for node in sorted(Path("/sys/class/video4linux").glob("video*")):
+        try:
+            drv = os.path.basename(os.readlink(node / "device" / "driver"))
+            idx = (node / "index").read_text().strip()
+        except OSError:
+            continue
+        if drv == "uvcvideo" and idx == "0":
+            name = (node / "name").read_text().strip() if (node / "name").exists() else ""
+            devs.append({"dev": f"/dev/{node.name}", "name": name, "port": "?", "by_path": ""})
     return devs
 
 
@@ -942,7 +953,8 @@ PAGE = r"""<!doctype html>
     <span id="cam-msg"></span>
   </div>
   <div class="row">
-    <button class="primary" onclick="dualcam()">Drop test: all cameras at once</button>
+    <button class="primary" onclick="dualcam()">Drop test: selected cameras at once</button>
+    <span id="dc-list"></span>
     <input id="dc-s" value="20" size="3"> s at the size and fps above, no streaming, frames discarded
     · stagger <input id="dc-st" value="1" size="3"> s
     <button onclick="run('uvc-quirk','out-cam','&on=1')">Reload uvcvideo with quirks=128</button>
@@ -988,7 +1000,7 @@ async function refresh() {
     let d = '';
     for (const [p, ok] of Object.entries(s.devices)) d += '<b>' + p + '</b><span class="' + (ok ? 'ok">present' : 'bad">missing') + '</span>';
     d += '<b>audio card</b>' + (s.audio_card ? '<span class="ok">' + s.audio_card.name + ' (card ' + s.audio_card.index + ')</span>' : '<span class="bad">missing</span>');
-    d += '<b>cameras</b>' + (s.video.length ? '<span class="ok">' + s.video.map(v => v.dev + ' ' + (v.name || '')).join(', ') + '</span>' : '<span class="bad">none</span>');
+    d += '<b>USB cameras</b>' + (s.video.length ? '<span class="ok">' + s.video.map(v => v.dev + ' (port ' + v.port + ')').join(', ') + '</span>' : '<span class="bad">none</span>');
     $('devs').innerHTML = d;
     let u = '';
     for (const x of s.units) {
@@ -998,8 +1010,11 @@ async function refresh() {
     }
     $('units').innerHTML = u;
     const sel = $('cam-dev');
-    if (sel.options.length !== s.video.length) {
-      sel.innerHTML = s.video.map(v => '<option value="' + v.dev + '">' + v.dev + (v.name ? ' — ' + v.name : '') + '</option>').join('');
+    const key = s.video.map(v => v.dev).join(',');
+    if (sel.dataset.key !== key) {
+      sel.dataset.key = key;
+      sel.innerHTML = s.video.map(v => '<option value="' + v.dev + '">' + v.dev + ' · port ' + v.port + (v.name ? ' · ' + v.name : '') + '</option>').join('');
+      $('dc-list').innerHTML = s.video.map(v => '<label><input type="checkbox" class="dc-dev" value="' + v.dev + '" checked> ' + v.dev + ' (port ' + v.port + ')</label>').join(' ');
     }
   } catch (e) { $('clock').innerHTML = '<span class="bad">status failed: ' + e + '</span>'; }
 }
@@ -1046,7 +1061,8 @@ function camLive(on) {
 
 function dualcam() {
   camLive(false);
-  const devs = Array.from($('cam-dev').options).map(o => o.value).join(',');
+  const devs = Array.from(document.querySelectorAll('.dc-dev:checked')).map(o => o.value).join(',');
+  if (!devs) { $('out-cam').textContent = 'no cameras selected'; return; }
   run('dualcam', 'out-cam', '&seconds=' + val('dc-s') + '&stagger=' + val('dc-st') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
 }
 

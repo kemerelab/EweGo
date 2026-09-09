@@ -445,8 +445,27 @@ def test_dualcam(write, q):
           f"Drop detection uses the kernel sequence number of each buffer; "
           f"a gap means the frame was lost between camera and driver.\n".encode())
     rc, quirks = sh(["cat", "/sys/module/uvcvideo/parameters/quirks"])
-    write(f"uvcvideo quirks={quirks.strip() or '?'} (128 = bandwidth fix)\n\n".encode())
+    rc_mp, mp = sh(["cat", "/sys/module/uvcvideo/parameters/max_payload"])
+    write(f"uvcvideo quirks={quirks.strip() or '?'}, max_payload={mp.strip() if rc_mp == 0 else 'n/a (stock module)'}\n\n".encode())
     rc, dmesg_before = sh(["bash", "-c", "dmesg | wc -l"])
+    # Turn on the driver's VIDEO trace for the duration so the kernel logs
+    # the reservation each camera actually got ("Selecting alternate
+    # setting N (M B/frame bandwidth)"); sysfs does not expose the
+    # high-bandwidth multiplier, so that log line is the reliable number.
+    tracef = Path("/sys/module/uvcvideo/parameters/trace")
+    try:
+        old_trace = tracef.read_text().strip()
+        tracef.write_text("1024")
+    except OSError:
+        old_trace = None
+    usb_if = {d: usb_interface_of(d)[0] for d in devs}
+
+    def reserved(d):
+        rc, out = sh(["bash", "-c", f"dmesg | tail -n +{int(dmesg_before.strip() or 0) + 1}"])
+        m = None
+        for m in re.finditer(rf"uvcvideo {re.escape(usb_if[d] or '~')}: Selecting alternate setting (\d+) \((\d+) B/frame", out):
+            pass
+        return (int(m.group(1)), int(m.group(2))) if m else None
 
     stats = {d: {"frames": 0, "first": None, "last": None, "gaps": 0, "lost": 0, "gap_at": [],
                  "errors": 0, "bytes": 0, "t0": None, "t1": None, "dt_min": None, "dt_max": 0.0,
@@ -516,9 +535,9 @@ def test_dualcam(write, q):
                 note = ""
                 if s["frames"] == 0 and procs[d].poll() is None and time.monotonic() - s["started"] > 4:
                     note = " (streaming but NO frames yet)"
-                a = uvc_altsetting(d)
-                if a and a[0]:
-                    note += f" [alt {a[0]}: {a[1]} B/uframe]"
+                a = reserved(d)
+                if a:
+                    note += f" [alt {a[0]}: {a[1]} B/uframe reserved]"
                 parts.append(f"{d}: {s['frames']} frames, {s['lost']} lost{note}")
             write(("  " + "   ".join(parts) + "\n").encode())
     finally:
@@ -554,6 +573,13 @@ def test_dualcam(write, q):
                       b"      timed out with no message, the stream started but the bus or hub never delivered\n"
                       b"      data: try 1280x720 or 15 fps, check hub power, and see lsusb -t below.\n")
     write((b"\nPASS: no frames lost on any camera\n" if ok else b"\nFAIL: see above\n"))
+    total = sum((reserved(d) or (0, 0))[1] for d in devs)
+    write(f"reserved bus bandwidth, all cameras: {total} B/microframe (budget ~6000 minus overhead; ~5000 is safe)\n".encode())
+    if old_trace is not None:
+        try:
+            tracef.write_text(old_trace)
+        except OSError:
+            pass
     rc, out = sh(["bash", "-c", f"dmesg -T | tail -n +{int(dmesg_before.strip() or 0) + 1} | tail -n 20"])
     write(b"\nkernel messages during the test:\n" + (out.encode() if out.strip() else b"  (none)\n"))
     rc, out = sh(["lsusb", "-t"])
@@ -661,6 +687,39 @@ def test_camrec(write, q):
     write(f"files kept under {out_root}/{stamp}/ (delete when done)\n".encode())
 
 
+def usb_interface_of(dev):
+    """'1-1.4:1.0' (USB interface id used in uvcvideo kernel messages) for a
+    /dev/videoN, and the bus/dev numbers for lsusb."""
+    try:
+        ctrl_if = Path(os.path.realpath(Path("/sys/class/video4linux") / os.path.basename(dev) / "device"))
+        usb_dev = ctrl_if.parent
+        return ctrl_if.name, (usb_dev / "busnum").read_text().strip(), (usb_dev / "devnum").read_text().strip()
+    except OSError:
+        return None, None, None
+
+
+def uvc_altsettings(dev):
+    """Table of the camera's video-streaming alternate settings from lsusb:
+    [(alt, bytes per microframe)]. This is what the max_payload cap selects
+    from: the driver picks the smallest entry >= the (capped) request."""
+    ifid, bus, devnum = usb_interface_of(dev)
+    if not bus:
+        return []
+    rc, out = sh(["lsusb", "-v", "-s", f"{bus}:{devnum}"], timeout=20)
+    table, alt, in_vs = [], None, False
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("bInterfaceSubClass"):
+            in_vs = re.match(r"bInterfaceSubClass\s+2\b", s) is not None  # 2 = VideoStreaming
+        elif s.startswith("bAlternateSetting"):
+            alt = int(s.split()[1])
+        elif s.startswith("wMaxPacketSize") and in_vs and alt is not None:
+            m = re.search(r"0x([0-9a-fA-F]+)\s+(\d+)x\s+(\d+)\s+bytes", s)
+            if m:
+                table.append((alt, int(m.group(2)) * int(m.group(3))))
+    return sorted(set(table))
+
+
 def test_uvc_probe(write, q):
     """Stream a few frames from one camera with uvcvideo tracing on and
     show what the camera asked for and which alternate setting the
@@ -702,12 +761,39 @@ def test_uvc_probe(write, q):
     write(("v4l2-ctl: " + (p.stderr.strip() or "ok") + "\n").encode())
     rc, out = sh(["bash", "-c", f"dmesg -T | tail -n +{int(before.strip() or 0) + 1} | grep -iE 'uvcvideo|usb [0-9]'"])
     write(b"kernel:\n" + (out.encode() if out.strip() else b"  (nothing logged)\n"))
+    table = uvc_altsettings(dev)
+    if table:
+        write(b"\nthis camera's video alternate settings (bytes per microframe):\n  " +
+              ", ".join(f"alt {a}: {b}" for a, b in table).encode() + b"\n")
+        write(b"the driver picks the smallest entry >= the request (after the max_payload cap), so to\n"
+              b"land on a given entry set max_payload to at most that value. Two cameras need their two\n"
+              b"reservations to sum to less than ~6000 minus per-packet overhead; ~5000 is safe.\n")
     write(b"\nHow to read it: 'Selecting alternate setting N (M B/frame bandwidth)' is the payload per\n"
-          b"125 us microframe the driver reserved for this camera. A single USB 2.0 bus has about\n"
-          b"6000 B per microframe for all isochronous devices together, so two cameras must sum\n"
-          b"below that. 3072 is the maximum a camera can ask for; two of those never fit.\n"
-          b"On this kernel the quirks=128 bandwidth fix applies to uncompressed formats only, so it\n"
-          b"does not change what an MJPEG camera requests.\n")
+          b"125 us microframe the driver reserved for this camera. 3060-3072 is the maximum a camera\n"
+          b"can ask for; two of those never fit. On this kernel the quirks=128 bandwidth fix applies\n"
+          b"to uncompressed formats only, so it does not change what an MJPEG camera requests.\n")
+
+
+def test_uvc_cap(write, q):
+    """Set uvcvideo max_payload at runtime (no reload; applies to the next
+    stream start). Persist by editing /etc/modprobe.d/ewego-uvc.conf."""
+    p = Path("/sys/module/uvcvideo/parameters/max_payload")
+    if not p.exists():
+        write(b"the patched uvcvideo is not loaded (no max_payload parameter)\n")
+        return
+    val = q.get("value", [""])[0].strip()
+    write(f"max_payload was {p.read_text().strip()}\n".encode())
+    if val:
+        try:
+            int(val)
+            p.write_text(val + "\n")
+        except (ValueError, OSError) as e:
+            write(f"could not set: {e}\n".encode())
+            return
+        write(f"max_payload is now {p.read_text().strip()} (until reboot; the image default is in "
+              f"/etc/modprobe.d/ewego-uvc.conf)\n".encode())
+    else:
+        write(b"no value given\n")
 
 
 def test_uvc_quirk(write, q):
@@ -780,6 +866,7 @@ TESTS = {
     "dualcam": (test_dualcam, "camera"),
     "uvc-quirk": (test_uvc_quirk, "camera"),
     "uvc-probe": (test_uvc_probe, "camera"),
+    "uvc-cap": (test_uvc_cap, None),
     "camrec": (test_camrec, "camera"),
     "usb": (test_usb, None),
     "dmesg": (test_dmesg, None),
@@ -1136,6 +1223,8 @@ PAGE = r"""<!doctype html>
     · stagger <input id="dc-st" value="1" size="3"> s
     <button onclick="run('uvc-quirk','out-cam','&on=1')">Reload uvcvideo with quirks=128</button>
     <button onclick="run('uvc-quirk','out-cam','&on=0')">Reload without</button>
+    · max_payload <input id="uvc-cap" value="2048" size="5">
+    <button onclick="run('uvc-cap','out-cam','&value='+val('uvc-cap'))">Set (live)</button>
   </div>
   <div class="row">
     <button class="primary" onclick="camrec()">Record test with ewego-cam: selected cameras</button>

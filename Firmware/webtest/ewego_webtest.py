@@ -586,6 +586,81 @@ def uvc_altsetting(dev):
     return None
 
 
+def test_camrec(write, q):
+    """Record N seconds from the selected cameras with the real recorder
+    (ewego-cam), one process per camera, and show each summary."""
+    secs = int(q.get("seconds", ["20"])[0])
+    size = q.get("size", ["1920x1080"])[0]
+    fps = q.get("fps", ["30"])[0]
+    stagger = float(q.get("stagger", ["1.0"])[0])
+    devs = [d for d in q.get("devs", [""])[0].split(",") if d] or [v["dev"] for v in video_devices()]
+    if not shutil.which("ewego-cam"):
+        write(b"ewego-cam is not installed on this image (needs v0.4.0 or later)\n")
+        return
+    if not devs:
+        write(b"no cameras selected\n")
+        return
+    out_root = EWEGO / "recordings" / "webtest"
+    out_root.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    write(f"ewego-cam: {len(devs)} camera(s), {secs}s at {size} {fps} fps -> {out_root}/{stamp}/\n\n".encode())
+    procs = {}
+    for i, d in enumerate(devs):
+        if i and stagger > 0:
+            time.sleep(stagger)
+        name = f"cam{i + 1}"
+        argv = ["ewego-cam", "--device", d, "--size", size, "--fps", fps, "--seconds", str(secs),
+                "--out", str(out_root / stamp), "--no-session-dir", "--name", name, "--stats", "2"]
+        procs[name] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        write(f"$ {' '.join(argv)}\n".encode())
+
+    lock = threading.Lock()
+
+    def pump(name):
+        for raw in procs[name].stdout:
+            with lock:
+                try:
+                    write(f"[{name}] ".encode() + raw.replace(b"\r", b"\n"))
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+
+    threads = [threading.Thread(target=pump, args=(n,), daemon=True) for n in procs]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + secs + 20 + stagger * len(devs)
+    try:
+        while any(p.poll() is None for p in procs.values()) and time.monotonic() < deadline:
+            time.sleep(0.5)
+    finally:
+        for p in procs.values():
+            if p.poll() is None:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        for t in threads:
+            t.join(timeout=5)
+    write(b"\nResult:\n")
+    ok = True
+    for name, p in procs.items():
+        rc = p.wait()
+        summ = out_root / stamp / f"{name}_summary.json"
+        write(f"  {name}: exit {rc} ({'no loss' if rc == 0 else 'frames lost/error-flagged' if rc == 2 else 'stalled' if rc == 3 else 'error'})\n".encode())
+        if summ.exists():
+            try:
+                s = json.loads(summ.read_text())
+                write(f"      frames {s['frames']}, lost {s['lost']} in {s['gaps']} gap(s), errors {s['error_frames']}, "
+                      f"{s['effective_fps']:.2f} fps, interval {s['interval_us']['min'] / 1000:.1f}/"
+                      f"{s['interval_us']['mean'] / 1000:.1f}/{s['interval_us']['max'] / 1000:.1f} ms, "
+                      f"{s['bytes'] / 1e6:.1f} MB, ts {s['timestamp_clock']}/{s['timestamp_source']}\n".encode())
+            except (ValueError, KeyError) as e:
+                write(f"      summary unreadable: {e}\n".encode())
+        ok = ok and rc == 0
+    write((b"\nPASS\n" if ok else b"\nFAIL\n"))
+    write(f"files kept under {out_root}/{stamp}/ (delete when done)\n".encode())
+
+
 def test_uvc_probe(write, q):
     """Stream a few frames from one camera with uvcvideo tracing on and
     show what the camera asked for and which alternate setting the
@@ -676,6 +751,7 @@ TESTS = {
     "dualcam": (test_dualcam, "camera"),
     "uvc-quirk": (test_uvc_quirk, "camera"),
     "uvc-probe": (test_uvc_probe, "camera"),
+    "camrec": (test_camrec, "camera"),
     "usb": (test_usb, None),
     "dmesg": (test_dmesg, None),
     "i2c": (test_i2c, None),
@@ -1030,6 +1106,10 @@ PAGE = r"""<!doctype html>
     <button onclick="run('uvc-quirk','out-cam','&on=1')">Reload uvcvideo with quirks=128</button>
     <button onclick="run('uvc-quirk','out-cam','&on=0')">Reload without</button>
   </div>
+  <div class="row">
+    <button class="primary" onclick="camrec()">Record test with ewego-cam: selected cameras</button>
+    <input id="cr-s" value="20" size="3"> s, writes real files (mjpeg + timestamps + index + summary) under recordings/webtest/
+  </div>
   <img id="cam" alt="">
   <pre id="out-cam"></pre>
 </section>
@@ -1134,6 +1214,13 @@ function dualcam() {
   const devs = Array.from(document.querySelectorAll('.dc-dev:checked')).map(o => o.value).join(',');
   if (!devs) { $('out-cam').textContent = 'no cameras selected'; return; }
   run('dualcam', 'out-cam', '&seconds=' + val('dc-s') + '&stagger=' + val('dc-st') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
+}
+
+function camrec() {
+  camLive(false);
+  const devs = Array.from(document.querySelectorAll('.dc-dev:checked')).map(o => o.value).join(',');
+  if (!devs) { $('out-cam').textContent = 'no cameras selected'; return; }
+  run('camrec', 'out-cam', '&seconds=' + val('cr-s') + '&stagger=' + val('dc-st') + '&size=' + val('cam-size') + '&fps=' + val('cam-fps') + '&devs=' + encodeURIComponent(devs));
 }
 
 function camSnap() {

@@ -94,7 +94,7 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-user-static binfmt-support rsync xz-utils fdisk e2fsprogs jq
+          sudo apt-get install -y -qq qemu-user-static binfmt-support rsync xz-utils fdisk e2fsprogs jq zerofree
           # binfmt must hand aarch64 binaries to qemu for the chroot apt step
           ls /proc/sys/fs/binfmt_misc/ | grep -q aarch64 || { echo "aarch64 binfmt not registered"; exit 1; }
 
@@ -120,6 +120,11 @@ jobs:
           # Trixie: cloud-init) for imager.json. Mount read-only with journal
           # replay disabled so the hash computed next stays valid.
           LOOP=$(sudo losetup -fP --show "$OUT_IMAGE"); sudo partx -a "$LOOP" 2>/dev/null || true
+          # Zero the free blocks (left dirty by the purged build tools and
+          # apt caches) so xz compresses the image as if they were never
+          # written; worth ~100 MB of download per flash.
+          sudo e2fsck -fp "${LOOP}p2" >/dev/null || true
+          sudo zerofree "${LOOP}p2"
           mkdir -p rootmnt && sudo mount -o ro,noload "${LOOP}p2" rootmnt
           if [ -d rootmnt/etc/cloud ]; then INIT=cloudinit; else INIT=systemd; fi
           echo "--- /etc/ewego-image-release"; cat rootmnt/etc/ewego-image-release

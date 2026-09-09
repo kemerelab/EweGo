@@ -35,7 +35,7 @@
 		},
 		{
 			"key": "0x30210001",
-			"value": 100,
+			"value": 200,
 			"layer": 0,
 			"action": "Set",
 			"valueType": "U2",
@@ -43,7 +43,7 @@
 		},
 		{
 			"key": "0x30210001",
-			"value": 100,
+			"value": 200,
 			"layer": 2,
 			"action": "Set",
 			"valueType": "U2",

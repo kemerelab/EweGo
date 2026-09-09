@@ -70,8 +70,8 @@ Press `Ctrl+C` to stop logging cleanly.
 Raw UBX binary data is saved to: `gps_log_YYYYMMDD_HHMMSS.ubx`
 
 This file contains:
-- NAV-PVT (position/velocity/time) at 10 Hz
-- RXM-RAWX (raw observations) at 10 Hz
+- NAV-PVT (position/velocity/time) at 5 Hz
+- RXM-RAWX (raw observations) at 5 Hz
 - RXM-SFRBX (ephemeris data)
 - NAV-STATUS (fix status)
 - NAV-SAT (satellite info)
@@ -87,7 +87,7 @@ Shows:
   - Watch for RTK FLOAT (carrier phase lock) or RTK FIXED (cm-level accuracy)
 - **Sats**: Number of satellites in solution
 - **Position**: Latitude, Longitude, Altitude
-- **Msgs**: Total messages received and current rate (should be ~10 Hz)
+- **Msgs**: Total messages received and current rate (should be ~5 Hz)
 - **Logged**: Size of log file
 - **RTCM**: NTRIP correction data received
 

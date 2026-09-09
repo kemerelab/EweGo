@@ -6,8 +6,8 @@ When logging GPS data alongside other sensors, you need to synchronize timestamp
 
 **Tested Configuration:**
 - Raspberry Pi Compute Module 4
-- ZED-F9P GPS module  
-- UART4 on /dev/ttyAMA1
+- ZED-X20P GNSS module (TP1 time pulse on GPS_TIME_1)
+- UART4 on /dev/ttyAMA4 at 460800 baud, 5 Hz navigation rate
 - PPS on GPIO 6
 
 ---
@@ -113,16 +113,16 @@ This is the recommended approach because:
 
 ### Hardware Setup
 
-**1. Locate TIMEPULSE pin** on ZED-F9P module
+**1. Locate TIMEPULSE pin** on ZED-X20P module
 
 **2. Connect to GPIO** on Raspberry Pi with optional pull-up resistor:
 
 ```
-ZED-F9P TIMEPULSE ----[10kΩ]---- 3.3V
+ZED-X20P TIMEPULSE ----[10kΩ]---- 3.3V
            |
            └---------------------- GPIO 6 (adjust for your setup)
 
-ZED-F9P GND ---------------------- Pi GND
+ZED-X20P GND ---------------------- Pi GND
 ```
 
 **GPIO Pin Notes:**
@@ -139,7 +139,7 @@ ZED-F9P GND ---------------------- Pi GND
 
 ---
 
-### Configure ZED-F9P in u-center 2
+### Configure ZED-X20P in u-center 2
 
 **1. Connect GPS module to u-center 2**
 

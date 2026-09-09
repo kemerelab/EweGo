@@ -14,7 +14,7 @@ python validate_ubx.py gps_log_20260105_142315.ubx
 
 ### 1. RXM-RAWX Messages (Raw Observations)
 - **Required:** YES - This is the actual satellite observation data
-- **Expected rate:** ~10 Hz (should match your configured rate)
+- **Expected rate:** ~5 Hz (should match your configured rate)
 - **What it contains:** Pseudorange, carrier phase, Doppler measurements
 - **If missing:** PPK is IMPOSSIBLE - reconfigure u-center and re-record
 
@@ -26,7 +26,7 @@ python validate_ubx.py gps_log_20260105_142315.ubx
 
 ### 3. NAV-PVT Messages (Position/Velocity/Time)
 - **Required:** NO for PPK, but useful for validation
-- **Expected rate:** ~10 Hz
+- **Expected rate:** ~5 Hz
 - **What it contains:** Real-time position solution from GPS
 - **Use:** Verify GPS was working and getting fixes during recording
 
@@ -52,8 +52,8 @@ Critical Messages for PPK:
   ✓ RXM-SFRBX (ephemeris):        1,245 messages
 ```
 
-✅ **Good:** Both present, RXM-RAWX at ~10 Hz  
-⚠️ **Warning:** RXM-RAWX rate below 9.5 Hz  
+✅ **Good:** Both present, RXM-RAWX at ~5 Hz  
+⚠️ **Warning:** RXM-RAWX rate below 4.75 Hz  
 ✗ **Bad:** Either message type missing or at 0 Hz
 
 ### Fix Type Distribution
@@ -170,7 +170,7 @@ Critical Messages for PPK:
   ✓ RXM-SFRBX (ephemeris):        1,200 messages
 
 ⚠ WARNINGS:
-  - RXM-RAWX rate is 4.6 Hz (expected ~10 Hz)
+  - RXM-RAWX rate is 2.3 Hz (expected ~5 Hz)
 
 ✓ VALIDATION PASSED: File appears suitable for PPK processing
   Some warnings were found - review above for details.
@@ -187,8 +187,8 @@ Critical Messages for PPK:
 
 Before attempting PPK processing, verify:
 
-- [ ] **File size reasonable** (50-100 MB per hour at 10 Hz)
-- [ ] **RXM-RAWX present** and at ~10 Hz
+- [ ] **File size reasonable** (25-80 MB per hour at 5 Hz, depending on satellites tracked)
+- [ ] **RXM-RAWX present** and at ~5 Hz
 - [ ] **RXM-SFRBX present** (at least 500+ messages for 1 hour)
 - [ ] **NAV-PVT shows 3D fixes** for most of recording
 - [ ] **Satellites observed** (12+ is great, 6-11 is OK, <6 is bad)

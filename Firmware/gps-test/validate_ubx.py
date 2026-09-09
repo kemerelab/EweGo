@@ -10,6 +10,10 @@ from datetime import datetime, timedelta
 from pyubx2 import UBXReader
 import os
 
+# Navigation rate configured on the module (CFG-RATE-MEAS = 200 ms, see CONFIGURING_HW.md)
+EXPECTED_RATE_HZ = 5.0
+
+
 class UBXValidator:
     """Validates UBX log files for PPK processing"""
     
@@ -158,14 +162,14 @@ class UBXValidator:
                 nav_pvt_rate = self.stats['nav_pvt_count'] / duration
                 rxm_rawx_rate = self.stats['rxm_rawx_count'] / duration
                 
-                if nav_pvt_rate < 9.5:  # Allow some tolerance
+                if nav_pvt_rate < EXPECTED_RATE_HZ * 0.95:  # Allow some tolerance
                     self.stats['warnings'].append(
-                        f"NAV-PVT rate is {nav_pvt_rate:.1f} Hz (expected ~10 Hz)"
+                        f"NAV-PVT rate is {nav_pvt_rate:.1f} Hz (expected ~{EXPECTED_RATE_HZ:g} Hz)"
                     )
                 
-                if rxm_rawx_rate < 9.5:
+                if rxm_rawx_rate < EXPECTED_RATE_HZ * 0.95:
                     self.stats['warnings'].append(
-                        f"RXM-RAWX rate is {rxm_rawx_rate:.1f} Hz (expected ~10 Hz)"
+                        f"RXM-RAWX rate is {rxm_rawx_rate:.1f} Hz (expected ~{EXPECTED_RATE_HZ:g} Hz)"
                     )
         
         # Check satellite count

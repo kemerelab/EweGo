@@ -18,7 +18,7 @@
 #   --grow SIZE   grow an image FILE by SIZE before injecting (default 1G,
 #                 0 to disable). Ignored for block devices.
 # Environment:
-#   UVC_MAX_PAYLOAD  bytes per microframe each camera may reserve (default 2048)
+#   UVC_MAX_PAYLOAD  bytes per microframe each camera may reserve (default 1900)
 #
 # What it does to the target:
 #   rootfs: /opt/ewego/                          Firmware tree from this repo
@@ -31,7 +31,7 @@
 #           /lib/modules/<ver>/updates/uvcvideo.ko  patched UVC driver with a
 #                                                max_payload cap, built in the
 #                                                same chroot (uvcvideo/README.md)
-#           /etc/modprobe.d/ewego-uvc.conf       options uvcvideo max_payload=2048
+#           /etc/modprobe.d/ewego-uvc.conf       options uvcvideo max_payload=1900
 #   boot:   config.txt                           dtparam=ant2 at the top,
 #                                                hardware block appended,
 #                                                [cm4] otg_mode=1 verified
@@ -57,7 +57,7 @@ BINDIR="$REPO_ROOT/build/bin"
 DO_APT=1
 DO_UVC=1
 GROW="1G"
-UVC_MAX_PAYLOAD=${UVC_MAX_PAYLOAD:-2048}
+UVC_MAX_PAYLOAD=${UVC_MAX_PAYLOAD:-1900}
 
 while [ $# -gt 0 ]; do
     case "$1" in

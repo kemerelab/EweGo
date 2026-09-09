@@ -65,6 +65,10 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   `/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg`, avahi-daemon is baked in,
   kernel packages are held. Reflash from v0.4.3 or later; never run apt on
   a collar. Console has an "apt / first-boot history" button.
+- 2026-09-09 bench PASS: two cameras 1080p30 simultaneously, 0 lost, with
+  `max_payload=1900` (camera alt table 800/944/1280/1600/1984/2880/3060;
+  2048 rounded up to 2880 and failed). 1900 is the image default from v0.4.4.
+  Next: ewego-cam record test on both cameras, then a 10-minute run.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

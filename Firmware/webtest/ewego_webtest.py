@@ -706,11 +706,15 @@ def uvc_altsettings(dev):
     if not bus:
         return []
     rc, out = sh(["lsusb", "-v", "-s", f"{bus}:{devnum}"], timeout=20)
-    table, alt, in_vs = [], None, False
+    table, alt, in_vs, video_class = [], None, False, False
     for line in out.splitlines():
         s = line.strip()
-        if s.startswith("bInterfaceSubClass"):
-            in_vs = re.match(r"bInterfaceSubClass\s+2\b", s) is not None  # 2 = VideoStreaming
+        if s.startswith("bInterfaceClass"):
+            video_class = re.match(r"bInterfaceClass\s+14\b", s) is not None  # 14 = Video
+        elif s.startswith("bInterfaceSubClass"):
+            # subclass 2 is VideoStreaming only within class 14; audio
+            # streaming interfaces (class 1) also use subclass 2
+            in_vs = video_class and re.match(r"bInterfaceSubClass\s+2\b", s) is not None
         elif s.startswith("bAlternateSetting"):
             alt = int(s.split()[1])
         elif s.startswith("wMaxPacketSize") and in_vs and alt is not None:
@@ -1223,7 +1227,7 @@ PAGE = r"""<!doctype html>
     · stagger <input id="dc-st" value="1" size="3"> s
     <button onclick="run('uvc-quirk','out-cam','&on=1')">Reload uvcvideo with quirks=128</button>
     <button onclick="run('uvc-quirk','out-cam','&on=0')">Reload without</button>
-    · max_payload <input id="uvc-cap" value="2048" size="5">
+    · max_payload <input id="uvc-cap" value="1900" size="5">
     <button onclick="run('uvc-cap','out-cam','&value='+val('uvc-cap'))">Set (live)</button>
   </div>
   <div class="row">

@@ -18,7 +18,7 @@ set -euo pipefail
 die() { echo "error: $*" >&2; exit 1; }
 log() { echo "==> $*"; }
 
-MAX_PAYLOAD=${MAX_PAYLOAD:-2048}
+MAX_PAYLOAD=${MAX_PAYLOAD:-1900}
 SRC=/tmp/uvc-src
 [ -f "$SRC/uvc_video.c" ] || die "$SRC does not contain the uvcvideo source"
 grep -q uvc_max_payload_param "$SRC/uvc_video.c" || die "$SRC is not patched (run patch-uvcvideo.py first)"

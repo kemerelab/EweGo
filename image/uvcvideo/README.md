@@ -19,13 +19,23 @@ formats in the Pi 6.12 kernel, so it does nothing for MJPEG.
 
 `patch-uvcvideo.py` adds one module parameter to the in-tree driver:
 
-    options uvcvideo max_payload=2048
+    options uvcvideo max_payload=1900
 
 If a camera asks for more than `max_payload` bytes per microframe, the
 request is capped before the alternate setting is chosen (the camera's
-own request is logged with `trace=1024`). 2048 B per microframe is 16 MB/s
-per camera, several times what 1080p30 MJPEG produces, and two cameras at
-2048 fit the bus with room to spare. `0` disables the cap.
+own request is logged with `trace=1024`). The driver then picks the
+smallest alternate setting **at or above** the capped value, so the cap
+must sit at or below the alternate setting you want. The collar camera's
+table is 800, 944, 1280, 1600, 1984, 2880, 3060 (alt 5–11); 1900 lands on
+alt 9 = 1984 B/µframe, 15.9 MB/s per camera, several times what 1080p30
+MJPEG produces (3–5 MB/s measured). Two cameras at 1984 total 3968, well
+inside the ~5000 that clears the controller's overhead accounting. 2048
+was tried first and rounded up to 2880, which two cameras cannot share.
+`0` disables the cap. The web console's Bandwidth probe prints a camera's
+table and can set the value at runtime.
+
+**Bench result 2026-09-09:** two cameras at 1920×1080 30 fps, 6 s, 0 lost
+frames on either, with max_payload=1900.
 
 The edit is anchored on exact source lines; if the kernel changes, the
 build fails loudly instead of producing an unpatched module.

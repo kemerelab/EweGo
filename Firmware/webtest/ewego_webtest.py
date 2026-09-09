@@ -516,6 +516,9 @@ def test_dualcam(write, q):
                 note = ""
                 if s["frames"] == 0 and procs[d].poll() is None and time.monotonic() - s["started"] > 4:
                     note = " (streaming but NO frames yet)"
+                a = uvc_altsetting(d)
+                if a and a[0]:
+                    note += f" [alt {a[0]}: {a[1]} B/uframe]"
                 parts.append(f"{d}: {s['frames']} frames, {s['lost']} lost{note}")
             write(("  " + "   ".join(parts) + "\n").encode())
     finally:
@@ -555,6 +558,68 @@ def test_dualcam(write, q):
     write(b"\nkernel messages during the test:\n" + (out.encode() if out.strip() else b"  (none)\n"))
     rc, out = sh(["lsusb", "-t"])
     write(b"\nUSB tree:\n" + out.encode())
+
+
+def uvc_altsetting(dev):
+    """(alt setting, bytes per microframe) of a UVC camera's streaming
+    interface while it streams, from sysfs. None if not streaming/unknown."""
+    try:
+        ctrl_if = Path(os.path.realpath(Path("/sys/class/video4linux") / os.path.basename(dev) / "device"))
+        usb_dev = ctrl_if.parent
+        base = ctrl_if.name.rsplit(":", 1)[0]          # e.g. 1-1.4
+        for intf in sorted(usb_dev.glob(base + ":*")):
+            try:
+                if (intf / "bInterfaceClass").read_text().strip() != "0e":   # video class
+                    continue
+                if (intf / "bInterfaceSubClass").read_text().strip() != "02":  # streaming
+                    continue
+                alt = int((intf / "bAlternateSetting").read_text().strip())
+                eps = list(intf.glob("ep_*"))
+                if not eps:
+                    return alt, 0
+                mps = int((eps[0] / "wMaxPacketSize").read_text().strip(), 16)
+                return alt, (mps & 0x7FF) * (((mps >> 11) & 3) + 1)
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def test_uvc_probe(write, q):
+    """Stream a few frames from one camera with uvcvideo tracing on and
+    show what the camera asked for and which alternate setting the
+    driver chose. This is the number that has to fit on the bus."""
+    dev = q.get("dev", [None])[0] or (video_devices() or [{"dev": "/dev/video0"}])[0]["dev"]
+    size = q.get("size", ["1920x1080"])[0]
+    fps = q.get("fps", ["30"])[0]
+    w, h = size.split("x")
+    tracef = Path("/sys/module/uvcvideo/parameters/trace")
+    try:
+        old = tracef.read_text().strip()
+        tracef.write_text("1025")          # PROBE (1) | VIDEO (1024)
+    except OSError as e:
+        write(f"cannot set uvcvideo trace: {e}\n".encode())
+        return
+    rc, before = sh(["bash", "-c", "dmesg | wc -l"])
+    write(f"Probing {dev} at {size} {fps} fps MJPG with uvcvideo trace on ...\n".encode())
+    argv = ["v4l2-ctl", "-d", dev, f"--set-fmt-video=width={w},height={h},pixelformat=MJPG",
+            f"--set-parm={fps}", "--stream-mmap", "--stream-poll", "--stream-count=10", "--stream-to=/dev/null"]
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    alt = uvc_altsetting(dev)
+    try:
+        tracef.write_text(old)
+    except OSError:
+        pass
+    write(("v4l2-ctl: " + (p.stderr.strip() or "ok") + "\n").encode())
+    rc, out = sh(["bash", "-c", f"dmesg -T | tail -n +{int(before.strip() or 0) + 1} | grep -iE 'uvcvideo|usb [0-9]'"])
+    write(b"kernel:\n" + (out.encode() if out.strip() else b"  (nothing logged)\n"))
+    write(b"\nHow to read it: 'Selecting alternate setting N (M B/frame bandwidth)' is the payload per\n"
+          b"125 us microframe the driver reserved for this camera. A single USB 2.0 bus has about\n"
+          b"6000 B per microframe for all isochronous devices together, so two cameras must sum\n"
+          b"below that. 3072 is the maximum a camera can ask for; two of those never fit.\n"
+          b"On this kernel the quirks=128 bandwidth fix applies to uncompressed formats only, so it\n"
+          b"does not change what an MJPEG camera requests.\n")
 
 
 def test_uvc_quirk(write, q):
@@ -607,6 +672,7 @@ TESTS = {
     "camera-info": (test_camera_info, "camera"),
     "dualcam": (test_dualcam, "camera"),
     "uvc-quirk": (test_uvc_quirk, "camera"),
+    "uvc-probe": (test_uvc_probe, "camera"),
     "usb": (test_usb, None),
     "dmesg": (test_dmesg, None),
     "i2c": (test_i2c, None),
@@ -950,6 +1016,7 @@ PAGE = r"""<!doctype html>
     <button onclick="camLive(false)">Stop</button>
     <button onclick="camSnap()">Snapshot</button>
     <button onclick="run('camera-info','out-cam','&dev='+encodeURIComponent(val('cam-dev')))">Formats</button>
+    <button onclick="run('uvc-probe','out-cam','&dev='+encodeURIComponent(val('cam-dev'))+'&size='+val('cam-size')+'&fps='+val('cam-fps'))">Bandwidth probe</button>
     <span id="cam-msg"></span>
   </div>
   <div class="row">

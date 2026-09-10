@@ -227,6 +227,7 @@ def status():
                  "path": str(EWEGO)},
         "battery": battery(),
         "pps": pps_status(),
+        "bridge": BRIDGE.status(),
         "devices": devs,
         "audio_card": {"index": card[0], "name": card[1]} if card else None,
         "video": video_devices(),
@@ -234,8 +235,8 @@ def status():
     }
 
 
-def open_serial_raw(port, baud):
-    fd = os.open(port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
+def open_serial_raw(port, baud, writable=False):
+    fd = os.open(port, (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOCTTY | os.O_NONBLOCK)
     attrs = termios.tcgetattr(fd)
     speed = getattr(termios, f"B{baud}")
     cflag = attrs[2]
@@ -245,6 +246,117 @@ def open_serial_raw(port, baud):
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     termios.tcflush(fd, termios.TCIFLUSH)
     return fd
+
+
+class SerialBridge:
+    """Expose a serial port on a TCP port, both directions, one client at a
+    time, so PyGPSClient (or u-center) on a laptop can talk to the GNSS
+    module over the network. Standard library only."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stop_evt = threading.Event()
+        self.state = {"running": False, "port": None, "dev": None, "baud": None,
+                      "client": None, "rx": 0, "tx": 0, "error": None}
+
+    def status(self):
+        with self.lock:
+            return dict(self.state)
+
+    def start(self, dev, baud, tcp_port):
+        with self.lock:
+            if self.state["running"]:
+                return False, "bridge already running"
+            if not LOCKS["gps"].acquire(blocking=False):
+                return False, "serial port busy (raw read running?)"
+            try:
+                fd = open_serial_raw(dev, baud, writable=True)
+            except (OSError, AttributeError) as e:
+                LOCKS["gps"].release()
+                return False, f"open {dev}: {e}"
+            try:
+                srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                srv.bind(("0.0.0.0", tcp_port))
+                srv.listen(1)
+                srv.settimeout(0.5)
+            except OSError as e:
+                os.close(fd)
+                LOCKS["gps"].release()
+                return False, f"listen on {tcp_port}: {e}"
+            self.stop_evt.clear()
+            self.state.update({"running": True, "port": tcp_port, "dev": dev, "baud": baud,
+                               "client": None, "rx": 0, "tx": 0, "error": None})
+            self.thread = threading.Thread(target=self._run, args=(fd, srv), daemon=True)
+            self.thread.start()
+            return True, f"listening on TCP {tcp_port} <-> {dev} @ {baud}"
+
+    def stop(self):
+        with self.lock:
+            if not self.state["running"]:
+                return False, "bridge not running"
+            self.stop_evt.set()
+        self.thread.join(timeout=5)
+        return True, "bridge stopped"
+
+    def _run(self, fd, srv):
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    conn, addr = srv.accept()
+                except socket.timeout:
+                    # keep draining the serial port so stale data does not pile up
+                    try:
+                        os.read(fd, 65536)
+                    except (BlockingIOError, OSError):
+                        pass
+                    continue
+                # blocking with a bound: select() tells us when recv will not
+                # block, and sendall() may wait briefly on a slow Wi-Fi link
+                conn.settimeout(5)
+                with self.lock:
+                    self.state["client"] = f"{addr[0]}:{addr[1]}"
+                try:
+                    termios.tcflush(fd, termios.TCIFLUSH)
+                    while not self.stop_evt.is_set():
+                        r, _, _ = select.select([fd, conn], [], [], 0.5)
+                        if fd in r:
+                            try:
+                                data = os.read(fd, 65536)
+                            except BlockingIOError:
+                                data = b""
+                            if data:
+                                conn.sendall(data)
+                                with self.lock:
+                                    self.state["tx"] += len(data)
+                        if conn in r:
+                            try:
+                                data = conn.recv(65536)
+                            except BlockingIOError:
+                                data = b""
+                            if not data:
+                                break        # client closed
+                            os.write(fd, data)
+                            with self.lock:
+                                self.state["rx"] += len(data)
+                except OSError as e:
+                    with self.lock:
+                        self.state["error"] = str(e)
+                finally:
+                    conn.close()
+                    with self.lock:
+                        self.state["client"] = None
+        finally:
+            srv.close()
+            os.close(fd)
+            with self.lock:
+                self.state["running"] = False
+                self.state["client"] = None
+            LOCKS["gps"].release()
+
+
+BRIDGE = SerialBridge()
 
 
 def sessions():
@@ -996,12 +1108,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        q = parse_qs(u.query)
         m = re.fullmatch(r"/api/unit/([a-z0-9@-]+)/(start|stop|restart)", u.path)
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
                 rc, out = sh(["systemctl", action, unit], timeout=45)
                 self.send_json({"rc": rc, "output": out, "status": unit_status(unit)})
+            elif u.path == "/api/bridge/start":
+                if unit_status("ewego-gps")["active"] == "active":
+                    self.send_json({"ok": False, "message": "ewego-gps is running and owns the port; stop it first"})
+                    return
+                dev = q.get("dev", [GPS_PORT])[0]
+                baud = int(q.get("baud", [str(GPS_BAUD)])[0])
+                tcp_port = int(q.get("port", ["5010"])[0])
+                ok, msg = BRIDGE.start(dev, baud, tcp_port)
+                self.send_json({"ok": ok, "message": msg, "status": BRIDGE.status()})
+            elif u.path == "/api/bridge/stop":
+                ok, msg = BRIDGE.stop()
+                self.send_json({"ok": ok, "message": msg, "status": BRIDGE.status()})
             else:
                 self.send_json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
@@ -1194,6 +1319,12 @@ PAGE = r"""<!doctype html>
     <button onclick="unit('ewego-gps','stop')">Stop logger</button>
     <button onclick="journal('ewego-gps','out-gps')">Logger journal</button>
   </div>
+  <div class="row">
+    <button onclick="bridge('start')">Serial bridge for PyGPSClient: start</button>
+    <button onclick="bridge('stop')">stop</button>
+    TCP port <input id="br-port" value="5010" size="5"> at <select id="br-baud"><option>460800</option><option>230400</option><option>115200</option><option>38400</option></select>
+    <span id="br-status"></span>
+  </div>
   <pre id="out-gps" class="tall"></pre>
 </section>
 
@@ -1264,6 +1395,10 @@ async function refresh() {
     $('clock').innerHTML = 'clock ' + (s.clock.synchronized ? '<span class="ok">synced</span>' : '<span class="bad">NOT synced</span>') + ' ' + s.clock.utc + ' UTC';
     $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>'
         : 'battery ' + s.battery.voltage + ' V · ' + s.battery.soc + ' %';
+    const b = s.bridge;
+    $('br-status').innerHTML = b.running
+      ? '<span class="ok">bridge on :' + b.port + '</span> ' + b.dev + ' @ ' + b.baud + (b.client ? ' · client ' + b.client : ' · waiting for client') + ' · to laptop ' + (b.tx/1024).toFixed(0) + ' KB, from laptop ' + b.rx + ' B' + (b.error ? ' · <span class="bad">' + b.error + '</span>' : '')
+      : 'bridge off';
     const p = s.pps;
     $('pps').innerHTML = !p.present ? '<span class="bad">PPS: no device</span>'
         : (p.pulses ? '<span class="ok">PPS live</span> seq ' + p.seq + (p.rate_hz != null ? ' · ' + p.rate_hz.toFixed(2) + ' Hz' : '') + ' · clock ' + (p.clock_offset_ms >= 0 ? '+' : '') + p.clock_offset_ms + ' ms'
@@ -1306,6 +1441,15 @@ async function run(name, paneId, extra) {
 async function unit(name, action) {
   const r = await (await fetch('/api/unit/' + name + '/' + action, {method: 'POST'})).json();
   $('out-units').textContent = 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output + '\n' + JSON.stringify(r.status);
+  refresh();
+}
+
+async function bridge(action) {
+  const r = await (await fetch('/api/bridge/' + action + '?port=' + val('br-port') + '&baud=' + val('br-baud'), {method: 'POST'})).json();
+  $('out-gps').textContent = r.message + (r.ok && action === 'start'
+    ? '\n\nIn PyGPSClient: Settings -> connection "Socket", host ' + location.hostname + ', port ' + val('br-port') + ', protocol TCP client, then Connect.\n'
+      + 'The bridge is two-way, so PyGPSClient can also send UBX configuration to the module.\nStop the bridge before starting the GPS logger unit.'
+    : '');
   refresh();
 }
 

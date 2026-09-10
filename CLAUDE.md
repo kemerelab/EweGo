@@ -69,6 +69,11 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   `max_payload=1900` (camera alt table 800/944/1280/1600/1984/2880/3060;
   2048 rounded up to 2880 and failed). 1900 is the image default from v0.4.4.
   Next: ewego-cam record test on both cameras, then a 10-minute run.
+- v0.4.5 (2026-09-10): ewego-cam 0.2 (writer thread + steady writeback,
+  overrun accounting) and UVC_URBS 5 -> 32 in the patched driver, after
+  the recorder lost 5-9 frames per camera at each 5 s fdatasync while
+  recording two cameras at 1080p30 to the SD card (v4l2-ctl to /dev/null
+  was clean). Bench next: same record test on v0.4.5, then 10 min.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

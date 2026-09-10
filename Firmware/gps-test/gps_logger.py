@@ -75,7 +75,11 @@ class NTRIPClient:
         """Connect to NTRIP caster"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Bounded connect: an unreachable caster (collar away from the
+            # lab network) used to block here for up to two minutes.
+            self.socket.settimeout(5)
             self.socket.connect((self.host, self.port))
+            self.socket.settimeout(10)  # recv in read_corrections must not hang forever either
             
             # Build NTRIP request
             request = (
@@ -470,24 +474,37 @@ def main():
     parser.add_argument('--port', default='/dev/ttyAMA4')
     parser.add_argument('--baud', type=int, default=460800)
     parser.add_argument('--log-dir', default=None)
+    parser.add_argument('--ntrip', default=os.environ.get('EWEGO_NTRIP', ''),
+                        help='NTRIP caster as HOST:PORT/MOUNTPOINT[,USER:PASSWORD], e.g. '
+                             '192.168.1.213:2101/sheep (the lab Sparkfun caster). '
+                             'Default: $EWEGO_NTRIP, or disabled.')
+    parser.add_argument('--no-ntrip', action='store_true', help='Disable RTK corrections')
     args = parser.parse_args()
 
     # ========== CONFIGURATION ==========
     SERIAL_PORT = args.port
     BAUDRATE = args.baud
-    
-    # NTRIP configuration (set to None to disable)
-    # NTRIP_CONFIG = None  # Disabled by default
-    
-    # Sparkfun Mosaic Default Project Configuration Server Settings for NTRIP RTK corrections:
-    NTRIP_CONFIG = {
-        'host': '192.168.1.213',
-        'port': 2101,
-        'mountpoint': 'sheep',
-        'username': None,  # Or your username
-        'password': None   # Or your password
-    }
-    
+
+    # NTRIP configuration: None disables corrections. Previously hard-coded to
+    # the lab caster, which made the logger block on connect away from the lab.
+    NTRIP_CONFIG = None
+    if args.ntrip and not args.no_ntrip:
+        try:
+            spec, _, auth = args.ntrip.partition(',')
+            hostport, _, mountpoint = spec.partition('/')
+            host, _, port = hostport.partition(':')
+            user, _, password = auth.partition(':') if auth else (None, None, None)
+            NTRIP_CONFIG = {
+                'host': host,
+                'port': int(port or 2101),
+                'mountpoint': mountpoint or 'sheep',
+                'username': user or None,
+                'password': password or None,
+            }
+        except ValueError:
+            print(f"✗ Bad --ntrip value {args.ntrip!r}; expected HOST:PORT/MOUNTPOINT[,USER:PASSWORD]")
+            sys.exit(2)
+
     # ===================================
     
     # Create logger

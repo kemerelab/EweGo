@@ -78,5 +78,6 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.
 - Known limits: NetworkManager still in use (SD corruption after power
-  loss, bug 001, until low-battery shutdown lands); NTRIP caster
-  hard-coded to 192.168.1.213 in gps_logger.py; no RTC on the CM4.
+  loss, bug 001, until low-battery shutdown lands); no RTC on the CM4.
+  (NTRIP is no longer hard-coded: `--ntrip HOST:PORT/MOUNT` with a 5 s
+  connect timeout, set via NTRIP_ARGS in /etc/ewego/gps.conf, default off.)

@@ -10,7 +10,9 @@ Type=simple
 WorkingDirectory=/opt/ewego
 Environment=PYTHONPATH=/opt/ewego/pylib
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs
+# NTRIP_ARGS (e.g. --ntrip 192.168.1.213:2101/sheep) comes from /etc/ewego/gps.conf; empty = no RTK corrections
+EnvironmentFile=-/etc/ewego/gps.conf
+ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs $NTRIP_ARGS
 # gps_logger.py stops cleanly on KeyboardInterrupt
 KillSignal=SIGINT
 TimeoutStopSec=15

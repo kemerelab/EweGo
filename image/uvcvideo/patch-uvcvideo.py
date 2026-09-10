@@ -48,6 +48,13 @@ EDITS = [
     ("uvc_video.c",
      "\t\tbandwidth = stream->ctrl.dwMaxPayloadTransferSize;\n",
      CLAMP),
+    # More isochronous URBs in flight: 5 x 32 packets is only ~20 ms of
+    # buffering, and the URBs are resubmitted from a work item that can be
+    # delayed by SD-card writeback on the CM4, which showed up as frames lost
+    # at each fdatasync while both cameras recorded. 32 URBs = ~128 ms.
+    ("uvcvideo.h",
+     "#define UVC_URBS\t\t5\n",
+     "#define UVC_URBS\t\t32\t/* EweGo: was 5 (~20 ms); 32 = ~128 ms of USB-side buffering */\n"),
 ]
 
 
@@ -58,8 +65,7 @@ def main():
     for fname, anchor, replacement in EDITS:
         p = src / fname
         text = p.read_text()
-        if replacement.split("\n", 1)[1] and replacement.split("\n", 1)[1].splitlines()[0] in text \
-                and "uvc_max_payload_param" in text and anchor in text and replacement in text:
+        if replacement in text:
             print(f"{fname}: already patched")
             continue
         n = text.count(anchor)

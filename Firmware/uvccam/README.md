@@ -28,6 +28,28 @@ A session directory `<out>/<YYYYmmdd_HHMMSS>/` (or `--out` itself with
 | `<name>_index.bin` | 32-byte records: u64 byte offset in `.mjpeg`, i64 timestamp µs, u32 driver sequence, u32 bytes, u32 V4L2 flags, u32 reserved |
 | `<name>_summary.json` | frames, lost, gaps and where, error-flagged frames, interval min/mean/max, effective fps, timestamp clock and source, and the `CLOCK_REALTIME` minus `CLOCK_MONOTONIC` offset at start and end, so timestamps can be mapped to wall time |
 
+## Disk I/O never blocks capture
+
+The first version wrote from the capture thread and called fdatasync every
+5 s. On the CM4 that flush stalled the process for 200–340 ms, and both
+cameras lost 5–9 frames at every flush: the uvcvideo driver keeps only a
+few URBs in flight and resubmits them from a work item that the SD-card
+writeback starved, so isochronous data was lost on the bus even though
+V4L2 buffers were free. Two fixes:
+
+- the capture thread only dequeues, copies the frame into a RAM queue
+  (`--ring`, default 64 MB) and requeues; a writer thread drains the queue
+  and starts writeback every `--wb` MB (default 4) with `sync_file_range`,
+  dropping written chunks from the page cache, so dirty data never piles
+  up into a large flush. If the writer falls behind the budget, frames are
+  counted as `writer.overruns` in the summary (exit 2) rather than blocking.
+- the image's patched uvcvideo keeps 32 URBs in flight instead of 5
+  (~128 ms of USB-side buffering per camera instead of ~20 ms).
+
+The statistics line and `summary.json` report the queue peak, overruns and
+the longest single write call, so an SD card that is getting slow shows up
+before it costs frames.
+
 ## Drop accounting
 
 The driver increments the sequence number for every frame the camera

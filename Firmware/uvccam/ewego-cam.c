@@ -7,6 +7,12 @@
  * carrying the driver's sequence number and flags, so lost frames and
  * error-flagged frames are accounted for exactly.
  *
+ * Disk I/O never touches the capture thread: frames are copied into a RAM
+ * queue and a writer thread drains it with steady, small writeback
+ * (sync_file_range every few MB) instead of periodic fdatasync bursts,
+ * because SD-card flush stalls of a few hundred ms were enough to lose USB
+ * isochronous data on the CM4.
+ *
  * Output, per run, in <out>/<session>/ (session = start time, or --no-session-dir):
  *   <name>.mjpeg            concatenated JPEG frames (play_with_timestamps.py reads this)
  *   <name>_timestamps.bin   int64 little-endian, microseconds, CLOCK_MONOTONIC, one per frame
@@ -14,8 +20,8 @@
  *                           u32 sequence, u32 bytes, u32 v4l2 flags, u32 reserved
  *   <name>_summary.json     counts, gaps, intervals, clock offsets, written at exit
  *
- * Exit status: 0 clean and no frames lost; 2 frames lost or error-flagged;
- * 3 camera stalled; 1 usage or device error.
+ * Exit status: 0 clean and no frames lost; 2 frames lost, error-flagged, or
+ * dropped by a full write queue; 3 camera stalled; 1 usage or device error.
  *
  * Build: gcc -O2 -Wall -Wextra -static -o ewego-cam ewego-cam.c
  * No dependencies beyond libc and the kernel headers.
@@ -29,6 +35,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stddef.h>
@@ -46,7 +53,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -66,8 +73,9 @@ struct cfg {
 	int buffers;
 	int seconds;
 	int stats_interval;
-	int sync_interval;
 	int stall_timeout;
+	size_t ring_bytes;   /* RAM queue budget between capture and writer */
+	size_t wb_chunk;     /* start writeback every this many bytes */
 	int session_dir;
 	int realtime;
 	int quiet;
@@ -81,10 +89,39 @@ struct stats {
 	double dt_min, dt_max, dt_sum;
 	uint64_t dt_n;
 	/* per stats interval */
-	uint64_t i_frames, i_bytes;
+	uint64_t i_bytes;
 	double i_dt_min, i_dt_max, i_dt_sum;
 	uint64_t i_dt_n;
 	char gap_list[512];
+};
+
+/* ---- frame queue between capture and writer ---------------------------- */
+
+struct frame {
+	struct frame *next;
+	uint8_t *data;
+	size_t len;
+	int64_t ts_us;
+	uint32_t seq, flags;
+};
+
+struct queue {
+	pthread_mutex_t m;
+	pthread_cond_t cv;
+	struct frame *head, *tail;
+	size_t bytes, max_bytes, high_water;
+	uint64_t frames, overruns;
+	int done;
+};
+
+struct writer {
+	struct queue *q;
+	int vid_fd, ts_fd, idx_fd;
+	size_t wb_chunk;
+	/* results */
+	uint64_t written_frames, written_bytes;
+	double write_max_ms;
+	int error;
 };
 
 static volatile sig_atomic_t g_stop;
@@ -142,6 +179,90 @@ static void sd_notify(const char *msg)
 	sendto(fd, msg, strlen(msg), MSG_NOSIGNAL, (struct sockaddr *)&addr,
 	       (socklen_t)(offsetof(struct sockaddr_un, sun_path) + len));
 	close(fd);
+}
+
+static int write_all(int fd, const void *buf, size_t len)
+{
+	const uint8_t *p = buf;
+	while (len > 0) {
+		ssize_t n = write(fd, p, len);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+static void *writer_main(void *arg)
+{
+	struct writer *w = arg;
+	struct queue *q = w->q;
+	uint64_t offset = 0;
+	uint64_t chunk_start = 0;
+
+	for (;;) {
+		struct frame *f;
+		int64_t t0, t1;
+
+		pthread_mutex_lock(&q->m);
+		while (!q->head && !q->done)
+			pthread_cond_wait(&q->cv, &q->m);
+		f = q->head;
+		if (f) {
+			q->head = f->next;
+			if (!q->head)
+				q->tail = NULL;
+			q->bytes -= f->len;
+			q->frames--;
+		}
+		pthread_mutex_unlock(&q->m);
+		if (!f)
+			break;              /* done and drained */
+
+		{
+			struct idx_rec rec = {
+				.offset = offset, .ts_us = f->ts_us, .seq = f->seq,
+				.bytes = (uint32_t)f->len, .flags = f->flags, .reserved = 0,
+			};
+			int64_t ts_le = f->ts_us;
+
+			t0 = now_mono_us();
+			if (write_all(w->vid_fd, f->data, f->len) ||
+			    write_all(w->ts_fd, &ts_le, sizeof(ts_le)) ||
+			    write_all(w->idx_fd, &rec, sizeof(rec))) {
+				if (!w->error)
+					fprintf(stderr, "write failed: %s (disk full?)\n", strerror(errno));
+				w->error = 1;
+			}
+			t1 = now_mono_us();
+			if ((double)(t1 - t0) / 1000.0 > w->write_max_ms)
+				w->write_max_ms = (double)(t1 - t0) / 1000.0;
+		}
+		offset += f->len;
+		w->written_frames++;
+		w->written_bytes += f->len;
+		free(f->data);
+		free(f);
+
+		/* Steady writeback: kick the last chunk out to the card as soon as
+		 * it is complete, and drop the chunk before it from the page cache,
+		 * so dirty data never piles up into a multi-hundred-ms flush. */
+		if (offset - chunk_start >= w->wb_chunk) {
+			sync_file_range(w->vid_fd, (off64_t)chunk_start, (off64_t)(offset - chunk_start),
+					SYNC_FILE_RANGE_WRITE);
+			if (chunk_start >= w->wb_chunk)
+				posix_fadvise(w->vid_fd, 0, (off_t)(chunk_start - w->wb_chunk), POSIX_FADV_DONTNEED);
+			chunk_start = offset;
+		}
+	}
+	fdatasync(w->vid_fd);
+	fdatasync(w->ts_fd);
+	fdatasync(w->idx_fd);
+	return NULL;
 }
 
 /*
@@ -223,12 +344,13 @@ static void usage(FILE *f)
 		"  --size WxH          default 1920x1080\n"
 		"  --fps N             default 30\n"
 		"  --buffers N         V4L2 buffers to queue (default 16, max %d)\n"
+		"  --ring MB           RAM queue between capture and disk (default 64)\n"
+		"  --wb MB             start writeback every MB written (default 4)\n"
 		"  --seconds N         stop after N seconds (default 0 = until SIGINT/SIGTERM)\n"
 		"  --stats N           print statistics every N seconds (default 5, 0 = off)\n"
-		"  --sync N            fdatasync output every N seconds (default 5)\n"
 		"  --stall N           exit 3 after N seconds without a frame (default 10)\n"
 		"  --no-session-dir    write directly into --out\n"
-		"  --rt                SCHED_FIFO priority 10 and mlockall (needs root)\n"
+		"  --rt                SCHED_FIFO priority 10 and mlockall for the capture thread (needs root)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n",
 		VERSION, MAX_BUFFERS);
@@ -255,31 +377,42 @@ static void stats_add_interval(struct stats *st, double dt)
 	st->i_dt_n++;
 }
 
-static void print_stats(const struct cfg *c, struct stats *st, double elapsed)
+static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, struct writer *w, double elapsed)
 {
-	char line[256];
+	char line[320];
 	double fps = st->i_dt_n ? 1e6 / (st->i_dt_sum / (double)st->i_dt_n) : 0.0;
+	size_t qbytes, qhw;
+	uint64_t qovr;
+
+	pthread_mutex_lock(&q->m);
+	qbytes = q->bytes;
+	qhw = q->high_water;
+	qovr = q->overruns;
+	pthread_mutex_unlock(&q->m);
 
 	snprintf(line, sizeof(line),
-		 "%s: %" PRIu64 " frames, %" PRIu64 " lost, %" PRIu64 " err | %.2f fps, interval %.1f/%.1f/%.1f ms, %.1f MB/s",
+		 "%s: %" PRIu64 " frames, %" PRIu64 " lost, %" PRIu64 " err | %.2f fps, interval %.1f/%.1f/%.1f ms, "
+		 "%.1f MB/s | queue %.1f MB (peak %.1f), overruns %" PRIu64 ", write max %.0f ms",
 		 c->name, st->frames, st->lost, st->errors, fps,
 		 st->i_dt_n ? st->i_dt_min / 1000.0 : 0.0,
 		 st->i_dt_n ? st->i_dt_sum / (double)st->i_dt_n / 1000.0 : 0.0,
 		 st->i_dt_n ? st->i_dt_max / 1000.0 : 0.0,
-		 c->stats_interval > 0 ? (double)st->i_bytes / 1e6 / (double)c->stats_interval : 0.0);
+		 c->stats_interval > 0 ? (double)st->i_bytes / 1e6 / (double)c->stats_interval : 0.0,
+		 (double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms);
 	if (!c->quiet)
 		printf("[%7.1fs] %s\n", elapsed, line);
 	{
-		char msg[300];
+		char msg[360];
 		snprintf(msg, sizeof(msg), "STATUS=%s", line);
 		sd_notify(msg);
 	}
-	st->i_frames = st->i_bytes = 0;
+	st->i_bytes = 0;
 	st->i_dt_n = 0;
 	st->i_dt_sum = 0;
 }
 
 static int write_summary(const char *path, const struct cfg *c, const struct stats *st,
+			 const struct queue *q, const struct writer *w,
 			 const char *devpath, int64_t mono0, int64_t real0, int64_t mono1, int64_t real1,
 			 int exit_code, uint32_t tstamp_flags)
 {
@@ -299,6 +432,8 @@ static int write_summary(const char *path, const struct cfg *c, const struct sta
 		"  \"gap_list\": \"%s\",\n"
 		"  \"error_frames\": %" PRIu64 ",\n"
 		"  \"stalls\": %" PRIu64 ",\n"
+		"  \"writer\": {\"frames\": %" PRIu64 ", \"bytes\": %" PRIu64 ", \"overruns\": %" PRIu64
+		", \"queue_peak_bytes\": %zu, \"queue_budget_bytes\": %zu, \"write_max_ms\": %.1f, \"error\": %d},\n"
 		"  \"first_seq\": %u,\n"
 		"  \"last_seq\": %u,\n"
 		"  \"first_ts_us\": %" PRId64 ",\n"
@@ -314,6 +449,8 @@ static int write_summary(const char *path, const struct cfg *c, const struct sta
 		"}\n",
 		VERSION, c->name, devpath, c->width, c->height, c->fps,
 		st->frames, st->bytes, st->lost, st->gaps, st->gap_list, st->errors, st->stalls,
+		w->written_frames, w->written_bytes, q->overruns, q->high_water, q->max_bytes,
+		w->write_max_ms, w->error,
 		st->have_seq ? st->first_seq : 0, st->have_seq ? st->last_seq : 0,
 		st->first_ts, st->last_ts,
 		st->dt_n ? st->dt_min : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n : 0.0,
@@ -322,11 +459,23 @@ static int write_summary(const char *path, const struct cfg *c, const struct sta
 			? (double)(st->frames - 1) * 1e6 / (double)(st->last_ts - st->first_ts) : 0.0,
 		(tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC ? "monotonic"
 			: (tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_COPY ? "copy" : "unknown",
-		(tstamp_flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE ? "start-of-exposure"
+		(tstamp_flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE
+			? "start-of-exposure (as flagged by uvcvideo; arrival time unless hwtimestamps=1)"
 			: "end-of-frame/arrival",
 		mono0, real0, mono1, real1, real0 - mono0, exit_code);
 	fclose(f);
 	return 0;
+}
+
+static int open_out(const char *dir, const char *name, const char *suffix)
+{
+	char path[PATH_MAX + 64];
+	int fd;
+	snprintf(path, sizeof(path), "%s/%s%s", dir, name, suffix);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (fd < 0)
+		perror(path);
+	return fd;
 }
 
 int main(int argc, char **argv)
@@ -334,15 +483,18 @@ int main(int argc, char **argv)
 	struct cfg c = {
 		.device = NULL, .out = NULL, .name = "camera1",
 		.width = 1920, .height = 1080, .fps = 30, .buffers = 16,
-		.seconds = 0, .stats_interval = 5, .sync_interval = 5, .stall_timeout = 10,
+		.seconds = 0, .stats_interval = 5, .stall_timeout = 10,
+		.ring_bytes = 64u << 20, .wb_chunk = 4u << 20,
 		.session_dir = 1, .realtime = 0, .quiet = 0,
 	};
 	static const struct option longopts[] = {
 		{"device", required_argument, 0, 'd'}, {"out", required_argument, 0, 'o'},
 		{"name", required_argument, 0, 'n'},   {"size", required_argument, 0, 's'},
 		{"fps", required_argument, 0, 'f'},    {"buffers", required_argument, 0, 'b'},
+		{"ring", required_argument, 0, 'R'},   {"wb", required_argument, 0, 'W'},
 		{"seconds", required_argument, 0, 't'}, {"stats", required_argument, 0, 'S'},
-		{"sync", required_argument, 0, 'y'},   {"stall", required_argument, 0, 'x'},
+		{"sync", required_argument, 0, 'y'},   /* accepted for compatibility, ignored */
+		{"stall", required_argument, 0, 'x'},
 		{"no-session-dir", no_argument, 0, 'N'}, {"rt", no_argument, 0, 'r'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
@@ -351,19 +503,22 @@ int main(int argc, char **argv)
 	char devpath[PATH_MAX];
 	char dir[PATH_MAX], path[PATH_MAX + 64];
 	int fd = -1;
-	FILE *fvid = NULL, *fts = NULL, *fidx = NULL;
 	void *bufs[MAX_BUFFERS] = {0};
 	size_t buflen[MAX_BUFFERS] = {0};
 	struct stats st;
-	int64_t mono0, real0, t_start, t_last_stats, t_last_sync, t_last_frame;
-	uint64_t offset = 0;
+	struct queue q;
+	struct writer w;
+	pthread_t writer_thread;
+	int64_t mono0, real0, t_start, t_last_stats, t_last_frame;
 	uint32_t tstamp_flags = 0;
 	int exit_code = 0;
 	unsigned int i;
 
 	memset(&st, 0, sizeof(st));
+	memset(&q, 0, sizeof(q));
+	memset(&w, 0, sizeof(w));
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:t:S:y:x:Nrqlh", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:Nrqlh", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -376,9 +531,11 @@ int main(int argc, char **argv)
 			break;
 		case 'f': c.fps = atoi(optarg); break;
 		case 'b': c.buffers = atoi(optarg); break;
+		case 'R': c.ring_bytes = (size_t)atoi(optarg) << 20; break;
+		case 'W': c.wb_chunk = (size_t)atoi(optarg) << 20; break;
 		case 't': c.seconds = atoi(optarg); break;
 		case 'S': c.stats_interval = atoi(optarg); break;
-		case 'y': c.sync_interval = atoi(optarg); break;
+		case 'y': break;
 		case 'x': c.stall_timeout = atoi(optarg); break;
 		case 'N': c.session_dir = 0; break;
 		case 'r': c.realtime = 1; break;
@@ -396,8 +553,8 @@ int main(int argc, char **argv)
 		fprintf(stderr, "--buffers must be 2..%d\n", MAX_BUFFERS);
 		return 1;
 	}
-	if (c.fps <= 0) {
-		fprintf(stderr, "--fps must be > 0\n");
+	if (c.fps <= 0 || c.ring_bytes < (1u << 20) || c.wb_chunk < (1u << 16)) {
+		fprintf(stderr, "--fps must be > 0, --ring >= 1, --wb >= 1\n");
 		return 1;
 	}
 
@@ -517,20 +674,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* output files */
-	snprintf(path, sizeof(path), "%s/%s.mjpeg", dir, c.name);
-	fvid = fopen(path, "wb");
-	if (!fvid) {
-		perror(path);
+	/* output files and writer thread */
+	w.vid_fd = open_out(dir, c.name, ".mjpeg");
+	w.ts_fd = open_out(dir, c.name, "_timestamps.bin");
+	w.idx_fd = open_out(dir, c.name, "_index.bin");
+	if (w.vid_fd < 0 || w.ts_fd < 0 || w.idx_fd < 0)
 		return 1;
-	}
-	setvbuf(fvid, NULL, _IOFBF, 1 << 20);
-	snprintf(path, sizeof(path), "%s/%s_timestamps.bin", dir, c.name);
-	fts = fopen(path, "wb");
-	snprintf(path, sizeof(path), "%s/%s_index.bin", dir, c.name);
-	fidx = fopen(path, "wb");
-	if (!fts || !fidx) {
-		perror(path);
+	pthread_mutex_init(&q.m, NULL);
+	pthread_cond_init(&q.cv, NULL);
+	q.max_bytes = c.ring_bytes;
+	w.q = &q;
+	w.wb_chunk = c.wb_chunk;
+	if (pthread_create(&writer_thread, NULL, writer_main, &w)) {
+		perror("pthread_create");
 		return 1;
 	}
 
@@ -555,12 +711,12 @@ int main(int argc, char **argv)
 	}
 	mono0 = now_mono_us();
 	real0 = now_real_us();
-	t_start = t_last_stats = t_last_sync = t_last_frame = mono0;
-	fprintf(stderr, "recording %dx%d MJPG @ %d fps, %d buffers -> %s/%s.*\n",
-		c.width, c.height, c.fps, c.buffers, dir, c.name);
+	t_start = t_last_stats = t_last_frame = mono0;
+	fprintf(stderr, "recording %dx%d MJPG @ %d fps, %d buffers, %zu MB queue -> %s/%s.*\n",
+		c.width, c.height, c.fps, c.buffers, c.ring_bytes >> 20, dir, c.name);
 	sd_notify("READY=1");
 
-	/* capture loop */
+	/* capture loop: dequeue, copy into the queue, requeue. No disk I/O here. */
 	while (!g_stop) {
 		struct pollfd pfd = {.fd = fd, .events = POLLIN};
 		struct v4l2_buffer b;
@@ -632,23 +788,56 @@ int main(int argc, char **argv)
 				st.errors++;
 
 			if (b.bytesused > 0 && b.bytesused <= buflen[b.index]) {
-				struct idx_rec rec = {
-					.offset = offset, .ts_us = ts_us, .seq = b.sequence,
-					.bytes = b.bytesused, .flags = b.flags, .reserved = 0,
-				};
-				int64_t ts_le = ts_us; /* little-endian on all Pi targets */
-				if (fwrite(bufs[b.index], 1, b.bytesused, fvid) != b.bytesused ||
-				    fwrite(&ts_le, sizeof(ts_le), 1, fts) != 1 ||
-				    fwrite(&rec, sizeof(rec), 1, fidx) != 1) {
-					fprintf(stderr, "write failed: %s (disk full?)\n", strerror(errno));
-					exit_code = 1;
-					xioctl(fd, VIDIOC_QBUF, &b);
-					break;
+				struct frame *f = NULL;
+				int overrun = 0;
+
+				pthread_mutex_lock(&q.m);
+				if (q.bytes + b.bytesused > q.max_bytes) {
+					q.overruns++;
+					overrun = 1;
 				}
-				offset += b.bytesused;
+				pthread_mutex_unlock(&q.m);
+
+				if (!overrun) {
+					f = malloc(sizeof(*f));
+					if (f) {
+						f->data = malloc(b.bytesused);
+						if (!f->data) {
+							free(f);
+							f = NULL;
+						}
+					}
+					if (!f) {
+						overrun = 1;
+						pthread_mutex_lock(&q.m);
+						q.overruns++;
+						pthread_mutex_unlock(&q.m);
+					}
+				}
+				if (f) {
+					memcpy(f->data, bufs[b.index], b.bytesused);
+					f->len = b.bytesused;
+					f->ts_us = ts_us;
+					f->seq = b.sequence;
+					f->flags = b.flags;
+					f->next = NULL;
+					pthread_mutex_lock(&q.m);
+					if (q.tail)
+						q.tail->next = f;
+					else
+						q.head = f;
+					q.tail = f;
+					q.bytes += f->len;
+					q.frames++;
+					if (q.bytes > q.high_water)
+						q.high_water = q.bytes;
+					pthread_cond_signal(&q.cv);
+					pthread_mutex_unlock(&q.m);
+				} else if (!c.quiet) {
+					fprintf(stderr, "writer queue full: frame seq %u not written\n", b.sequence);
+				}
 				st.frames++;
 				st.bytes += b.bytesused;
-				st.i_frames++;
 				st.i_bytes += b.bytesused;
 			}
 			if (xioctl(fd, VIDIOC_QBUF, &b)) {
@@ -659,23 +848,14 @@ int main(int argc, char **argv)
 		}
 
 		if (c.stats_interval > 0 && now - t_last_stats >= (int64_t)c.stats_interval * 1000000) {
-			print_stats(&c, &st, (double)(now - t_start) / 1e6);
+			print_stats(&c, &st, &q, &w, (double)(now - t_start) / 1e6);
 			t_last_stats = now;
-		}
-		if (c.sync_interval > 0 && now - t_last_sync >= (int64_t)c.sync_interval * 1000000) {
-			fflush(fvid);
-			fflush(fts);
-			fflush(fidx);
-			fdatasync(fileno(fvid));
-			fdatasync(fileno(fts));
-			fdatasync(fileno(fidx));
-			t_last_sync = now;
 		}
 		if (c.seconds > 0 && now - t_start >= (int64_t)c.seconds * 1000000)
 			break;
 	}
 
-	/* shutdown */
+	/* shutdown: stop the stream, then let the writer drain the queue */
 	sd_notify("STOPPING=1");
 	{
 		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -685,25 +865,28 @@ int main(int argc, char **argv)
 		if (bufs[i])
 			munmap(bufs[i], buflen[i]);
 	close(fd);
-	fflush(fvid);
-	fflush(fts);
-	fflush(fidx);
-	fdatasync(fileno(fvid));
-	fclose(fvid);
-	fclose(fts);
-	fclose(fidx);
 
-	if (exit_code == 0 && (st.lost || st.errors))
+	pthread_mutex_lock(&q.m);
+	q.done = 1;
+	pthread_cond_signal(&q.cv);
+	pthread_mutex_unlock(&q.m);
+	pthread_join(writer_thread, NULL);
+	close(w.vid_fd);
+	close(w.ts_fd);
+	close(w.idx_fd);
+
+	if (exit_code == 0 && (st.lost || st.errors || q.overruns || w.error))
 		exit_code = 2;
 	{
 		int64_t mono1 = now_mono_us(), real1 = now_real_us();
 		snprintf(path, sizeof(path), "%s/%s_summary.json", dir, c.name);
-		write_summary(path, &c, &st, devpath, mono0, real0, mono1, real1, exit_code, tstamp_flags);
+		write_summary(path, &c, &st, &q, &w, devpath, mono0, real0, mono1, real1, exit_code, tstamp_flags);
 	}
 	fprintf(stderr, "%s: %" PRIu64 " frames, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " error-flagged, "
-		"%.1f MB, interval min/mean/max %.1f/%.1f/%.1f ms -> exit %d\n",
-		c.name, st.frames, st.lost, st.gaps, st.errors, (double)st.bytes / 1e6,
+		"%" PRIu64 " queue overruns, %.1f MB, interval min/mean/max %.1f/%.1f/%.1f ms, "
+		"queue peak %.1f MB, write max %.0f ms -> exit %d\n",
+		c.name, st.frames, st.lost, st.gaps, st.errors, q.overruns, (double)w.written_bytes / 1e6,
 		st.dt_n ? st.dt_min / 1000.0 : 0.0, st.dt_n ? st.dt_sum / (double)st.dt_n / 1000.0 : 0.0,
-		st.dt_n ? st.dt_max / 1000.0 : 0.0, exit_code);
+		st.dt_n ? st.dt_max / 1000.0 : 0.0, (double)q.high_water / 1e6, w.write_max_ms, exit_code);
 	return exit_code;
 }

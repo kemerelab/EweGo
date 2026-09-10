@@ -40,6 +40,13 @@ frames on either, with max_payload=1900.
 The edit is anchored on exact source lines; if the kernel changes, the
 build fails loudly instead of producing an unpatched module.
 
+The patch also raises `UVC_URBS` from 5 to 32. With 32 packets per URB
+that is ~128 ms of USB-side buffering per camera instead of ~20 ms; the
+URBs are resubmitted from a work item that SD-card writeback on the CM4
+can delay, which showed up as 5–9 frames lost on both cameras at every
+fdatasync of the recorder. Cost: about 2 MB of DMA memory per streaming
+camera.
+
 ## How it is built
 
 `inject-ewego.sh` does this inside the image's chroot, after the apt step:

@@ -10,6 +10,9 @@ psmisc
 # ffmpeg for ad-hoc streaming/transcoding tests with USB cameras (not used
 # by the recording scripts).
 ffmpeg
+# dfu-util flashes the hub_imu (STM32F042) USB IMU module through the hub
+# via the STM32 system bootloader (hold BOOT0 high at plug-in -> 0483:df11).
+dfu-util
 # avahi-daemon gives <hostname>.local. Raspberry Pi Imager's cloud-init
 # user-data would otherwise apt-install it at first boot; the image disables
 # that module, so it has to be here.

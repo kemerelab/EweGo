@@ -182,7 +182,8 @@ int main(void)
 {
 	clock_init();
 	led(1);
-	tud_init(0);
+	const tusb_rhport_init_t rh_init = {.role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_FULL};
+	tusb_rhport_init(0, &rh_init);
 
 	uint32_t last_blink = 0;
 	int led_on = 1;

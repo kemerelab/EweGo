@@ -24,6 +24,7 @@ SRCS := \
 	$(TUSB)/device/usbd.c \
 	$(TUSB)/class/cdc/cdc_device.c \
 	$(TUSB)/class/hid/hid_device.c \
+	$(TUSB)/portable/st/stm32_fsdev/fsdev_common.c \
 	$(TUSB)/portable/st/stm32_fsdev/dcd_stm32_fsdev.c
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS))

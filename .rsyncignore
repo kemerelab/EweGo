@@ -20,3 +20,7 @@ recordings/
 
 # Dev-side config
 CLAUDE.md
+
+# hub_imu firmware build products and fetched dependencies (dev/CI only)
+Firmware/hub_imu/lib/
+Firmware/hub_imu/build/

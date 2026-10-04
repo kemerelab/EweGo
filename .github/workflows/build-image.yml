@@ -9,7 +9,9 @@ on:
   push:
     branches: [main, phase-a-image]
     tags: ['v*']
+    paths-ignore: ['Firmware/hub_imu/**', '.github/workflows/hub-imu-firmware.yml']
   pull_request:
+    paths-ignore: ['Firmware/hub_imu/**']
   workflow_dispatch:
 
 env:

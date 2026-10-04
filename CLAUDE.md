@@ -82,9 +82,12 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   .bin). Step 1 (hubimu-v0.1.0) enumerates as CDC console + HID, 12 KB
   flash. Flash via DFU through the hub (BOOT0 high at plug-in -> 0483:df11;
   afterwards the console's `dfu` command). dfu-util is in apt-packages.txt
-  for the next image. Steps 2 (I2C/BNO055 id) and 3 (100 Hz HID reports with
-  device timestamp + seq, host logger ewego-imu-usb) are next. Bench results
-  so far: DFU mode seen from a Mac's System Information (hardware OK).
+  for the next image (v0.4.7 has it). Step 1 verified on hardware (flashed
+  via DFU from the collar, enumerates, console works). Step 2 (hubimu-v0.2.0,
+  18.6 KB flash): I2C1 PF0/PF1 100 kHz, BNO055 NDOF, console id/cal/read/
+  init; awaiting bench. Step 3 next: 100 Hz HID reports (46-byte burst +
+  device µs timestamp + seq), host logger ewego-imu-usb, console IMU card,
+  then the combined bus test with both cameras.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

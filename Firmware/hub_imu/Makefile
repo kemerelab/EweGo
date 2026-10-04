@@ -22,7 +22,6 @@ SRCS := \
 	$(TUSB)/tusb.c \
 	$(TUSB)/common/tusb_fifo.c \
 	$(TUSB)/device/usbd.c \
-	$(TUSB)/device/usbd_control.c \
 	$(TUSB)/class/cdc/cdc_device.c \
 	$(TUSB)/class/hid/hid_device.c \
 	$(TUSB)/portable/st/stm32_fsdev/dcd_stm32_fsdev.c

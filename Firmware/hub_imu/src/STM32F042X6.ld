@@ -41,6 +41,9 @@ SECTIONS
     *(COMMON)
     . = ALIGN(4);
     _ebss = .;
+    /* newlib's nosys sbrk wants 'end' even though nothing allocates */
+    PROVIDE(end = .);
+    PROVIDE(_end = .);
   } > RAM
 
   /* Survives a software reset: used to request the system bootloader. */

@@ -74,6 +74,17 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   the recorder lost 5-9 frames per camera at each 5 s fdatasync while
   recording two cameras at 1080p30 to the SD card (v4l2-ctl to /dev/null
   was clean). Bench next: same record test on v0.4.5, then 10 min.
+- USB IMU (2026-10-04): the hub_imu module (hardware in
+  LabTools/SmallProjects/USB-IMU/hub_imu: STM32F042F6P6 + BNO055 on a port
+  of the camera hub) gets its firmware in `Firmware/hub_imu/` with its own
+  workflow `hub-imu-firmware.yml` (gcc-arm-none-eabi on the runner, deps
+  fetched by fetch-deps.sh, never committed; tags `hubimu-v*` release the
+  .bin). Step 1 (hubimu-v0.1.0) enumerates as CDC console + HID, 12 KB
+  flash. Flash via DFU through the hub (BOOT0 high at plug-in -> 0483:df11;
+  afterwards the console's `dfu` command). dfu-util is in apt-packages.txt
+  for the next image. Steps 2 (I2C/BNO055 id) and 3 (100 Hz HID reports with
+  device timestamp + seq, host logger ewego-imu-usb) are next. Bench results
+  so far: DFU mode seen from a Mac's System Information (hardware OK).
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

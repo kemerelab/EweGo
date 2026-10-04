@@ -1,15 +1,13 @@
 /*
- * hub_imu firmware, step 1: enumerate as a composite USB device (CDC console
- * + HID data interface), blink the LED, and answer on the console.
- *
- * Nothing talks to the BNO055 yet. The HID interface is present so the host
- * side can be developed against the final descriptor; it sends nothing.
+ * hub_imu firmware, step 2: USB (CDC console + HID), LED, and the BNO055
+ * over I2C with console commands to inspect it. The HID interface is
+ * present but sends nothing yet (step 3 streams samples).
  *
  * Clocks: HSI48 is both SYSCLK and the USB clock, trimmed by the CRS from
  * USB start-of-frame (the board has no crystal). PA11/PA12 must be remapped
  * to the USB pads (SYSCFG_CFGR1.PA11_PA12_RMP) or the device never appears.
  *
- * Console commands: help, version, dfu (reboot into the USB bootloader).
+ * Console commands: help, version, id, cal, read, init, dfu.
  */
 #include <stdint.h>
 #include <string.h>
@@ -17,13 +15,17 @@
 #include "stm32f0xx.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
+#include "i2c.h"
+#include "bno055.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
 #endif
 
 uint32_t SystemCoreClock = 48000000u;
-static volatile uint32_t g_ms;
+volatile uint32_t g_ms;
+static int g_sensor_ok;      /* 0 = not initialised / failed, 1 = NDOF running */
+static int g_sensor_err;     /* last bno055_init() result */
 
 extern void request_bootloader(void);
 
@@ -31,7 +33,6 @@ extern void request_bootloader(void);
 
 static void clock_init(void)
 {
-	/* HSI48 on, as SYSCLK; flash needs one wait state at 48 MHz */
 	RCC->CR2 |= RCC_CR2_HSI48ON;
 	while (!(RCC->CR2 & RCC_CR2_HSI48RDY))
 		;
@@ -39,35 +40,24 @@ static void clock_init(void)
 	RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_HSI48;
 	while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_HSI48)
 		;
-	/* USB clock = HSI48 (USBSW = 0) */
-	RCC->CFGR3 &= ~RCC_CFGR3_USBSW;
+	RCC->CFGR3 &= ~RCC_CFGR3_USBSW;          /* USB clock = HSI48 */
 
-	/* CRS: trim HSI48 from USB SOF. Reset values of CRS_CFGR already select
-	 * USB SOF as the sync source with the right reload for 48 MHz / 1 kHz. */
-	RCC->APB1ENR |= RCC_APB1ENR_CRSEN;
+	RCC->APB1ENR |= RCC_APB1ENR_CRSEN;       /* trim HSI48 from USB SOF */
 	CRS->CR |= CRS_CR_AUTOTRIMEN | CRS_CR_CEN;
 
-	/* peripherals */
 	RCC->AHBENR |= RCC_AHBENR_GPIOAEN;
 	RCC->APB2ENR |= RCC_APB2ENR_SYSCFGCOMPEN;
 	RCC->APB1ENR |= RCC_APB1ENR_USBEN;
-
-	/* USB pads on PA11/PA12 */
 	SYSCFG->CFGR1 |= SYSCFG_CFGR1_PA11_PA12_RMP;
 
-	/* LED on PA3, output, push-pull */
-	GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODER3) | GPIO_MODER_MODER3_0;
+	GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODER3) | GPIO_MODER_MODER3_0;   /* LED */
 
-	/* 1 kHz SysTick */
 	SysTick_Config(SystemCoreClock / 1000u);
 }
 
 static inline void led(int on)
 {
-	if (on)
-		GPIOA->BSRR = GPIO_BSRR_BS_3;
-	else
-		GPIOA->BSRR = GPIO_BSRR_BR_3;
+	GPIOA->BSRR = on ? GPIO_BSRR_BS_3 : GPIO_BSRR_BR_3;
 }
 
 void SysTick_Handler(void)
@@ -80,7 +70,12 @@ void USB_IRQHandler(void)
 	tud_int_handler(0);
 }
 
-/* ---- console ------------------------------------------------------------- */
+void bno055_yield(void)
+{
+	tud_task();
+}
+
+/* ---- console output ------------------------------------------------------- */
 
 static void con_puts(const char *s)
 {
@@ -102,21 +97,137 @@ static void con_puts(const char *s)
 	tud_cdc_write_flush();
 }
 
+static char g_line_buf[96];
+#define con_printf(...) do { snprintf(g_line_buf, sizeof(g_line_buf), __VA_ARGS__); con_puts(g_line_buf); } while (0)
+
+/* print a signed 16-bit raw value scaled by 1/div as a decimal (no float printf) */
+static void con_fixed(const char *label, int16_t raw, int div, int decimals)
+{
+	int32_t v = raw;
+	int neg = v < 0;
+	if (neg)
+		v = -v;
+	int32_t ip = v / div, fp = v % div;
+	/* scale the fraction to the requested number of decimals */
+	int32_t scale = 1;
+	for (int i = 0; i < decimals; i++)
+		scale *= 10;
+	fp = (fp * scale + div / 2) / div;
+	if (fp >= scale) {
+		ip++;
+		fp -= scale;
+	}
+	if (decimals)
+		con_printf("%s%s%ld.%0*ld", label, neg ? "-" : "", (long)ip, decimals, (long)fp);
+	else
+		con_printf("%s%s%ld", label, neg ? "-" : "", (long)ip);
+}
+
+static const char *sensor_state(void)
+{
+	if (g_sensor_ok)
+		return "NDOF running";
+	switch (g_sensor_err) {
+	case 1: return "wrong chip ID";
+	case -1: return "no response on I2C (check 3V3, SDA/SCL, address 0x28)";
+	case -2: return "I2C timeout";
+	default: return "init failed";
+	}
+}
+
 static void banner(void)
 {
-	con_puts("\r\nhub_imu " FW_VERSION " (STM32F042 + BNO055)\r\n"
-		 "step 1: USB only, no sensor yet. type 'help'\r\n> ");
+	con_puts("\r\nhub_imu " FW_VERSION " (STM32F042 + BNO055)\r\n");
+	con_printf("sensor: %s. type 'help'\r\n> ", sensor_state());
+}
+
+/* ---- commands ------------------------------------------------------------- */
+
+static void cmd_id(void)
+{
+	struct bno055_info info;
+	int r = bno055_info(&info);
+	if (r) {
+		con_printf("I2C error %d (%s)\r\n", r, sensor_state());
+		return;
+	}
+	con_printf("chip 0x%02X (expect 0xA0)  acc 0x%02X  mag 0x%02X  gyr 0x%02X\r\n",
+		   info.chip_id, info.acc_id, info.mag_id, info.gyr_id);
+	con_printf("sw rev 0x%04X  bootloader 0x%02X  opr_mode 0x%02X  sys_status %u  sys_err %u\r\n",
+		   info.sw_rev, info.bl_rev, info.opr_mode, info.sys_status, info.sys_err);
+	con_puts("sys_status: 5 = fusion running, 1 = system error (see sys_err)\r\n");
+}
+
+static void cmd_cal(void)
+{
+	uint8_t c;
+	int r = bno055_calib(&c);
+	if (r) {
+		con_printf("I2C error %d\r\n", r);
+		return;
+	}
+	con_printf("calibration (0..3): sys %u  gyr %u  acc %u  mag %u\r\n",
+		   (c >> 6) & 3, (c >> 4) & 3, (c >> 2) & 3, c & 3);
+}
+
+static int16_t le16(const uint8_t *p)
+{
+	return (int16_t)(p[0] | (p[1] << 8));
+}
+
+static void cmd_read(void)
+{
+	uint8_t b[BNO_BURST_LEN];
+	uint32_t t0 = g_ms;
+	int r = bno055_read_burst(b);
+	uint32_t dt = g_ms - t0;
+	if (r) {
+		con_printf("I2C error %d\r\n", r);
+		return;
+	}
+	/* offsets relative to 0x08 */
+	con_puts("acc m/s^2  ");
+	con_fixed("", le16(b + 0), 100, 2); con_fixed(" ", le16(b + 2), 100, 2); con_fixed(" ", le16(b + 4), 100, 2);
+	con_puts("\r\nmag uT     ");
+	con_fixed("", le16(b + 6), 16, 1); con_fixed(" ", le16(b + 8), 16, 1); con_fixed(" ", le16(b + 10), 16, 1);
+	con_puts("\r\ngyr dps    ");
+	con_fixed("", le16(b + 12), 16, 1); con_fixed(" ", le16(b + 14), 16, 1); con_fixed(" ", le16(b + 16), 16, 1);
+	con_puts("\r\neuler deg  h/r/p ");
+	con_fixed("", le16(b + 18), 16, 1); con_fixed(" ", le16(b + 20), 16, 1); con_fixed(" ", le16(b + 22), 16, 1);
+	con_puts("\r\nquat w/x/y/z ");
+	con_fixed("", le16(b + 24), 16384, 4); con_fixed(" ", le16(b + 26), 16384, 4);
+	con_fixed(" ", le16(b + 28), 16384, 4); con_fixed(" ", le16(b + 30), 16384, 4);
+	con_puts("\r\nlin acc    ");
+	con_fixed("", le16(b + 32), 100, 2); con_fixed(" ", le16(b + 34), 100, 2); con_fixed(" ", le16(b + 36), 100, 2);
+	con_puts("\r\ngravity    ");
+	con_fixed("", le16(b + 38), 100, 2); con_fixed(" ", le16(b + 40), 100, 2); con_fixed(" ", le16(b + 42), 100, 2);
+	con_printf("\r\ntemp %d C   calib sys %u gyr %u acc %u mag %u   (46-byte burst took %lu ms)\r\n",
+		   (int8_t)b[44], (b[45] >> 6) & 3, (b[45] >> 4) & 3, (b[45] >> 2) & 3, b[45] & 3, (unsigned long)dt);
+}
+
+static void cmd_init(void)
+{
+	g_sensor_err = bno055_init();
+	g_sensor_ok = g_sensor_err == 0;
+	con_printf("init: %s\r\n", sensor_state());
 }
 
 static void handle_line(char *line)
 {
 	if (!strcmp(line, "help")) {
-		con_puts("commands: help | version | dfu (reboot into USB bootloader)\r\n");
+		con_puts("help | version | id | cal | read | init | dfu\r\n");
 	} else if (!strcmp(line, "version")) {
-		con_puts("hub_imu " FW_VERSION "\r\n");
+		con_printf("hub_imu " FW_VERSION ", sensor: %s\r\n", sensor_state());
+	} else if (!strcmp(line, "id")) {
+		cmd_id();
+	} else if (!strcmp(line, "cal")) {
+		cmd_cal();
+	} else if (!strcmp(line, "read")) {
+		cmd_read();
+	} else if (!strcmp(line, "init")) {
+		cmd_init();
 	} else if (!strcmp(line, "dfu")) {
 		con_puts("rebooting into the system bootloader (0483:df11)...\r\n");
-		tud_task();
 		for (uint32_t t = g_ms; g_ms - t < 50;)
 			tud_task();
 		request_bootloader();
@@ -185,14 +296,21 @@ int main(void)
 	const tusb_rhport_init_t rh_init = {.role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_FULL};
 	tusb_rhport_init(0, &rh_init);
 
+	/* The sensor takes ~700 ms to boot; bno055_init() calls bno055_yield()
+	 * while it waits, so USB enumeration proceeds in the meantime. */
+	i2c_init();
+	g_sensor_err = bno055_init();
+	g_sensor_ok = g_sensor_err == 0;
+
 	uint32_t last_blink = 0;
 	int led_on = 1;
 	for (;;) {
 		tud_task();
 		console_task();
 
-		/* 1 Hz blink once the host has configured us, 5 Hz while waiting */
-		uint32_t period = tud_mounted() ? 500 : 100;
+		/* 1 Hz once configured by the host (2 Hz if the sensor failed),
+		 * 5 Hz while waiting for the host */
+		uint32_t period = tud_mounted() ? (g_sensor_ok ? 500 : 250) : 100;
 		if (g_ms - last_blink >= period) {
 			last_blink = g_ms;
 			led_on = !led_on;

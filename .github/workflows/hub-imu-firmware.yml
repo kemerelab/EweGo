@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0          # git describe for the version string
       - name: Install ARM toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi dfu-util
       - name: Fetch pinned dependencies (TinyUSB, CMSIS)
         run: bash Firmware/hub_imu/fetch-deps.sh
       - name: Build
@@ -41,11 +41,21 @@ jobs:
           RAM=$(arm-none-eabi-size -B build/hub_imu.elf | awk 'NR==2 {print $2+$3}')
           echo "flash used: $FLASH / 32768 bytes; RAM (data+bss): $RAM / 6144 bytes" | tee -a "$GITHUB_STEP_SUMMARY"
           [ "$FLASH" -le 32768 ] && [ "$RAM" -le 5632 ]   # leave 512 B of RAM for the stack
+      - name: DFU suffix
+        # hub_imu.dfu = the same binary with a DFU trailer naming the STM32
+        # bootloader (0483:df11), so dfu-util checks the target and stops
+        # warning. hub_imu.bin stays for tools that want a raw image.
+        run: |
+          cd Firmware/hub_imu/build
+          cp hub_imu.bin hub_imu.dfu
+          dfu-suffix -v 0483 -p df11 -d 0000 -a hub_imu.dfu
+          dfu-suffix -c hub_imu.dfu
       - uses: actions/upload-artifact@v6
         with:
           name: hub_imu-firmware
           path: |
             Firmware/hub_imu/build/hub_imu.bin
+            Firmware/hub_imu/build/hub_imu.dfu
             Firmware/hub_imu/build/hub_imu.elf
             Firmware/hub_imu/build/hub_imu.map
           retention-days: 14
@@ -56,5 +66,6 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           cp Firmware/hub_imu/build/hub_imu.bin "hub_imu-$TAG.bin"
+          cp Firmware/hub_imu/build/hub_imu.dfu "hub_imu-$TAG.dfu"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "hub_imu firmware $TAG" --generate-notes
-          gh release upload "$TAG" --clobber "hub_imu-$TAG.bin"
+          gh release upload "$TAG" --clobber "hub_imu-$TAG.bin" "hub_imu-$TAG.dfu"

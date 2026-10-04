@@ -19,6 +19,8 @@ SRCS := \
 	src/startup.c \
 	src/main.c \
 	src/usb_descriptors.c \
+	src/i2c.c \
+	src/bno055.c \
 	$(TUSB)/tusb.c \
 	$(TUSB)/common/tusb_fifo.c \
 	$(TUSB)/device/usbd.c \

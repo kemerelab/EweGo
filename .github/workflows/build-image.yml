@@ -58,14 +58,17 @@ jobs:
           name: pylib
           path: build/pylib
           retention-days: 7
-      - name: ewego-cam compiles natively with -Werror
-        run: make -C Firmware/uvccam CC=gcc && ./Firmware/uvccam/ewego-cam --help | head -3 && make -C Firmware/uvccam clean
-      - name: Cross-compile ewego-cam (static arm64)
+      - name: C tools compile natively with -Werror
+        run: |
+          make -C Firmware/uvccam CC=gcc && ./Firmware/uvccam/ewego-cam --help | head -3 && make -C Firmware/uvccam clean
+          make -C Firmware/usbimu CC=gcc && ./Firmware/usbimu/ewego-imu-usb --help | head -3 && make -C Firmware/usbimu clean
+      - name: Cross-compile C tools (static arm64)
         run: |
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
-          make -C Firmware/uvccam CC=aarch64-linux-gnu-gcc
-          file Firmware/uvccam/ewego-cam
-          mkdir -p build/bin && mv Firmware/uvccam/ewego-cam build/bin/ewego-cam
+          mkdir -p build/bin
+          make -C Firmware/uvccam CC=aarch64-linux-gnu-gcc && mv Firmware/uvccam/ewego-cam build/bin/
+          make -C Firmware/usbimu CC=aarch64-linux-gnu-gcc && mv Firmware/usbimu/ewego-imu-usb build/bin/
+          file build/bin/*
       - uses: actions/upload-artifact@v6
         with:
           name: bin

@@ -118,7 +118,7 @@ static void con_puts(const char *s)
 	tud_cdc_write_flush();
 }
 
-static char g_line_buf[96];
+static char g_line_buf[160];
 #define con_printf(...) do { snprintf(g_line_buf, sizeof(g_line_buf), __VA_ARGS__); con_puts(g_line_buf); } while (0)
 
 /* print a signed 16-bit raw value scaled by 1/div as a decimal (no float printf) */

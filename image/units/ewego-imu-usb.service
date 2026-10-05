@@ -1,0 +1,17 @@
+[Unit]
+Description=EweGo USB IMU logger (hub_imu, BNO055 over HID)
+Documentation=file:///opt/ewego/Firmware/usbimu/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ewego/imu-usb.conf
+# DEVICE is optional: with it unset the logger finds the single hub_imu by VID:PID
+ExecStart=/usr/local/bin/ewego-imu-usb --out ${OUT_DIR} --name ${NAME} ${DEVICE_ARG} ${EXTRA_ARGS}
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

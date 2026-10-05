@@ -33,7 +33,7 @@ from urllib.parse import parse_qs, urlparse
 
 EWEGO = Path(os.environ.get("EWEGO_DIR", "/opt/ewego"))
 RUN_DIR = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/ewego-webtest"))
-UNITS = ["ewego-sensors", "ewego-gps", "ewego-dualcam", "ewego-cam@camera1", "ewego-cam@camera2"]
+UNITS = ["ewego-sensors", "ewego-gps", "ewego-dualcam", "ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb"]
 GPS_PORT = "/dev/ttyAMA4"
 GPS_BAUD = 460800
 IMU_PORT = "/dev/ttyAMA5"
@@ -928,6 +928,79 @@ def test_uvc_quirk(write, q):
               b"in /etc/modprobe.d/uvcvideo.conf (the plan has this going into the image).\n")
 
 
+def hubimu_hidraw():
+    """/dev/hidrawN of the hub_imu module (VID:PID 1209:0001), or None."""
+    for p in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        try:
+            if "HID_ID=0003:00001209:00000001" in (p / "device" / "uevent").read_text():
+                return f"/dev/{p.name}"
+        except OSError:
+            pass
+    return None
+
+
+def test_imu_usb(write, q):
+    """Read the hub_imu HID stream for N seconds: rate, sequence gaps,
+    flags, device-clock intervals, and one decoded sample."""
+    secs = int(q.get("seconds", ["5"])[0])
+    dev = hubimu_hidraw()
+    acm = sorted(Path("/dev").glob("ttyACM*"))
+    write(f"hub_imu console: {', '.join(str(a) for a in acm) or 'no ttyACM device'}\n".encode())
+    if not dev:
+        write(b"no hub_imu HID device (VID:PID 1209:0001). Firmware >= v0.3.0 streams HID; check 'USB tree'.\n")
+        return
+    write(f"reading {dev} for {secs}s ...\n".encode())
+    import struct
+    fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+    n = lost = flagged = 0
+    last_seq = None
+    last_dev = None
+    dts = []
+    sample = None
+    end = time.monotonic() + secs
+    try:
+        while time.monotonic() < end:
+            r, _, _ = select.select([fd], [], [], 0.5)
+            if not r:
+                continue
+            try:
+                b = os.read(fd, 64)
+            except BlockingIOError:
+                continue
+            if len(b) != 64 or b[0] != 1:
+                continue
+            flags, seq, dev_ts = b[1], struct.unpack_from("<H", b, 2)[0], struct.unpack_from("<I", b, 4)[0]
+            if last_seq is not None:
+                miss = (seq - last_seq - 1) & 0xFFFF
+                lost += miss
+                if miss == 0 and not (flags & 4):
+                    dts.append((dev_ts - last_dev) & 0xFFFFFFFF)
+            last_seq, last_dev = seq, dev_ts
+            n += 1
+            if flags:
+                flagged += 1
+            if not (flags & 3):
+                sample = b
+    finally:
+        os.close(fd)
+    write(f"  reports: {n} in {secs}s ({n / secs:.1f}/s), lost {lost}, flagged {flagged}\n".encode())
+    if dts:
+        write(f"  device-clock interval: min {min(dts)} / mean {sum(dts) / len(dts):.0f} / max {max(dts)} us  "
+              f"(expect 10000)\n".encode())
+    if sample:
+        bu = sample[8:54]
+        s16 = lambda o: struct.unpack_from("<h", bu, o)[0]
+        i2c_us = struct.unpack_from("<H", sample, 54)[0]
+        write(f"  last sample: euler h/r/p {s16(18) / 16:.1f} {s16(20) / 16:.1f} {s16(22) / 16:.1f} deg, "
+              f"gravity {s16(38) / 100:.2f} {s16(40) / 100:.2f} {s16(42) / 100:.2f} m/s^2, "
+              f"temp {struct.unpack_from('<b', bu, 44)[0]} C, calib sys/gyr/acc/mag "
+              f"{(bu[45] >> 6) & 3}/{(bu[45] >> 4) & 3}/{(bu[45] >> 2) & 3}/{bu[45] & 3}, i2c {i2c_us} us\n".encode())
+    elif n:
+        write(b"  every report was flagged: sensor not running on the module (see its console)\n")
+    if n == 0:
+        write(b"  nothing received: is the module's HID stream on? ('stream' toggles it on its console)\n")
+
+
 def test_usb(write, q):
     stream_process(["lsusb", "-t"], write)
     stream_process(["lsusb"], write)
@@ -985,6 +1058,7 @@ TESTS = {
     "uvc-cap": (test_uvc_cap, None),
     "camrec": (test_camrec, "camera"),
     "usb": (test_usb, None),
+    "imu-usb": (test_imu_usb, None),
     "dmesg": (test_dmesg, None),
     "i2c": (test_i2c, None),
     "serial": (test_serial_ports, None),
@@ -1285,7 +1359,7 @@ PAGE = r"""<!doctype html>
   <h2>Units</h2>
   <table><thead><tr><th>unit</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody id="units"></tbody></table>
   <div class="row">
-    <select id="jr-unit"><option>ewego-sensors</option><option>ewego-gps</option><option>ewego-dualcam</option><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-webtest</option></select>
+    <select id="jr-unit"><option>ewego-sensors</option><option>ewego-gps</option><option>ewego-dualcam</option><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-webtest</option></select>
     <button onclick="journal()">Journal tail</button>
     <button onclick="listSessions()">Sessions</button>
   </div>
@@ -1326,6 +1400,18 @@ PAGE = r"""<!doctype html>
     <span id="br-status"></span>
   </div>
   <pre id="out-gps" class="tall"></pre>
+</section>
+
+<section class="card">
+  <h2>USB IMU (hub_imu, BNO055 over HID)</h2>
+  <div class="row">
+    <button class="primary" onclick="run('imu-usb','out-imuusb','&seconds='+val('iu-s'))">Read stream</button>
+    <input id="iu-s" value="5" size="3"> s
+    <button onclick="unit('ewego-imu-usb','start')">Start logger</button>
+    <button onclick="unit('ewego-imu-usb','stop')">Stop logger</button>
+    <button onclick="journal('ewego-imu-usb','out-imuusb')">Logger journal</button>
+  </div>
+  <pre id="out-imuusb"></pre>
 </section>
 
 <section class="card">

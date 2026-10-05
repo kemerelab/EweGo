@@ -82,12 +82,19 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   .bin). Step 1 (hubimu-v0.1.0) enumerates as CDC console + HID, 12 KB
   flash. Flash via DFU through the hub (BOOT0 high at plug-in -> 0483:df11;
   afterwards the console's `dfu` command). dfu-util is in apt-packages.txt
-  for the next image (v0.4.7 has it). Step 1 verified on hardware (flashed
-  via DFU from the collar, enumerates, console works). Step 2 (hubimu-v0.2.0,
-  18.6 KB flash): I2C1 PF0/PF1 100 kHz, BNO055 NDOF, console id/cal/read/
-  init; awaiting bench. Step 3 next: 100 Hz HID reports (46-byte burst +
-  device µs timestamp + seq), host logger ewego-imu-usb, console IMU card,
-  then the combined bus test with both cameras.
+  for the next image (v0.4.7 has it). Step 1 verified on hardware. Step 2
+  (hubimu-v0.2.0) verified on hardware 2026-10-04: chip 0xA0, sys_status 5,
+  gravity 9.8, euler follows motion; burst took 4-7 ms at 100 kHz. Step 3
+  (hubimu-v0.3.0, 19.6 KB): I2C 400 kHz, TIM2 µs device clock, 100 Hz HID
+  reports per `Firmware/hub_imu/src/report.h` (version, flags, seq,
+  dev_ts_us, 46-byte burst, i2c_us, period_us), console stats/stream.
+  Host: `Firmware/usbimu/ewego-imu-usb.c` (static C, finds hidraw by
+  VID:PID 1209:0001, UART-era CSV columns + host_mono_us/dev_ts_us/seq/
+  i2c_us/flags, summary.json with drift ppm, exit 2 on loss), unit
+  `ewego-imu-usb` + `/etc/ewego/imu-usb.conf`, console "USB IMU" card.
+  Image v0.5.0 carries all of it. Bench next: flash hubimu-v0.3.0, console
+  "Read stream" (expect ~100/s, 0 lost, interval ~10000 us), then
+  ewego-imu-usb for a minute, then the combined test with both cameras.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

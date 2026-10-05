@@ -37,12 +37,13 @@ jobs:
         # build time; check the patch against the branches in play so a
         # driver change surfaces on push, not only on a tag.
         run: |
-          for br in rpi-6.18.y rpi-6.12.y; do
+          for src in raspberrypi/linux:rpi-6.18.y raspberrypi/linux:rpi-6.12.y torvalds/linux:v6.8 torvalds/linux:v6.14 torvalds/linux:v6.17; do
+            repo=${src%%:*}; br=${src##*:}
             rm -rf uvc-src && mkdir -p uvc-src
             for f in uvc_driver.c uvc_video.c uvcvideo.h; do
-              curl -fsSL -o uvc-src/$f "https://raw.githubusercontent.com/raspberrypi/linux/$br/drivers/media/usb/uvc/$f"
+              curl -fsSL -o uvc-src/$f "https://raw.githubusercontent.com/$repo/$br/drivers/media/usb/uvc/$f"
             done
-            echo "== $br"; python3 image/uvcvideo/patch-uvcvideo.py uvc-src
+            echo "== $src"; python3 image/uvcvideo/patch-uvcvideo.py uvc-src
           done
       - name: Unit files have the required sections
         run: |

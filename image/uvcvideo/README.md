@@ -67,6 +67,17 @@ Skip it with `inject-ewego.sh --no-uvc`. Change the cap with
 `UVC_MAX_PAYLOAD=… inject-ewego.sh …`, or on a collar by editing the
 modprobe file and reloading the module.
 
+## On another Linux machine (VM, bench Pi)
+
+`build-host-module.sh` does the same for whatever Debian/Ubuntu kernel is
+running on the machine it is run on, fetching the uvcvideo source for the
+kernel's base version from the mainline tree:
+
+    sudo image/uvcvideo/build-host-module.sh        # installs headers/build tools via apt
+
+Re-run after a kernel upgrade. Everything else (`ewego-cam`, `ewego-imu-usb`,
+`bus-test.py`, the web console) builds and runs there unchanged.
+
 ## Checking it on a collar
 
     modinfo uvcvideo | grep -E 'filename|max_payload'   # filename should be under updates/

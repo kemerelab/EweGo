@@ -1,13 +1,13 @@
 /*
- * hub_imu firmware, step 2: USB (CDC console + HID), LED, and the BNO055
- * over I2C with console commands to inspect it. The HID interface is
- * present but sends nothing yet (step 3 streams samples).
+ * hub_imu firmware, step 3: streams one BNO055 sample per HID report at
+ * 100 Hz (see report.h), with a device microsecond timestamp and sequence
+ * counter, and keeps the CDC console for inspection.
  *
  * Clocks: HSI48 is both SYSCLK and the USB clock, trimmed by the CRS from
  * USB start-of-frame (the board has no crystal). PA11/PA12 must be remapped
  * to the USB pads (SYSCFG_CFGR1.PA11_PA12_RMP) or the device never appears.
  *
- * Console commands: help, version, id, cal, read, init, dfu.
+ * Console commands: help, version, id, cal, read, init, stats, stream, dfu.
  */
 #include <stdint.h>
 #include <string.h>
@@ -17,6 +17,7 @@
 #include "usb_descriptors.h"
 #include "i2c.h"
 #include "bno055.h"
+#include "report.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
@@ -26,6 +27,14 @@ uint32_t SystemCoreClock = 48000000u;
 volatile uint32_t g_ms;
 static int g_sensor_ok;      /* 0 = not initialised / failed, 1 = NDOF running */
 static int g_sensor_err;     /* last bno055_init() result */
+
+/* sampling */
+#define SAMPLE_PERIOD_US 10000u   /* 100 Hz */
+static int g_stream = 1;          /* HID streaming enabled */
+static uint16_t g_seq;
+static uint32_t g_next_sample_us;
+static uint32_t g_sent, g_i2c_err, g_hid_busy, g_i2c_us_max;
+static int g_last_dropped;
 
 extern void request_bootloader(void);
 
@@ -52,7 +61,19 @@ static void clock_init(void)
 
 	GPIOA->MODER = (GPIOA->MODER & ~GPIO_MODER_MODER3) | GPIO_MODER_MODER3_0;   /* LED */
 
+	/* TIM2: 32-bit free-running microsecond clock (device timestamp) */
+	RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+	TIM2->PSC = (SystemCoreClock / 1000000u) - 1;
+	TIM2->ARR = 0xFFFFFFFFu;
+	TIM2->EGR = TIM_EGR_UG;
+	TIM2->CR1 = TIM_CR1_CEN;
+
 	SysTick_Config(SystemCoreClock / 1000u);
+}
+
+static inline uint32_t now_us(void)
+{
+	return TIM2->CNT;
 }
 
 static inline void led(int on)
@@ -212,10 +233,20 @@ static void cmd_init(void)
 	con_printf("init: %s\r\n", sensor_state());
 }
 
+static void cmd_stats(void)
+{
+	con_printf("stream %s, %u Hz: sent %lu, i2c errors %lu, hid busy (host not polling) %lu, "
+		   "i2c burst max %lu us, seq %u, uptime %lu s\r\n",
+		   g_stream ? "on" : "off", 1000000u / SAMPLE_PERIOD_US, (unsigned long)g_sent,
+		   (unsigned long)g_i2c_err, (unsigned long)g_hid_busy, (unsigned long)g_i2c_us_max,
+		   g_seq, (unsigned long)(g_ms / 1000u));
+	g_i2c_us_max = 0;
+}
+
 static void handle_line(char *line)
 {
 	if (!strcmp(line, "help")) {
-		con_puts("help | version | id | cal | read | init | dfu\r\n");
+		con_puts("help | version | id | cal | read | init | stats | stream (toggle HID) | dfu\r\n");
 	} else if (!strcmp(line, "version")) {
 		con_printf("hub_imu " FW_VERSION ", sensor: %s\r\n", sensor_state());
 	} else if (!strcmp(line, "id")) {
@@ -226,6 +257,11 @@ static void handle_line(char *line)
 		cmd_read();
 	} else if (!strcmp(line, "init")) {
 		cmd_init();
+	} else if (!strcmp(line, "stats")) {
+		cmd_stats();
+	} else if (!strcmp(line, "stream")) {
+		g_stream = !g_stream;
+		con_printf("HID stream %s\r\n", g_stream ? "on" : "off");
 	} else if (!strcmp(line, "dfu")) {
 		con_puts("rebooting into the system bootloader (0483:df11)...\r\n");
 		for (uint32_t t = g_ms; g_ms - t < 50;)
@@ -287,6 +323,55 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
 	(void)itf; (void)report_id; (void)report_type; (void)buffer; (void)bufsize;
 }
 
+/* ---- sampling ------------------------------------------------------------- */
+
+static void sample_task(void)
+{
+	static struct imu_report rpt;
+	uint32_t now = now_us();
+
+	if (!g_stream || (int32_t)(now - g_next_sample_us) < 0)
+		return;
+	g_next_sample_us += SAMPLE_PERIOD_US;
+	/* if we fell far behind (console output, USB stall), resynchronise rather
+	 * than burst-catch-up */
+	if ((int32_t)(now - g_next_sample_us) > (int32_t)SAMPLE_PERIOD_US)
+		g_next_sample_us = now + SAMPLE_PERIOD_US;
+
+	memset(&rpt, 0, sizeof(rpt));
+	rpt.version = REPORT_VERSION;
+	rpt.seq = g_seq++;
+	rpt.period_us = SAMPLE_PERIOD_US;
+	if (g_last_dropped)
+		rpt.flags |= RPT_FLAG_DROPPED;
+
+	if (!g_sensor_ok) {
+		rpt.flags |= RPT_FLAG_NO_SENSOR;
+		rpt.dev_ts_us = now_us();
+	} else {
+		uint32_t t0 = now_us();
+		rpt.dev_ts_us = t0;
+		if (bno055_read_burst(rpt.burst)) {
+			rpt.flags |= RPT_FLAG_I2C_ERROR;
+			g_i2c_err++;
+		}
+		uint32_t dt = now_us() - t0;
+		rpt.i2c_us = dt > 0xFFFF ? 0xFFFF : (uint16_t)dt;
+		if (dt > g_i2c_us_max)
+			g_i2c_us_max = dt;
+	}
+
+	if (tud_hid_ready()) {
+		tud_hid_report(0, &rpt, sizeof(rpt));
+		g_sent++;
+		g_last_dropped = 0;
+	} else {
+		/* previous report still in the endpoint: host is not polling */
+		g_hid_busy++;
+		g_last_dropped = 1;
+	}
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void)
@@ -302,11 +387,13 @@ int main(void)
 	g_sensor_err = bno055_init();
 	g_sensor_ok = g_sensor_err == 0;
 
+	g_next_sample_us = now_us() + SAMPLE_PERIOD_US;
 	uint32_t last_blink = 0;
 	int led_on = 1;
 	for (;;) {
 		tud_task();
 		console_task();
+		sample_task();
 
 		/* 1 Hz once configured by the host (2 Hz if the sensor failed),
 		 * 5 Hz while waiting for the host */

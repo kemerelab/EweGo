@@ -1,8 +1,7 @@
 /*
  * I2C1 master for the STM32F042 (I2C v2 peripheral), register level.
  * SDA = PF0, SCL = PF1, alternate function 1. Pull-ups are on the board.
- * Clocked from SYSCLK (48 MHz); TIMINGR from RM0091 for 100 kHz standard
- * mode. Clock stretching stays enabled, which the BNO055 needs.
+ * Clocked from SYSCLK (48 MHz); TIMINGR from RM0091 for 400 kHz fast mode. Clock stretching stays enabled, which the BNO055 needs.
  */
 #include "i2c.h"
 #include "stm32f0xx.h"
@@ -47,7 +46,9 @@ void i2c_init(void)
 	RCC->APB1ENR |= RCC_APB1ENR_I2C1EN;
 
 	I2C1->CR1 = 0;
-	I2C1->TIMINGR = 0xB0420F13u;           /* 100 kHz @ 48 MHz, RM0091 table */
+	/* 400 kHz fast mode @ 48 MHz (RM0091 table): the 46-byte burst then
+	 * takes ~1.3 ms instead of ~4.5 ms, leaving room in a 10 ms period */
+	I2C1->TIMINGR = 0x50330309u;
 	I2C1->CR1 = I2C_CR1_PE;
 }
 

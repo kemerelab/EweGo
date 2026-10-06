@@ -171,9 +171,15 @@ def video_devices():
     (index1 is the camera's metadata node), and the Pi's own codec/ISP/HEVC
     nodes have no USB by-path entry, so this skips them. The by-path name
     doubles as a stable label for the physical hub port."""
-    devs = []
-    for p in sorted(Path("/dev/v4l/by-path").glob("*usb*-video-index0")) if Path("/dev/v4l/by-path").exists() else []:
+    devs, seen = [], set()
+    # udev makes two links per camera (…-usb-… and …-usbv2-…) to the same node
+    links = sorted(Path("/dev/v4l/by-path").glob("*usb*-video-index0"), key=lambda x: ("usbv2" in x.name, x.name)) \
+        if Path("/dev/v4l/by-path").exists() else []
+    for p in links:
         dev = os.path.realpath(p)
+        if dev in seen:
+            continue
+        seen.add(dev)
         node = Path("/sys/class/video4linux") / os.path.basename(dev)
         try:
             name = (node / "name").read_text().strip()

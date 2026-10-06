@@ -221,12 +221,17 @@ def list_cameras():
             if m and re.search(CAM_MATCH, m.group(2)):
                 cams.append((m.group(1), m.group(2).strip()))
         return cams
-    cams = []
+    cams, seen = [], set()
     bp = "/dev/v4l/by-path"
     if os.path.isdir(bp):
-        for n in sorted(os.listdir(bp)):
+        # udev makes two links per camera (…-usb-… and …-usbv2-…) to the same
+        # node; keep one entry per device node
+        for n in sorted(os.listdir(bp), key=lambda x: ("usbv2" in x, x)):
             if "usb" in n and n.endswith("video-index0"):
-                cams.append((os.path.realpath(os.path.join(bp, n)), n))
+                dev = os.path.realpath(os.path.join(bp, n))
+                if dev not in seen:
+                    seen.add(dev)
+                    cams.append((dev, n))
     return cams
 
 

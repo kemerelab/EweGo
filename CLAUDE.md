@@ -98,8 +98,14 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   2026-10-05: IMU 100.0 Hz, 0 lost, 9992-10008 us intervals under two-camera
   load. `image/uvcvideo/build-host-module.sh` builds the patched driver on
   any Debian/Ubuntu kernel (e.g. the user's Ubuntu guest in Parallels);
-  patch verified against mainline v6.8/v6.14/v6.17 in CI. Next: the
-  two-camera + IMU test on the collar (or the VM), then Phase C.
+  patch verified against mainline v6.8/v6.14/v6.17 in CI.
+- **Collar PASS 2026-10-05:** bus-test.py on v0.5.1: both cameras 600/600
+  frames at 1080p30, IMU 100 Hz 0 lost, one bus. Cameras are on hub ports
+  1.3 and 1.4 (`port:1.3` / `port:1.4` for /etc/ewego/cam-camera*.conf).
+  udev makes -usb- and -usbv2- by-path links per camera; listings dedupe
+  by device node (1d5267b, not yet in an image). Next: 10-minute run of
+  ewego-cam@camera1 + @camera2 + ewego-imu-usb units together (summary.json
+  lost/overruns = 0), then Phase C (GPS/fuel/UART-IMU in C, systemd target).
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

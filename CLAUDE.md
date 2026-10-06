@@ -92,9 +92,14 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   VID:PID 1209:0001, UART-era CSV columns + host_mono_us/dev_ts_us/seq/
   i2c_us/flags, summary.json with drift ppm, exit 2 on loss), unit
   `ewego-imu-usb` + `/etc/ewego/imu-usb.conf`, console "USB IMU" card.
-  Image v0.5.0 carries all of it. Bench next: flash hubimu-v0.3.0, console
-  "Read stream" (expect ~100/s, 0 lost, interval ~10000 us), then
-  ewego-imu-usb for a minute, then the combined test with both cameras.
+  Image v0.5.1 carries all of it plus `Firmware/usbimu/bus-test.py`
+  (IMU + cameras combined test; stdlib; also runs on macOS via IOKit ctypes
+  + ffmpeg, where cameras are bus load only, and on any Linux). Mac bench
+  2026-10-05: IMU 100.0 Hz, 0 lost, 9992-10008 us intervals under two-camera
+  load. `image/uvcvideo/build-host-module.sh` builds the patched driver on
+  any Debian/Ubuntu kernel (e.g. the user's Ubuntu guest in Parallels);
+  patch verified against mainline v6.8/v6.14/v6.17 in CI. Next: the
+  two-camera + IMU test on the collar (or the VM), then Phase C.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

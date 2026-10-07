@@ -7,7 +7,7 @@ After=local-fs.target
 Type=simple
 EnvironmentFile=-/etc/ewego/imu-usb.conf
 # DEVICE is optional: with it unset the logger finds the single hub_imu by VID:PID
-ExecStart=/usr/local/bin/ewego-imu-usb --out ${OUT_DIR} --name ${NAME} ${DEVICE_ARG} ${EXTRA_ARGS}
+ExecStart=/usr/local/bin/ewego-imu-usb --out ${OUT_DIR} --name ${NAME} $DEVICE_ARG $EXTRA_ARGS
 KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure

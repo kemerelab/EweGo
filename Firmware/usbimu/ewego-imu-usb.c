@@ -35,7 +35,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 #define USB_VID 0x1209
 #define USB_PID 0x0001
 
@@ -144,9 +144,19 @@ int main(int argc, char **argv)
 	if (dev) {
 		snprintf(devpath, sizeof(devpath), "%s", dev);
 	} else {
-		int r = find_device(devpath, sizeof(devpath));
-		if (r) {
-			fprintf(stderr, "ewego-imu-usb: %s\n", r == -2 ? "more than one hub_imu; use --device" : "no hub_imu device found (is it plugged in and running firmware >= v0.3.0?)");
+		/* wait up to 30 s: after a hub reset the module re-enumerates late */
+		int r, tries = 0;
+		while ((r = find_device(devpath, sizeof(devpath))) == -1) {
+			if (++tries >= 60) {
+				fprintf(stderr, "ewego-imu-usb: no hub_imu device after 30 s (plugged in, firmware >= v0.3.0?)\n");
+				return 1;
+			}
+			if (tries == 1)
+				fprintf(stderr, "ewego-imu-usb: waiting up to 30 s for the hub_imu device ...\n");
+			usleep(500000);
+		}
+		if (r == -2) {
+			fprintf(stderr, "ewego-imu-usb: more than one hub_imu; use --device\n");
 			return 1;
 		}
 	}

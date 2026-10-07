@@ -80,6 +80,7 @@ struct cfg {
 	int realtime;
 	int quiet;
 	int auto_fps;        /* leave the camera's exposure-auto-priority on */
+	int wait_secs;       /* wait this long for the device to appear */
 };
 
 struct stats {
@@ -281,13 +282,11 @@ static int resolve_device(const char *spec, char *out, size_t outlen)
 
 	if (strncmp(spec, "port:", 5) != 0) {
 		snprintf(out, outlen, "%s", spec);
-		return 0;
+		return access(spec, F_OK) == 0 ? 0 : -1;
 	}
 	snprintf(needle, sizeof(needle), ":%s:", spec + 5);
-	if (glob("/dev/v4l/by-path/*-usb-*-video-index0", 0, NULL, &g) != 0) {
-		fprintf(stderr, "ewego-cam: no USB cameras under /dev/v4l/by-path\n");
+	if (glob("/dev/v4l/by-path/*-usb-*-video-index0", 0, NULL, &g) != 0)
 		return -1;
-	}
 	for (i = 0; i < g.gl_pathc; i++) {
 		if (strstr(g.gl_pathv[i], needle)) {
 			snprintf(out, outlen, "%s", g.gl_pathv[i]);
@@ -295,11 +294,11 @@ static int resolve_device(const char *spec, char *out, size_t outlen)
 		}
 	}
 	globfree(&g);
-	if (found != 1) {
+	if (found > 1) {
 		fprintf(stderr, "ewego-cam: %s matched %d cameras (want exactly 1); use --list\n", spec, found);
-		return -1;
+		return -2;
 	}
-	return 0;
+	return found == 1 ? 0 : -1;
 }
 
 static void list_cameras(void)
@@ -353,6 +352,7 @@ static void usage(FILE *f)
 		"  --no-session-dir    write directly into --out\n"
 		"  --rt                SCHED_FIFO priority 10 and mlockall for the capture thread (needs root)\n"
 		"  --auto-fps          let auto-exposure lower the frame rate in dim light (default: hold the rate)\n"
+		"  --wait N            wait up to N seconds for the camera to appear (default 30)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n",
 		VERSION, MAX_BUFFERS);
@@ -487,7 +487,7 @@ int main(int argc, char **argv)
 		.width = 1920, .height = 1080, .fps = 30, .buffers = 16,
 		.seconds = 0, .stats_interval = 5, .stall_timeout = 10,
 		.ring_bytes = 64u << 20, .wb_chunk = 4u << 20,
-		.session_dir = 1, .realtime = 0, .quiet = 0,
+		.session_dir = 1, .realtime = 0, .quiet = 0, .wait_secs = 30,
 	};
 	static const struct option longopts[] = {
 		{"device", required_argument, 0, 'd'}, {"out", required_argument, 0, 'o'},
@@ -498,7 +498,7 @@ int main(int argc, char **argv)
 		{"sync", required_argument, 0, 'y'},   /* accepted for compatibility, ignored */
 		{"stall", required_argument, 0, 'x'},
 		{"no-session-dir", no_argument, 0, 'N'}, {"rt", no_argument, 0, 'r'},
-		{"auto-fps", no_argument, 0, 'A'},
+		{"auto-fps", no_argument, 0, 'A'}, {"wait", required_argument, 0, 'w'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
@@ -521,7 +521,7 @@ int main(int argc, char **argv)
 	memset(&q, 0, sizeof(q));
 	memset(&w, 0, sizeof(w));
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAqlh", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:qlh", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -543,6 +543,7 @@ int main(int argc, char **argv)
 		case 'N': c.session_dir = 0; break;
 		case 'r': c.realtime = 1; break;
 		case 'A': c.auto_fps = 1; break;
+		case 'w': c.wait_secs = atoi(optarg); break;
 		case 'q': c.quiet = 1; break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
@@ -562,8 +563,21 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (resolve_device(c.device, devpath, sizeof(devpath)))
-		return 1;
+	/* After a hub reset the camera re-enumerates a few seconds later; wait
+	 * for it rather than failing the unit (systemd would retry anyway, but
+	 * this keeps the gap and the log cleaner). */
+	{
+		int tries = 0;
+		while (resolve_device(c.device, devpath, sizeof(devpath))) {
+			if (++tries >= c.wait_secs * 2) {
+				fprintf(stderr, "ewego-cam: no camera for %s after %d s\n", c.device, c.wait_secs);
+				return 1;
+			}
+			if (tries == 1)
+				fprintf(stderr, "ewego-cam: waiting up to %d s for %s ...\n", c.wait_secs, c.device);
+			usleep(500000);
+		}
+	}
 
 	/* output directory */
 	if (c.session_dir) {

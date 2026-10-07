@@ -103,9 +103,18 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   frames at 1080p30, IMU 100 Hz 0 lost, one bus. Cameras are on hub ports
   1.3 and 1.4 (`port:1.3` / `port:1.4` for /etc/ewego/cam-camera*.conf).
   udev makes -usb- and -usbv2- by-path links per camera; listings dedupe
-  by device node (1d5267b, not yet in an image). Next: 10-minute run of
-  ewego-cam@camera1 + @camera2 + ewego-imu-usb units together (summary.json
-  lost/overruns = 0), then Phase C (GPS/fuel/UART-IMU in C, systemd target).
+  by device node (1d5267b).
+- **2026-10-06 production run:** all three units together: 7.5 min clean
+  (12.9k frames per camera, 0 lost, 0 overruns, write stalls up to 1.2 s
+  absorbed), then the whole hub re-enumerated when the collar was moved
+  (`usb 1-1` = hub upstream; user suspects a cold joint on the USB-C cable,
+  fixing it next). IMU had 44 lost in 3 gaps (~0.1%: host late polling the
+  HID endpoint; watch it). Cameras fell to 24.4 fps in dim light
+  (exposure-auto-priority). Fixes in v0.5.3: ewego-cam 0.3 holds the rate
+  and waits for its device after a reset; ewego-imu-usb 0.2 waits too;
+  units word-split $EXTRA_ARGS. Next: repeat the 10-minute run on v0.5.3
+  after the cable fix, open a recording in play_with_timestamps.py, then
+  Phase C (GPS/fuel/UART-IMU in C, systemd target).
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

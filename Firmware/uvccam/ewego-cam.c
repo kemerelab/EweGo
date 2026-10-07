@@ -53,7 +53,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.2"
+#define VERSION "0.3"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -79,6 +79,7 @@ struct cfg {
 	int session_dir;
 	int realtime;
 	int quiet;
+	int auto_fps;        /* leave the camera's exposure-auto-priority on */
 };
 
 struct stats {
@@ -351,6 +352,7 @@ static void usage(FILE *f)
 		"  --stall N           exit 3 after N seconds without a frame (default 10)\n"
 		"  --no-session-dir    write directly into --out\n"
 		"  --rt                SCHED_FIFO priority 10 and mlockall for the capture thread (needs root)\n"
+		"  --auto-fps          let auto-exposure lower the frame rate in dim light (default: hold the rate)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n",
 		VERSION, MAX_BUFFERS);
@@ -496,6 +498,7 @@ int main(int argc, char **argv)
 		{"sync", required_argument, 0, 'y'},   /* accepted for compatibility, ignored */
 		{"stall", required_argument, 0, 'x'},
 		{"no-session-dir", no_argument, 0, 'N'}, {"rt", no_argument, 0, 'r'},
+		{"auto-fps", no_argument, 0, 'A'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
@@ -518,7 +521,7 @@ int main(int argc, char **argv)
 	memset(&q, 0, sizeof(q));
 	memset(&w, 0, sizeof(w));
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:Nrqlh", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAqlh", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -539,6 +542,7 @@ int main(int argc, char **argv)
 		case 'x': c.stall_timeout = atoi(optarg); break;
 		case 'N': c.session_dir = 0; break;
 		case 'r': c.realtime = 1; break;
+		case 'A': c.auto_fps = 1; break;
 		case 'q': c.quiet = 1; break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
@@ -635,6 +639,16 @@ int main(int argc, char **argv)
 			 (int)(parm.parm.capture.timeperframe.denominator / parm.parm.capture.timeperframe.numerator) != c.fps)
 			fprintf(stderr, "note: camera chose %u/%u s per frame instead of 1/%d\n",
 				parm.parm.capture.timeperframe.numerator, parm.parm.capture.timeperframe.denominator, c.fps);
+	}
+	if (!c.auto_fps) {
+		/* UVC "exposure, auto priority": when set, auto-exposure may lengthen
+		 * the exposure beyond the frame period and the camera delivers fewer
+		 * frames in dim light (seen: 24 fps in the evening). Clear it so the
+		 * rate stays fixed and frames get darker instead. */
+		struct v4l2_control ctl = {.id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = 0};
+		if (xioctl(fd, VIDIOC_S_CTRL, &ctl))
+			fprintf(stderr, "note: could not clear exposure-auto-priority (%s); frame rate may drop in dim light\n",
+				strerror(errno));
 	}
 	{
 		struct v4l2_requestbuffers req;

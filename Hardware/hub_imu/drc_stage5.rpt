@@ -1,0 +1,32 @@
+** Drc report for hub_imu.kicad_pcb **
+** Created on 2026-10-16T08:44:29-0500 **
+** Report includes: Errors, Warnings, Exclusions **
+
+** Found 7 DRC violations **
+[lib_footprint_mismatch]: Footprint 'SOT-23-3' does not match copy in library 'Package_TO_SOT_SMD'.
+    Local override; warning
+    @(86.3000 mm, 82.0000 mm): Footprint U3
+[lib_footprint_mismatch]: Footprint 'R_0402_1005Metric' does not match copy in library 'Resistor_SMD'.
+    Local override; warning
+    @(71.8400 mm, 91.7500 mm): Footprint R1
+[lib_footprint_mismatch]: Footprint 'C_0402_1005Metric' does not match copy in library 'Capacitor_SMD'.
+    Local override; warning
+    @(87.6800 mm, 91.0000 mm): Footprint C7
+[lib_footprint_mismatch]: Footprint 'LGA-28_5.2x3.8mm_P0.5mm' does not match copy in library 'Package_LGA'.
+    Local override; warning
+    @(86.4000 mm, 87.8000 mm): Footprint U2
+[lib_footprint_mismatch]: Footprint 'C_0402_1005Metric' does not match copy in library 'Capacitor_SMD'.
+    Local override; warning
+    @(87.6400 mm, 84.6200 mm): Footprint C8
+[lib_footprint_mismatch]: Footprint 'R_0402_1005Metric' does not match copy in library 'Resistor_SMD'.
+    Local override; warning
+    @(85.6400 mm, 84.6200 mm): Footprint R2
+[lib_footprint_mismatch]: Footprint 'R_0402_1005Metric' does not match copy in library 'Resistor_SMD'.
+    Local override; warning
+    @(85.4900 mm, 92.8000 mm): Footprint R5
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** End of Report **

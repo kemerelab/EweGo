@@ -1,6 +1,6 @@
 # ewego-imu-usb
 
-Host-side logger for the hub_imu USB IMU module (`Firmware/hub_imu/`,
+Host-side logger for the hub_imu USB IMU module (`Hardware/hub_imu/firmware/`,
 firmware v0.3.0 or later). Static C, libc only; runs on the collar image
 and on any Linux machine.
 
@@ -10,7 +10,7 @@ and on any Linux machine.
 The module sends one 64-byte HID report per sample at 100 Hz: a sequence
 counter, a device microsecond timestamp taken at the start of the I2C
 read, the BNO055's 46-byte register burst, and the I2C read time
-(`Firmware/hub_imu/src/report.h`). The logger stamps each report on
+(`Hardware/hub_imu/firmware/src/report.h`). The logger stamps each report on
 arrival with `CLOCK_MONOTONIC` and `CLOCK_REALTIME`.
 
 ## Output

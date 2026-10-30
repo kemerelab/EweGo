@@ -1,0 +1,39 @@
+(version 1)
+
+# JLCPCB 2-layer, 1.6 mm FR4, 1 oz
+(rule "min_clearance"
+	(constraint clearance (min 0.2mm)))
+
+(rule "min_track_width"
+	(condition "A.Type == 'Track'")
+	(constraint track_width (min 0.2mm)))
+
+(rule "via_size"
+	(condition "A.Type == 'Via'")
+	(constraint via_diameter (min 0.6mm))
+	(constraint hole_size (min 0.3mm)))
+
+(rule "power_width"
+	(condition "A.Type == 'Track' && (A.NetName == '+5V' || A.NetName == '+3V3') && !A.intersectsCourtyard('U2')")
+	(constraint track_width (min 0.4mm) (opt 0.4mm)))
+
+# U2 (LGA, 0.254 mm pads) cannot accept 0.4 mm; neck down only inside its courtyard
+(rule "power_neck_U2"
+	(condition "A.Type == 'Track' && A.NetName == '+3V3' && A.intersectsCourtyard('U2')")
+	(constraint track_width (min 0.25mm)))
+
+(rule "usb_width"
+	(condition "A.Type == 'Track' && (A.NetName == '/USB_DP' || A.NetName == '/USB_DM')")
+	(constraint track_width (min 0.25mm) (opt 0.25mm) (max 0.25mm)))
+
+# Nothing under U2 on B.Cu except ground pour
+(rule "no_bcu_under_U2"
+	(layer B.Cu)
+	(condition "A.Type != 'Zone' && A.intersectsCourtyard('U2')")
+	(constraint disallow track via))
+
+# One thermal spoke accepted (KiCad default is 2) only where a GND pad is boxed in and has a direct
+# GND track to an adjacent via: R1 pad 2, and U1 pin 15 (TSSOP pad between pin 14/16; track to C4 GND + via).
+(rule "R1_U1_gnd_spokes"
+	(condition "A.memberOfFootprint('R1') || B.memberOfFootprint('R1') || A.memberOfFootprint('U1') || B.memberOfFootprint('U1')")
+	(constraint min_resolved_spokes 1))

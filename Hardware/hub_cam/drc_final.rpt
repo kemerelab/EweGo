@@ -1,0 +1,33 @@
+** Drc report for hub_cam.kicad_pcb **
+** Created on 2026-10-20T19:06:41-0500 **
+** Report includes: Errors, Warnings, Exclusions **
+
+** Found 7 DRC violations **
+[lib_footprint_mismatch]: Footprint 'C_0402_1005Metric' does not match copy in library 'Capacitor_SMD'.
+    Local override; warning
+    @(117.3000 mm, 106.3000 mm): Footprint C3
+[lib_footprint_mismatch]: Footprint 'C_0402_1005Metric' does not match copy in library 'Capacitor_SMD'.
+    Local override; warning
+    @(116.8400 mm, 114.0000 mm): Footprint C4
+[lib_footprint_mismatch]: Footprint 'R_0402_1005Metric' does not match copy in library 'Resistor_SMD'.
+    Local override; warning
+    @(122.6050 mm, 102.7500 mm): Footprint R5
+[lib_footprint_mismatch]: Footprint 'QFN-24-1EP_4x4mm_P0.5mm_EP2.6x2.6mm' does not match copy in library 'Package_DFN_QFN'.
+    Local override; warning
+    @(114.0000 mm, 110.5000 mm): Footprint U1
+[lib_footprint_mismatch]: Footprint 'R_0402_1005Metric' does not match copy in library 'Resistor_SMD'.
+    Local override; warning
+    @(115.0000 mm, 113.7000 mm): Footprint R2
+[lib_footprint_mismatch]: Footprint 'USB_C_Receptacle_GCT_USB4105-xx-A_16P_TopMnt_Horizontal' does not match copy in library 'Connector_USB'.
+    Local override; warning
+    @(124.2550 mm, 109.1000 mm): Footprint J4
+[silk_overlap]: Silkscreen overlap
+    Rule: board setup constraints silk; warning
+    @(111.9400 mm, 107.5100 mm): Segment of Y1 on F.Silkscreen
+    @(115.2500 mm, 107.8900 mm): Polygon of U1 on F.Silkscreen
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** End of Report **

@@ -74,9 +74,9 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   the recorder lost 5-9 frames per camera at each 5 s fdatasync while
   recording two cameras at 1080p30 to the SD card (v4l2-ctl to /dev/null
   was clean). Bench next: same record test on v0.4.5, then 10 min.
-- USB IMU (2026-10-04): the hub_imu module (hardware in
-  LabTools/SmallProjects/USB-IMU/hub_imu: STM32F042F6P6 + BNO055 on a port
-  of the camera hub) gets its firmware in `Firmware/hub_imu/` with its own
+- USB IMU (2026-10-04): the hub_imu module (STM32F042F6P6 + BNO055 on a
+  port of the camera hub; board in `Hardware/hub_imu/`,
+  firmware in `Hardware/hub_imu/firmware/`) has its own
   workflow `hub-imu-firmware.yml` (gcc-arm-none-eabi on the runner, deps
   fetched by fetch-deps.sh, never committed; tags `hubimu-v*` release the
   .bin). Step 1 (hubimu-v0.1.0) enumerates as CDC console + HID, 12 KB
@@ -86,7 +86,7 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   (hubimu-v0.2.0) verified on hardware 2026-10-04: chip 0xA0, sys_status 5,
   gravity 9.8, euler follows motion; burst took 4-7 ms at 100 kHz. Step 3
   (hubimu-v0.3.0, 19.6 KB): I2C 400 kHz, TIM2 µs device clock, 100 Hz HID
-  reports per `Firmware/hub_imu/src/report.h` (version, flags, seq,
+  reports per `Hardware/hub_imu/firmware/src/report.h` (version, flags, seq,
   dev_ts_us, 46-byte burst, i2c_us, period_us), console stats/stream.
   Host: `Firmware/usbimu/ewego-imu-usb.c` (static C, finds hidraw by
   VID:PID 1209:0001, UART-era CSV columns + host_mono_us/dev_ts_us/seq/
@@ -115,6 +115,11 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   units word-split $EXTRA_ARGS. Next: repeat the 10-minute run on v0.5.3
   after the cable fix, open a recording in play_with_timestamps.py, then
   Phase C (GPS/fuel/UART-IMU in C, systemd target).
+- 2026-10-30: hub_imu and hub_cam boards copied from the old USB-IMU repo
+  (github.com/ckemere/usb-imu keeps their history) into `Hardware/`; each
+  has README.md + NOTES.md. hub_cam is laid out, not fabricated; on it the
+  cameras move to hub ports 1/3 (expect `port:1.1`/`port:1.3`). The image
+  build now ignores `Hardware/**`.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads; then a systemd target replacing sensor_test.py.

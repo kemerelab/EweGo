@@ -2,7 +2,7 @@
  * ewego-imu-usb — log the hub_imu USB IMU (STM32F042 + BNO055, HID).
  *
  * Reads 64-byte HID input reports from /dev/hidrawN (see
- * Firmware/hub_imu/src/report.h), stamps each with CLOCK_MONOTONIC and
+ * Hardware/hub_imu/firmware/src/report.h), stamps each with CLOCK_MONOTONIC and
  * CLOCK_REALTIME on arrival, and writes:
  *
  *   <name>.csv            same columns as Firmware/IMU/log_imu_data.py

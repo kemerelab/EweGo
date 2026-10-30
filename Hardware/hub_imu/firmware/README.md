@@ -2,8 +2,8 @@
 
 Firmware for the hub_imu module: an STM32F042F6P6 that turns one port of
 the collar's FE1.1S USB hub into a USB IMU (Bosch BNO055 over I2C). The
-hardware lives in `LabTools/SmallProjects/USB-IMU/hub_imu`; its README is
-the reference for pins and the circuit.
+board is one directory up (`Hardware/hub_imu/`); its README is the
+reference for pins and the circuit.
 
 Nothing is built or installed on a developer machine. GitHub Actions
 (`.github/workflows/hub-imu-firmware.yml`) compiles every push that touches
@@ -32,7 +32,8 @@ Composite device, VID:PID `1209:0001` (pid.codes test PID; lab use only):
 | 0/1 | CDC-ACM | text console: `/dev/ttyACM*` on Linux, `/dev/cu.usbmodem*` on macOS (`screen /dev/cu.usbmodem* 115200`) |
 | 2 | HID (vendor page) | IMU data: one 64-byte input report per sample, 1 ms interrupt endpoint |
 
-Console commands: `help`, `version`, `id`, `cal`, `read`, `init`, `dfu`.
+Console commands: `help`, `version`, `id`, `cal`, `read`, `init`,
+`stats`, `stream` (toggle the HID stream), `dfu`.
 
 ## Status
 
@@ -44,9 +45,11 @@ Console commands: `help`, `version`, `id`, `cal`, `read`, `init`, `dfu`.
   `read` one formatted 46-byte burst and how long the I2C read took;
   `init` re-runs the bring-up. LED at 2 Hz if the sensor failed; the
   banner says why.
-- Step 3: 100 Hz sampling, HID reports with the 46-byte register burst
-  (0x08–0x35), device microsecond timestamp and sequence counter; host
-  logger `ewego-imu-usb` on the collar.
+- **Step 3 (v0.3.0, verified on the collar)**: I2C at 400 kHz, TIM2
+  microsecond device clock, 100 Hz HID reports with the 46-byte register
+  burst (0x08–0x35), device timestamp and sequence counter
+  (`src/report.h`); `stats` and `stream` on the console. Host logger:
+  `Firmware/usbimu/ewego-imu-usb`.
 
 ## Layout
 

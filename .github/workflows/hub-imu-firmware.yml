@@ -1,6 +1,6 @@
 name: hub-imu-firmware
 
-# Builds the hub_imu USB IMU module firmware (STM32F042, Firmware/hub_imu/).
+# Builds the hub_imu USB IMU module firmware (STM32F042, Hardware/hub_imu/firmware/).
 # Separate from the image pipeline: runs only when the firmware changes, in
 # about a minute, and attaches hub_imu.bin to the run. A tag of the form
 # hubimu-v* publishes a release with the binary.
@@ -12,10 +12,10 @@ name: hub-imu-firmware
 on:
   push:
     branches: [main, phase-a-image]
-    paths: ['Firmware/hub_imu/**', '.github/workflows/hub-imu-firmware.yml']
+    paths: ['Hardware/hub_imu/firmware/**', '.github/workflows/hub-imu-firmware.yml']
     tags: ['hubimu-v*']
   pull_request:
-    paths: ['Firmware/hub_imu/**']
+    paths: ['Hardware/hub_imu/firmware/**']
   workflow_dispatch:
 
 jobs:
@@ -30,12 +30,12 @@ jobs:
       - name: Install ARM toolchain
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi dfu-util
       - name: Fetch pinned dependencies (TinyUSB, CMSIS)
-        run: bash Firmware/hub_imu/fetch-deps.sh
+        run: bash Hardware/hub_imu/firmware/fetch-deps.sh
       - name: Build
-        run: make -C Firmware/hub_imu
+        run: make -C Hardware/hub_imu/firmware
       - name: Flash and RAM usage
         run: |
-          cd Firmware/hub_imu
+          cd Hardware/hub_imu/firmware
           arm-none-eabi-size -A build/hub_imu.elf | awk '/^\.(isr_vector|text|ARM.exidx|data|bss|noinit)/ {print}'
           FLASH=$(arm-none-eabi-size -B build/hub_imu.elf | awk 'NR==2 {print $1+$2}')
           RAM=$(arm-none-eabi-size -B build/hub_imu.elf | awk 'NR==2 {print $2+$3}')
@@ -46,7 +46,7 @@ jobs:
         # bootloader (0483:df11), so dfu-util checks the target and stops
         # warning. hub_imu.bin stays for tools that want a raw image.
         run: |
-          cd Firmware/hub_imu/build
+          cd Hardware/hub_imu/firmware/build
           cp hub_imu.bin hub_imu.dfu
           dfu-suffix -v 0483 -p df11 -d 0000 -a hub_imu.dfu
           dfu-suffix -c hub_imu.dfu
@@ -54,10 +54,10 @@ jobs:
         with:
           name: hub_imu-firmware
           path: |
-            Firmware/hub_imu/build/hub_imu.bin
-            Firmware/hub_imu/build/hub_imu.dfu
-            Firmware/hub_imu/build/hub_imu.elf
-            Firmware/hub_imu/build/hub_imu.map
+            Hardware/hub_imu/firmware/build/hub_imu.bin
+            Hardware/hub_imu/firmware/build/hub_imu.dfu
+            Hardware/hub_imu/firmware/build/hub_imu.elf
+            Hardware/hub_imu/firmware/build/hub_imu.map
           retention-days: 14
       - name: Release
         if: startsWith(github.ref, 'refs/tags/hubimu-v')
@@ -65,7 +65,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.ref_name }}"
-          cp Firmware/hub_imu/build/hub_imu.bin "hub_imu-$TAG.bin"
-          cp Firmware/hub_imu/build/hub_imu.dfu "hub_imu-$TAG.dfu"
+          cp Hardware/hub_imu/firmware/build/hub_imu.bin "hub_imu-$TAG.bin"
+          cp Hardware/hub_imu/firmware/build/hub_imu.dfu "hub_imu-$TAG.dfu"
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "hub_imu firmware $TAG" --generate-notes
           gh release upload "$TAG" --clobber "hub_imu-$TAG.bin" "hub_imu-$TAG.dfu"

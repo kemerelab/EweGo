@@ -1,0 +1,49 @@
+(version 1)
+
+# JLCPCB 2-layer, 1.0 mm FR4, 1 oz
+(rule "min_clearance"
+	(constraint clearance (min 0.2mm)))
+
+(rule "min_track_width"
+	(condition "A.Type == 'Track'")
+	(constraint track_width (min 0.2mm)))
+
+(rule "via_size"
+	(condition "A.Type == 'Via'")
+	(constraint via_diameter (min 0.6mm))
+	(constraint hole_size (min 0.3mm)))
+
+(rule "edge_clearance"
+	(constraint edge_clearance (min 0.3mm)))
+
+(rule "power_width"
+	(condition "A.Type == 'Track' && (A.NetName == '+5V' || A.NetName == '+3V3') && !A.intersectsCourtyard('U1')")
+	(constraint track_width (min 0.4mm) (opt 0.4mm)))
+
+# U1 (QFN, 0.25 mm pads) cannot accept 0.4 mm; neck down only inside its courtyard
+(rule "power_neck_U1"
+	(condition "A.Type == 'Track' && (A.NetName == '+5V' || A.NetName == '+3V3') && A.intersectsCourtyard('U1')")
+	(constraint track_width (min 0.25mm)))
+
+# USB 2.0 HS pairs (and the FS IMU pair, routed the same way). 0.35/0.15 edge-coupled over the
+# far-side GND plane is ~110-120 ohm differential on 1.0 mm FR4; coplanar GND pour pulls it down.
+# Acceptable because every pair is under ~12 mm, below the ~13 mm critical length for 500 ps edges.
+(rule "usb_width"
+	(condition "A.Type == 'Track' && (A.NetName == '/HOST_DP' || A.NetName == '/HOST_DM' || A.NetName == '/CAM1_DP' || A.NetName == '/CAM1_DM' || A.NetName == '/CAM2_DP' || A.NetName == '/CAM2_DM' || A.NetName == '/IMU_DP' || A.NetName == '/IMU_DM') && !A.intersectsCourtyard('U1') && !A.intersectsCourtyard('U2') && !A.intersectsCourtyard('U3') && !A.intersectsCourtyard('J2') && !A.intersectsCourtyard('J3') && !A.intersectsCourtyard('J4')")
+	(constraint track_width (min 0.35mm) (opt 0.35mm) (max 0.35mm)))
+
+(rule "usb_neck"
+	(condition "A.Type == 'Track' && (A.NetName == '/HOST_DP' || A.NetName == '/HOST_DM' || A.NetName == '/CAM1_DP' || A.NetName == '/CAM1_DM' || A.NetName == '/CAM2_DP' || A.NetName == '/CAM2_DM' || A.NetName == '/IMU_DP' || A.NetName == '/IMU_DM') && (A.intersectsCourtyard('U1') || A.intersectsCourtyard('U2') || A.intersectsCourtyard('U3') || A.intersectsCourtyard('J2') || A.intersectsCourtyard('J3') || A.intersectsCourtyard('J4'))")
+	(constraint track_width (min 0.2mm) (max 0.35mm)))
+
+
+
+# Camera-connector (JST SH) mounting tabs are mechanical anchors: connect them to the pour solid.
+(rule "gh_tabs_solid"
+	(condition "A.Type == 'Pad' && A.Pad_Number == 'MP'")
+	(constraint zone_connection solid))
+
+# J5-J8 are bare hand-solder pads for backup host wires; their courtyards include the wire, the copper keeps 0.4 mm
+(rule "wire_pads"
+	(condition "(A.Reference == 'J5' || A.Reference == 'J6' || A.Reference == 'J7' || A.Reference == 'J8') && (B.Reference == 'J5' || B.Reference == 'J6' || B.Reference == 'J7' || B.Reference == 'J8')")
+	(constraint courtyard_clearance (min -1mm)))

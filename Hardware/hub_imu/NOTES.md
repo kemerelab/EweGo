@@ -7,7 +7,7 @@ layout rules are in [README.md](README.md). The firmware has its own
 
 ## What it is and why
 
-A 21 x 14.4 mm module that turns one downstream port of the collar's USB hub
+A 21 x 14.4 mm module that turns one downstream port of the wearable's USB hub
 into a USB IMU. An STM32F042F6P6 reads a Bosch BNO055 over I2C and sends each
 sample to the CM4 as a HID report.
 

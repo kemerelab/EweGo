@@ -1,7 +1,7 @@
 # hub_imu firmware
 
 Firmware for the hub_imu module: an STM32F042F6P6 that turns one port of
-the collar's FE1.1S USB hub into a USB IMU (Bosch BNO055 over I2C). The
+the wearable's FE1.1S USB hub into a USB IMU (Bosch BNO055 over I2C). The
 board is one directory up (`Hardware/hub_imu/`); its README is the
 reference for pins and the circuit.
 
@@ -14,7 +14,7 @@ attaches `hub_imu.bin`; a `hubimu-v*` tag publishes a release.
 
 First time, with blank flash: hold BOOT0 (J2 pin 2) to 3.3 V (J2 pin 1)
 while plugging the module into the hub, then release. The chip starts the
-STM32 system bootloader and enumerates as `0483:df11`. Then, on the collar
+STM32 system bootloader and enumerates as `0483:df11`. Then, on the wearable
 (dfu-util is on the image) or any machine with dfu-util:
 
     dfu-util -l

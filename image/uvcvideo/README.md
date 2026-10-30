@@ -6,7 +6,7 @@ USB 2.0 isochronous bandwidth is reserved per stream from a bus budget of
 about 6000 bytes per 125 µs microframe. When a UVC camera starts streaming
 it asks for a payload size (`dwMaxPayloadTransferSize`) and the kernel
 picks the smallest alternate setting that satisfies it. The candidate
-collar camera asks for **3060 B at every resolution and frame rate**, so a
+EweGo camera asks for **3060 B at every resolution and frame rate**, so a
 second identical camera fails with:
 
     usb 1-1.4: Not enough bandwidth for altsetting 11
@@ -25,7 +25,7 @@ If a camera asks for more than `max_payload` bytes per microframe, the
 request is capped before the alternate setting is chosen (the camera's
 own request is logged with `trace=1024`). The driver then picks the
 smallest alternate setting **at or above** the capped value, so the cap
-must sit at or below the alternate setting you want. The collar camera's
+must sit at or below the alternate setting you want. The EweGo camera's
 table is 800, 944, 1280, 1600, 1984, 2880, 3060 (alt 5–11); 1900 lands on
 alt 9 = 1984 B/µframe, 15.9 MB/s per camera, several times what 1080p30
 MJPEG produces (3–5 MB/s measured). Two cameras at 1984 total 3968, well
@@ -64,7 +64,7 @@ If the apt mirror no longer has headers for the image's exact kernel, the
 kernel and headers are upgraded together so they match.
 
 Skip it with `inject-ewego.sh --no-uvc`. Change the cap with
-`UVC_MAX_PAYLOAD=… inject-ewego.sh …`, or on a collar by editing the
+`UVC_MAX_PAYLOAD=… inject-ewego.sh …`, or on a wearable by editing the
 modprobe file and reloading the module.
 
 ## On another Linux machine (VM, bench Pi)
@@ -78,7 +78,7 @@ kernel's base version from the mainline tree:
 Re-run after a kernel upgrade. Everything else (`ewego-cam`, `ewego-imu-usb`,
 `bus-test.py`, the web console) builds and runs there unchanged.
 
-## Checking it on a collar
+## Checking it on a wearable
 
     modinfo uvcvideo | grep -E 'filename|max_payload'   # filename should be under updates/
     cat /sys/module/uvcvideo/parameters/max_payload     # 2048
@@ -94,6 +94,6 @@ Re-run after a kernel upgrade. Everything else (`ewego-cam`, `ewego-imu-usb`,
   endpoint size and streams fine; some may misbehave. The drop test shows
   which: frames arrive with zero gaps, or they do not.
 - The module is tied to the kernel version in the image. `apt upgrade` of
-  the kernel on a collar would leave the patched module behind (the stock
+  the kernel on a wearable would leave the patched module behind (the stock
   one for the new kernel loads instead, and the cap silently disappears).
-  Collars are not expected to run apt in the field.
+  Wearables are not expected to run apt in the field.

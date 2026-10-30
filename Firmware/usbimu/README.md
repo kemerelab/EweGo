@@ -1,7 +1,7 @@
 # ewego-imu-usb
 
 Host-side logger for the hub_imu USB IMU module (`Hardware/hub_imu/firmware/`,
-firmware v0.3.0 or later). Static C, libc only; runs on the collar image
+firmware v0.3.0 or later). Static C, libc only; runs on the EweGo image
 and on any Linux machine.
 
     ewego-imu-usb --list                      # find the module (VID:PID 1209:0001)
@@ -33,7 +33,7 @@ Exit 0 means every sample arrived and none was flagged; 2 otherwise;
 
 Two timestamps per sample. The device clock is the one to use for sample
 spacing (it is 1 µs and taken at the sensor read); the host clock places
-the sample in the collar's time base, with up to 1 ms of USB polling
+the sample in the wearable's time base, with up to 1 ms of USB polling
 jitter. A linear fit of host time against device time over a session
 removes that jitter and gives the drift, which the summary reports.
 

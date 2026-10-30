@@ -2,7 +2,7 @@
 
 Standalone recorder for one UVC (USB) camera. One C file, static binary,
 no dependencies beyond libc and the kernel headers, so it runs on the
-collar image and on any other Pi for bench tests. It talks V4L2 to the
+EweGo image and on any other Pi for bench tests. It talks V4L2 to the
 in-kernel `uvcvideo` driver, not libuvc, so every frame's timestamp is the
 kernel's `CLOCK_MONOTONIC` stamp taken when the frame's first USB packet
 arrived, independent of anything user space does.
@@ -82,7 +82,7 @@ line to `systemctl status` via the notify socket.
 `ewego-cam@camera1.service` and `ewego-cam@camera2.service` read
 `/etc/ewego/cam-camera1.conf` / `cam-camera2.conf` (DEVICE, SIZE, FPS,
 OUT_DIR, EXTRA_ARGS). Installed on the image, not enabled. Set DEVICE to
-the right `port:` for each side of the collar after `ewego-cam --list`.
+the right `port:` for each side of the wearable after `ewego-cam --list`.
 
 ## Build
 

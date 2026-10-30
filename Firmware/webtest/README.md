@@ -1,7 +1,7 @@
 # EweGo web test console
 
 `ewego_webtest.py` is a single-file HTTP server (Python standard library
-only) for exercising each piece of a collar from a browser. It runs the same
+only) for exercising each piece of a wearable from a browser. It runs the same
 tools you would use over SSH and streams their output to the page.
 
 Open `http://<hostname>.local:8080/` on any device on the same network.
@@ -45,7 +45,7 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 
 ## Running it
 
-It is installed and enabled on the collar image as `ewego-webtest.service`.
+It is installed and enabled on the EweGo image as `ewego-webtest.service`.
 To run it by hand somewhere else:
 
     sudo python3 ewego_webtest.py --port 8080 --ewego-dir /path/to/EweGo
@@ -56,14 +56,14 @@ HTTP 409 with a message.
 ## Security
 
 There is no authentication and it runs as root. Use it only on networks you
-control (bench, lab, phone hotspot). Disable it on a collar that will sit
+control (bench, lab, phone hotspot). Disable it on a wearable that will sit
 on a network you do not control:
 
     sudo systemctl disable --now ewego-webtest
 
 ## Iterating without rebuilding the image
 
-Copy the file straight to the collar and restart the unit:
+Copy the file straight to the wearable and restart the unit:
 
     scp Firmware/webtest/ewego_webtest.py user@ewe.local:/tmp/ && \
       ssh user@ewe.local 'sudo install -m 644 /tmp/ewego_webtest.py /opt/ewego/Firmware/webtest/ && sudo systemctl restart ewego-webtest'

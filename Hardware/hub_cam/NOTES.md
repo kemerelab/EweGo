@@ -11,8 +11,8 @@ camera strap. It has a USB-C port to the CM4, two JST SH camera ports, and the
 J1 header that the [hub_imu](../hub_imu/NOTES.md) module stacks onto. Holes in
 the board let it be sewn to the strap.
 
-It replaces the off-the-shelf FE1.1S hub (Amazon B0GTVPVPV9) used on the collar
-so far, which has three problems:
+It replaces the off-the-shelf FE1.1S hub (Amazon B0GTVPVPV9) used on the
+wearable so far, which has three problems:
 
 - Its 2.0 mm port pitch doesn't match hub_imu's 2.54 mm header.
 - The camera wires must be soldered to it, and their insulation melts.
@@ -46,7 +46,7 @@ The old repository's top-level README still says "JST-GH". The board uses
 
 ## After the first boards arrive
 
-- **Camera port names change.** The collar's `/etc/ewego/cam-camera*.conf`
+- **Camera port names change.** The test collar's `/etc/ewego/cam-camera*.conf`
   use `port:1.3` / `port:1.4`, which are the Amazon hub's ports. On hub_cam
   the cameras are on hub ports 1 and 3 and the IMU is on port 2, so expect
   `port:1.1` / `port:1.3`. Confirm with `ewego-cam --list` and update the

@@ -1,6 +1,7 @@
 # EweGo — working notes for Claude Code sessions
 
-Sensor collar for sheep: Raspberry Pi CM4 on the eweSAW carrier with two USB
+Animal-borne sensor wearable (collar or head-halter variants; sheep first):
+Raspberry Pi CM4 on the eweSAW carrier with two USB
 cameras (moving from CSI), u-blox ZED-X20P GNSS, BNO055 IMU, stereo mics,
 MAX17048 fuel gauge. Plan and decisions live in the bring-up plan artifact:
 https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
@@ -20,10 +21,10 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   the release. Flash with Raspberry Pi Imager via
   `https://github.com/kemerelab/EweGo/releases/latest/download/imager.json`.
 - No first-boot steps of any kind: everything is baked in at build time so
-  a collar works in the field with no network.
+  a wearable works in the field with no network.
 - Fast iteration for the web console without an image rebuild: scp
   `Firmware/webtest/ewego_webtest.py` to `/opt/ewego/Firmware/webtest/` on
-  the collar and `systemctl restart ewego-webtest`.
+  the wearable and `systemctl restart ewego-webtest`.
 - Keep C ports byte-compatible with the existing CSV / .ubx / int64-µs
   timestamp outputs so `play_with_timestamps.py` keeps working.
 
@@ -64,7 +65,7 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   stripped from `cloud_final_modules` via
   `/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg`, avahi-daemon is baked in,
   kernel packages are held. Reflash from v0.4.3 or later; never run apt on
-  a collar. Console has an "apt / first-boot history" button.
+  a wearable. Console has an "apt / first-boot history" button.
 - 2026-09-09 bench PASS: two cameras 1080p30 simultaneously, 0 lost, with
   `max_payload=1900` (camera alt table 800/944/1280/1600/1984/2880/3060;
   2048 rounded up to 2880 and failed). 1900 is the image default from v0.4.4.

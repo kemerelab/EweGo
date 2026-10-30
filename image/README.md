@@ -1,7 +1,7 @@
-# EweGo collar image
+# EweGo image
 
 A ready-to-flash Raspberry Pi OS Lite (arm64) image with the EweGo firmware
-already installed, built by GitHub Actions on every version tag. A collar
+already installed, built by GitHub Actions on every version tag. A wearable
 flashed from it needs no network access and no setup script: everything is
 placed in the image at build time, and nothing runs on first boot except
 stock Pi OS behaviour (root filesystem expansion and Raspberry Pi Imager's
@@ -24,14 +24,14 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 Recordings from `ewego-sensors` land in `/opt/ewego/sensor_test_<timestamp>/`,
 the same place relative to the tree as when running from `~/EweGo` by hand.
 
-## Flashing a collar
+## Flashing a wearable
 
 1. Once, point Raspberry Pi Imager at this repository's image list:
    *Options → Content Repository → custom URL*
    `https://github.com/kemerelab/EweGo/releases/latest/download/imager.json`
    The EweGo image then appears in Imager's OS list with the customisation
    step (hostname, user, Wi-Fi, SSH key) available.
-2. Flash, boot. The collar joins the configured Wi-Fi and is reachable as
+2. Flash, boot. The wearable joins the configured Wi-Fi and is reachable as
    `<hostname>.local`, or on the UART console (TX0/RX0, 115200 baud).
    Open `http://<hostname>.local:8080/` for the test console: device
    presence, battery, clock, and a button per sensor, plus a live camera view.

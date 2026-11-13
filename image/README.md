@@ -38,10 +38,10 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
    `<hostname>.local`, or on the UART console (TX0/RX0, 115200 baud).
    Open `http://<hostname>.local:8080/` for the test console: device
    presence, battery, clock, and a button per sensor, plus a live camera view.
-3. Check the camera hub ports once: `ewego-cam --list` on the wearable,
-   and set `DEVICE=port:...` in `/etc/ewego/cam-camera1.conf` and
-   `cam-camera2.conf` if they differ from the defaults (`port:1.1`,
-   `port:1.3`, the hub_cam board's camera ports).
+3. The camera units pick the two USB cameras by hub-port order
+   (`DEVICE=auto:1/2`, `auto:2/2`): camera1 is the camera on the lower hub
+   port, on any hub. `ewego-cam --list` shows the order; set `DEVICE=port:...`
+   in `/etc/ewego/cam-camera*.conf` only to pin a physical port.
 4. Start recording when you want it (or from the console's Recorder card):
 
        sudo systemctl start ewego-record.target        # this boot only

@@ -53,7 +53,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.3"
+#define VERSION "0.4"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -267,33 +267,118 @@ static void *writer_main(void *arg)
 	return NULL;
 }
 
+/* A USB camera as seen in /dev/v4l/by-path: its hub port spec and the link. */
+struct cam_entry {
+	char port[64];
+	char path[PATH_MAX];
+};
+#define MAX_CAMS 16
+
+/* port spec from a by-path name: ...-usb-0:1.3:1.0-video-index0 -> "1.3" */
+static void port_of(const char *bypath, char *port, size_t len)
+{
+	const char *p = strstr(bypath, "-usb-");
+	const char *a = p ? strchr(p + 5, ':') : NULL;
+	const char *b = a ? strstr(a + 1, "-video") : NULL;
+
+	snprintf(port, len, "?");
+	if (a && b) {
+		const char *c = b;
+		while (c > a && *c != ':')
+			c--;
+		if (c > a + 1)
+			snprintf(port, len, "%.*s", (int)(c - a - 1), a + 1);
+	}
+}
+
+static int cmp_cam(const void *x, const void *y)
+{
+	return strverscmp(((const struct cam_entry *)x)->port, ((const struct cam_entry *)y)->port);
+}
+
 /*
- * Resolve --device. Accepts a path, or "port:<spec>" which matches the USB
- * port in /dev/v4l/by-path names, e.g. "port:1.3" matches
- * ...-usb-0:1.3:1.0-video-index0. The by-path name is stable across boots
- * for a given physical hub port; /dev/videoN is not.
+ * All USB cameras ordered by hub port (1.1 before 1.3 before 1.10), from the
+ * -usb- by-path links only: udev also makes -usbv2- links for the same nodes.
  */
-static int resolve_device(const char *spec, char *out, size_t outlen)
+static int enumerate_cameras(struct cam_entry *cams, int max)
 {
 	glob_t g;
 	size_t i;
-	int found = 0;
-	char needle[128];
+	int n = 0;
 
+	/* zero the padding after the strings: resolve_device() memcmp()s entries */
+	memset(cams, 0, sizeof(*cams) * max);
+	if (glob("/dev/v4l/by-path/*-usb-*-video-index0", 0, NULL, &g) != 0)
+		return 0;
+	for (i = 0; i < g.gl_pathc && n < max; i++) {
+		port_of(g.gl_pathv[i], cams[n].port, sizeof(cams[n].port));
+		snprintf(cams[n].path, sizeof(cams[n].path), "%s", g.gl_pathv[i]);
+		n++;
+	}
+	globfree(&g);
+	qsort(cams, n, sizeof(cams[0]), cmp_cam);
+	return n;
+}
+
+/*
+ * Resolve --device:
+ *   /dev/videoN, a by-path link   used as is
+ *   port:1.3                      the camera on that hub port (stable for a
+ *                                 physical port; /dev/videoN is not)
+ *   auto:N[/M]                    the Nth camera (1-based) with the cameras
+ *                                 ordered by hub port, so camera1 is the one
+ *                                 on the lowest port whatever the hub or the
+ *                                 enumeration order; M = how many cameras to
+ *                                 expect (default N). The set has to be
+ *                                 unchanged across a few polls first: after a
+ *                                 hub reset the cameras come back one at a
+ *                                 time and the order must not be decided
+ *                                 while one is still missing.
+ * Returns 0 resolved, -1 not (yet) present, -2 bad spec, -3 for auto: when
+ * at least N cameras are present but fewer than M or the set is still
+ * changing (out holds the candidate, so the caller can use it after the
+ * wait rather than record nothing).
+ */
+static int resolve_device(const char *spec, char *out, size_t outlen)
+{
+	struct cam_entry cams[MAX_CAMS];
+	static struct cam_entry last[MAX_CAMS];
+	static int last_n = -1, stable_polls;
+	int n, i, found = 0;
+
+	if (strncmp(spec, "auto:", 5) == 0) {
+		char *end;
+		int want = (int)strtol(spec + 5, &end, 10), expect = want;
+
+		if (*end == '/')
+			expect = (int)strtol(end + 1, &end, 10);
+		if (*end || want < 1 || want > MAX_CAMS || expect < want || expect > MAX_CAMS) {
+			fprintf(stderr, "ewego-cam: bad device spec %s (want auto:N or auto:N/M)\n", spec);
+			return -2;
+		}
+		n = enumerate_cameras(cams, MAX_CAMS);
+		if (n == last_n && memcmp(cams, last, sizeof(cams[0]) * n) == 0)
+			stable_polls++;
+		else
+			stable_polls = 0;
+		memcpy(last, cams, sizeof(cams[0]) * n);
+		last_n = n;
+		if (n < want)
+			return -1;
+		snprintf(out, outlen, "%s", cams[want - 1].path);
+		return (n < expect || stable_polls < 3) ? -3 : 0;
+	}
 	if (strncmp(spec, "port:", 5) != 0) {
 		snprintf(out, outlen, "%s", spec);
 		return access(spec, F_OK) == 0 ? 0 : -1;
 	}
-	snprintf(needle, sizeof(needle), ":%s:", spec + 5);
-	if (glob("/dev/v4l/by-path/*-usb-*-video-index0", 0, NULL, &g) != 0)
-		return -1;
-	for (i = 0; i < g.gl_pathc; i++) {
-		if (strstr(g.gl_pathv[i], needle)) {
-			snprintf(out, outlen, "%s", g.gl_pathv[i]);
+	n = enumerate_cameras(cams, MAX_CAMS);
+	for (i = 0; i < n; i++) {
+		if (strcmp(cams[i].port, spec + 5) == 0) {
+			snprintf(out, outlen, "%s", cams[i].path);
 			found++;
 		}
 	}
-	globfree(&g);
 	if (found > 1) {
 		fprintf(stderr, "ewego-cam: %s matched %d cameras (want exactly 1); use --list\n", spec, found);
 		return -2;
@@ -303,42 +388,28 @@ static int resolve_device(const char *spec, char *out, size_t outlen)
 
 static void list_cameras(void)
 {
-	glob_t g;
-	size_t i;
+	struct cam_entry cams[MAX_CAMS];
+	int n = enumerate_cameras(cams, MAX_CAMS), i;
 
-	if (glob("/dev/v4l/by-path/*-usb-*-video-index0", 0, NULL, &g) != 0) {
+	if (n == 0) {
 		printf("no USB cameras\n");
 		return;
 	}
-	for (i = 0; i < g.gl_pathc; i++) {
+	for (i = 0; i < n; i++) {
 		char real[PATH_MAX];
-		const char *p = strstr(g.gl_pathv[i], "-usb-");
-		char port[64] = "?";
-		if (p) {
-			/* -usb-0:1.3:1.0-video → port spec is between the first and last ':' */
-			const char *a = strchr(p + 5, ':');
-			const char *b = a ? strstr(a + 1, "-video") : NULL;
-			if (a && b) {
-				const char *c = b;
-				while (c > a && *c != ':')
-					c--;
-				if (c > a + 1)
-					snprintf(port, sizeof(port), "%.*s", (int)(c - a - 1), a + 1);
-			}
-		}
-		if (!realpath(g.gl_pathv[i], real))
+		if (!realpath(cams[i].path, real))
 			snprintf(real, sizeof(real), "?");
-		printf("port:%-12s %s  (%s)\n", port, real, g.gl_pathv[i]);
+		printf("auto:%-4d port:%-12s %s  (%s)\n", i + 1, cams[i].port, real, cams[i].path);
 	}
-	globfree(&g);
 }
 
 static void usage(FILE *f)
 {
 	fprintf(f,
 		"ewego-cam %s — record a UVC camera with kernel timestamps\n"
-		"usage: ewego-cam --device DEV|port:SPEC --out DIR [options]\n"
-		"  --device DEV        /dev/videoN, a by-path link, or port:1.3 (USB hub port)\n"
+		"usage: ewego-cam --device DEV|port:SPEC|auto:N[/M] --out DIR [options]\n"
+		"  --device DEV        /dev/videoN, a by-path link, port:1.3 (USB hub port), or\n"
+		"                      auto:N[/M] = Nth camera by hub port order (expecting M cameras)\n"
 		"  --out DIR           output directory (a session subdirectory is created)\n"
 		"  --name NAME         file prefix (default camera1)\n"
 		"  --size WxH          default 1920x1080\n"
@@ -567,9 +638,19 @@ int main(int argc, char **argv)
 	 * for it rather than failing the unit (systemd would retry anyway, but
 	 * this keeps the gap and the log cleaner). */
 	{
-		int tries = 0;
-		while (resolve_device(c.device, devpath, sizeof(devpath))) {
+		int tries = 0, rc;
+		for (;;) {
+			rc = resolve_device(c.device, devpath, sizeof(devpath));
+			if (rc == 0)
+				break;
+			if (rc == -2)
+				return 1;
 			if (++tries >= c.wait_secs * 2) {
+				if (rc == -3) {
+					fprintf(stderr, "ewego-cam: %s: fewer cameras than expected after %d s, using %s\n",
+						c.device, c.wait_secs, devpath);
+					break;
+				}
 				fprintf(stderr, "ewego-cam: no camera for %s after %d s\n", c.device, c.wait_secs);
 				return 1;
 			}
@@ -577,6 +658,8 @@ int main(int argc, char **argv)
 				fprintf(stderr, "ewego-cam: waiting up to %d s for %s ...\n", c.wait_secs, c.device);
 			usleep(500000);
 		}
+		if (strncmp(c.device, "auto:", 5) == 0)
+			fprintf(stderr, "ewego-cam: %s -> %s\n", c.device, devpath);
 	}
 
 	/* output directory */

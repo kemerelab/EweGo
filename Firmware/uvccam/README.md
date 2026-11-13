@@ -8,13 +8,18 @@ kernel's `CLOCK_MONOTONIC` stamp taken when the frame's first USB packet
 arrived, independent of anything user space does.
 
     ewego-cam --list
-    ewego-cam --device port:1.3 --out /opt/ewego/recordings/camera1 --name camera1 \
+    ewego-cam --device auto:1/2 --out /opt/ewego/recordings/camera1 --name camera1 \
               --size 1920x1080 --fps 30 --seconds 600
 
-`--device` takes `/dev/videoN`, a `/dev/v4l/by-path/...` link, or
-`port:<hub port>`, which matches the physical USB port in the by-path name
-and is stable across reboots (device numbers are not). `--list` prints the
-ports.
+`--device` takes `/dev/videoN`, a `/dev/v4l/by-path/...` link,
+`port:<hub port>` (the physical USB port in the by-path name, stable across
+reboots where device numbers are not), or `auto:N[/M]`: the Nth camera with
+the cameras ordered by hub port, expecting M of them. `auto:1/2` and
+`auto:2/2` are the image defaults, so camera1 is always the camera on the
+lower hub port on any hub. The recorder waits until the camera set has been
+unchanged for 1.5 s before choosing (after a hub reset the cameras come back
+one at a time), and if fewer than M cameras show up within `--wait` it
+records with what is there and says so. `--list` prints both forms.
 
 ## Output
 
@@ -81,8 +86,9 @@ line to `systemctl status` via the notify socket.
 
 `ewego-cam@camera1.service` and `ewego-cam@camera2.service` read
 `/etc/ewego/cam-camera1.conf` / `cam-camera2.conf` (DEVICE, SIZE, FPS,
-OUT_DIR, EXTRA_ARGS). Installed on the image, not enabled. Set DEVICE to
-the right `port:` for each side of the wearable after `ewego-cam --list`.
+OUT_DIR, EXTRA_ARGS). Installed on the image, not enabled. DEVICE defaults
+to `auto:1/2` / `auto:2/2`; pin a `port:` from `ewego-cam --list` only if a
+specific physical side must keep a name when the hub wiring changes.
 
 ## Build
 

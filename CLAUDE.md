@@ -133,8 +133,12 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   log_fuel_gauge.py`); members are `PartOf=` the target. `ewego-sensors`
   and `ewego-dualcam` units, `python3-picamera2`, the imx708 overlays and
   `gpu_mem=256` are gone from the image (scripts stay in Firmware/ for
-  reference). cam confs default to port:1.1/1.3 (hub_cam; the hand-wired hub was 1.3/1.4,
-  which v0.6.0 shipped and recorded only one camera on the collar). Console: Recorder card
+  reference). v0.6.1 shipped cam confs port:1.1/1.3 (hub_cam; the hand-wired hub was
+  1.3/1.4, which v0.6.0 shipped and recorded only one camera on the collar).
+  v0.6.2: ewego-cam 0.4 adds `--device auto:N[/M]` (Nth camera by hub-port
+  order, waits for a stable set of M, falls back to what is there after
+  --wait) and the confs default to auto:1/2 / auto:2/2, so no hub port is
+  hard-coded anywhere. Console: Recorder card
   drives the target; the unit regex now allows the `.target` dot.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with

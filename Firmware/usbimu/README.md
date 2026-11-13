@@ -4,6 +4,16 @@ Host-side logger for the hub_imu USB IMU module (`Hardware/hub_imu/firmware/`,
 firmware v0.3.0 or later). Static C, libc only; runs on the EweGo image
 and on any Linux machine.
 
+Two threads (since 0.3): the reader, which only polls the hidraw node,
+timestamps each report and pushes it into a RAM ring of 8192 samples, and
+the writer, which does the accounting, the CSV and the live file. The
+kernel keeps just 64 reports (0.6 s at 100 Hz) per open hidraw node, and
+the single-threaded 0.2 lost up to 150 samples at a time whenever its CSV
+write blocked on the SD card while the cameras were streaming to it. `--rt`
+puts the reader on SCHED_FIFO (priority 10, mlockall), as the image's
+`imu-usb.conf` does. Ring overruns are counted in the summary and make the
+exit code 2.
+
     ewego-imu-usb --list                      # find the module (VID:PID 1209:0001)
     ewego-imu-usb --out /opt/ewego/recordings/imu --name imu --seconds 60
 
@@ -42,7 +52,17 @@ module reads it on a timer, so a reading may be up to 10 ms old relative
 to the sensor's internal update. That is a property of the sensor in
 fusion mode and was equally true of the UART path.
 
+## Live view
+
+`--live DIR` writes `DIR/<name>.json` ten times a second (tmpfs,
+`/run/ewego` on the image): the counters plus the last 64 samples decoded
+(sample index, seq, device and host timestamps, euler, accel, gyro,
+linear accel, flags), which the web console's `/live` page turns into
+scrolling traces. `--preview --live DIR` streams without recording. The file
+is removed at exit.
+
 ## Under systemd
 
 `ewego-imu-usb.service`, installed on the image and not enabled, reads
-`/etc/ewego/imu-usb.conf` (OUT_DIR, NAME, DEVICE_ARG, EXTRA_ARGS).
+`/etc/ewego/imu-usb.conf` (OUT_DIR, NAME, DEVICE_ARG, EXTRA_ARGS; the
+default EXTRA_ARGS is `--stats 5 --rt --live /run/ewego`).

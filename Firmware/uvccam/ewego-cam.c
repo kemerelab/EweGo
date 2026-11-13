@@ -20,6 +20,11 @@
  *                           u32 sequence, u32 bytes, u32 v4l2 flags, u32 reserved
  *   <name>_summary.json     counts, gaps, intervals, clock offsets, written at exit
  *
+ * --live DIR (meant for tmpfs, /run/ewego) keeps <name>.jpg = the newest
+ * frame, replaced at most 5 times a second, and <name>.json = counters,
+ * rewritten once a second, for the web console's live view. --preview
+ * streams the camera into the live files only and records nothing.
+ *
  * Exit status: 0 clean and no frames lost; 2 frames lost, error-flagged, or
  * dropped by a full write queue; 3 camera stalled; 1 usage or device error.
  *
@@ -53,7 +58,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.4"
+#define VERSION "0.5"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -81,6 +86,8 @@ struct cfg {
 	int quiet;
 	int auto_fps;        /* leave the camera's exposure-auto-priority on */
 	int wait_secs;       /* wait this long for the device to appear */
+	const char *live;    /* directory for the live frame + counters, or NULL */
+	int preview;         /* live files only, no recording */
 };
 
 struct stats {
@@ -118,8 +125,10 @@ struct queue {
 
 struct writer {
 	struct queue *q;
-	int vid_fd, ts_fd, idx_fd;
+	int vid_fd, ts_fd, idx_fd;   /* -1 in --preview: nothing is recorded */
 	size_t wb_chunk;
+	const char *live, *name;     /* live frame: <live>/<name>.jpg */
+	int64_t live_last_ts;
 	/* results */
 	uint64_t written_frames, written_bytes;
 	double write_max_ms;
@@ -225,7 +234,22 @@ static void *writer_main(void *arg)
 		if (!f)
 			break;              /* done and drained */
 
-		{
+		/* newest frame for the live view: at most 5 a second, atomic replace */
+		if (w->live && f->ts_us - w->live_last_ts >= 200000) {
+			char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
+			int lfd;
+			snprintf(fin, sizeof(fin), "%s/%s.jpg", w->live, w->name);
+			snprintf(tmp, sizeof(tmp), "%s/.%s.jpg.tmp", w->live, w->name);
+			lfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+			if (lfd >= 0) {
+				if (write_all(lfd, f->data, f->len) == 0)
+					rename(tmp, fin);
+				close(lfd);
+			}
+			w->live_last_ts = f->ts_us;
+		}
+
+		if (w->vid_fd >= 0) {
 			struct idx_rec rec = {
 				.offset = offset, .ts_us = f->ts_us, .seq = f->seq,
 				.bytes = (uint32_t)f->len, .flags = f->flags, .reserved = 0,
@@ -253,7 +277,7 @@ static void *writer_main(void *arg)
 		/* Steady writeback: kick the last chunk out to the card as soon as
 		 * it is complete, and drop the chunk before it from the page cache,
 		 * so dirty data never piles up into a multi-hundred-ms flush. */
-		if (offset - chunk_start >= w->wb_chunk) {
+		if (w->vid_fd >= 0 && offset - chunk_start >= w->wb_chunk) {
 			sync_file_range(w->vid_fd, (off64_t)chunk_start, (off64_t)(offset - chunk_start),
 					SYNC_FILE_RANGE_WRITE);
 			if (chunk_start >= w->wb_chunk)
@@ -261,9 +285,11 @@ static void *writer_main(void *arg)
 			chunk_start = offset;
 		}
 	}
-	fdatasync(w->vid_fd);
-	fdatasync(w->ts_fd);
-	fdatasync(w->idx_fd);
+	if (w->vid_fd >= 0) {
+		fdatasync(w->vid_fd);
+		fdatasync(w->ts_fd);
+		fdatasync(w->idx_fd);
+	}
 	return NULL;
 }
 
@@ -408,6 +434,7 @@ static void usage(FILE *f)
 	fprintf(f,
 		"ewego-cam %s — record a UVC camera with kernel timestamps\n"
 		"usage: ewego-cam --device DEV|port:SPEC|auto:N[/M] --out DIR [options]\n"
+		"       ewego-cam --device ... --preview --live DIR     live files only, no recording\n"
 		"  --device DEV        /dev/videoN, a by-path link, port:1.3 (USB hub port), or\n"
 		"                      auto:N[/M] = Nth camera by hub port order (expecting M cameras)\n"
 		"  --out DIR           output directory (a session subdirectory is created)\n"
@@ -424,6 +451,8 @@ static void usage(FILE *f)
 		"  --rt                SCHED_FIFO priority 10 and mlockall for the capture thread (needs root)\n"
 		"  --auto-fps          let auto-exposure lower the frame rate in dim light (default: hold the rate)\n"
 		"  --wait N            wait up to N seconds for the camera to appear (default 30)\n"
+		"  --live DIR          keep DIR/NAME.jpg (newest frame, <= 5/s) and DIR/NAME.json (counters, 1/s)\n"
+		"  --preview           stream into the --live files only; nothing is recorded\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n",
 		VERSION, MAX_BUFFERS);
@@ -482,6 +511,45 @@ static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, 
 	st->i_bytes = 0;
 	st->i_dt_n = 0;
 	st->i_dt_sum = 0;
+}
+
+/* Live counters for the console: rewritten once a second, atomic replace. */
+static void write_live_json(const struct cfg *c, const struct stats *st, struct queue *q,
+			    const struct writer *w, const char *devpath, const char *session,
+			    int64_t now, int64_t t_start, double fps_recent)
+{
+	char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
+	FILE *f;
+	size_t qbytes, qhw;
+	uint64_t qovr;
+
+	snprintf(fin, sizeof(fin), "%s/%s.json", c->live, c->name);
+	snprintf(tmp, sizeof(tmp), "%s/.%s.json.tmp", c->live, c->name);
+	f = fopen(tmp, "w");
+	if (!f)
+		return;
+	pthread_mutex_lock(&q->m);
+	qbytes = q->bytes;
+	qhw = q->high_water;
+	qovr = q->overruns;
+	pthread_mutex_unlock(&q->m);
+	fprintf(f, "{\"program\":\"ewego-cam %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
+		VERSION, c->name, devpath, c->preview);
+	if (session)
+		fprintf(f, "\"session\":\"%s\",", session);
+	else
+		fputs("\"session\":null,", f);
+	fprintf(f, "\"width\":%d,\"height\":%d,\"fps_requested\":%d,\"elapsed_s\":%.1f,"
+		   "\"frames\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
+		   ",\"errors\":%" PRIu64 ",\"fps\":%.2f,\"queue_mb\":%.1f,\"queue_peak_mb\":%.1f,"
+		   "\"overruns\":%" PRIu64 ",\"write_max_ms\":%.0f,\"written_mb\":%.1f,"
+		   "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 "}\n",
+		c->width, c->height, c->fps, (double)(now - t_start) / 1e6,
+		st->frames, st->bytes, st->lost, st->gaps, st->errors, fps_recent,
+		(double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms, (double)w->written_bytes / 1e6,
+		now, now_real_us());
+	fclose(f);
+	rename(tmp, fin);
 }
 
 static int write_summary(const char *path, const struct cfg *c, const struct stats *st,
@@ -570,6 +638,7 @@ int main(int argc, char **argv)
 		{"stall", required_argument, 0, 'x'},
 		{"no-session-dir", no_argument, 0, 'N'}, {"rt", no_argument, 0, 'r'},
 		{"auto-fps", no_argument, 0, 'A'}, {"wait", required_argument, 0, 'w'},
+		{"live", required_argument, 0, 'L'}, {"preview", no_argument, 0, 'P'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
@@ -583,7 +652,8 @@ int main(int argc, char **argv)
 	struct queue q;
 	struct writer w;
 	pthread_t writer_thread;
-	int64_t mono0, real0, t_start, t_last_stats, t_last_frame;
+	int64_t mono0, real0, t_start, t_last_stats, t_last_frame, t_last_live;
+	uint64_t live_frames0 = 0;
 	uint32_t tstamp_flags = 0;
 	int exit_code = 0;
 	unsigned int i;
@@ -592,7 +662,7 @@ int main(int argc, char **argv)
 	memset(&q, 0, sizeof(q));
 	memset(&w, 0, sizeof(w));
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:qlh", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:Pqlh", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -615,13 +685,15 @@ int main(int argc, char **argv)
 		case 'r': c.realtime = 1; break;
 		case 'A': c.auto_fps = 1; break;
 		case 'w': c.wait_secs = atoi(optarg); break;
+		case 'L': c.live = optarg; break;
+		case 'P': c.preview = 1; break;
 		case 'q': c.quiet = 1; break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 1;
 		}
 	}
-	if (!c.device || !c.out) {
+	if (!c.device || (!c.out && !c.preview) || (c.preview && !c.live)) {
 		usage(stderr);
 		return 1;
 	}
@@ -663,22 +735,29 @@ int main(int argc, char **argv)
 	}
 
 	/* output directory */
-	if (c.session_dir) {
-		time_t t = time(NULL);
-		struct tm tm;
-		char stamp[32];
-		localtime_r(&t, &tm);
-		strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
-		snprintf(dir, sizeof(dir), "%s/%s", c.out, stamp);
-	} else {
-		snprintf(dir, sizeof(dir), "%s", c.out);
+	dir[0] = 0;
+	if (!c.preview) {
+		if (c.session_dir) {
+			time_t t = time(NULL);
+			struct tm tm;
+			char stamp[32];
+			localtime_r(&t, &tm);
+			strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+			snprintf(dir, sizeof(dir), "%s/%s", c.out, stamp);
+		} else {
+			snprintf(dir, sizeof(dir), "%s", c.out);
+		}
+		if (mkdir(c.out, 0755) && errno != EEXIST) {
+			perror(c.out);
+			return 1;
+		}
+		if (mkdir(dir, 0755) && errno != EEXIST) {
+			perror(dir);
+			return 1;
+		}
 	}
-	if (mkdir(c.out, 0755) && errno != EEXIST) {
-		perror(c.out);
-		return 1;
-	}
-	if (mkdir(dir, 0755) && errno != EEXIST) {
-		perror(dir);
+	if (c.live && mkdir(c.live, 0755) && errno != EEXIST) {
+		perror(c.live);
 		return 1;
 	}
 
@@ -786,11 +865,17 @@ int main(int argc, char **argv)
 	}
 
 	/* output files and writer thread */
-	w.vid_fd = open_out(dir, c.name, ".mjpeg");
-	w.ts_fd = open_out(dir, c.name, "_timestamps.bin");
-	w.idx_fd = open_out(dir, c.name, "_index.bin");
-	if (w.vid_fd < 0 || w.ts_fd < 0 || w.idx_fd < 0)
-		return 1;
+	w.vid_fd = w.ts_fd = w.idx_fd = -1;
+	if (!c.preview) {
+		w.vid_fd = open_out(dir, c.name, ".mjpeg");
+		w.ts_fd = open_out(dir, c.name, "_timestamps.bin");
+		w.idx_fd = open_out(dir, c.name, "_index.bin");
+		if (w.vid_fd < 0 || w.ts_fd < 0 || w.idx_fd < 0)
+			return 1;
+	}
+	w.live = c.live;
+	w.name = c.name;
+	w.live_last_ts = INT64_MIN;
 	pthread_mutex_init(&q.m, NULL);
 	pthread_cond_init(&q.cv, NULL);
 	q.max_bytes = c.ring_bytes;
@@ -822,9 +907,14 @@ int main(int argc, char **argv)
 	}
 	mono0 = now_mono_us();
 	real0 = now_real_us();
-	t_start = t_last_stats = t_last_frame = mono0;
-	fprintf(stderr, "recording %dx%d MJPG @ %d fps, %d buffers, %zu MB queue -> %s/%s.*\n",
-		c.width, c.height, c.fps, c.buffers, c.ring_bytes >> 20, dir, c.name);
+	t_start = t_last_stats = t_last_frame = t_last_live = mono0;
+	if (c.preview)
+		fprintf(stderr, "preview %dx%d MJPG @ %d fps -> %s/%s.jpg (nothing recorded)\n",
+			c.width, c.height, c.fps, c.live, c.name);
+	else
+		fprintf(stderr, "recording %dx%d MJPG @ %d fps, %d buffers, %zu MB queue -> %s/%s.*%s%s\n",
+			c.width, c.height, c.fps, c.buffers, c.ring_bytes >> 20, dir, c.name,
+			c.live ? ", live files in " : "", c.live ? c.live : "");
 	sd_notify("READY=1");
 
 	/* capture loop: dequeue, copy into the queue, requeue. No disk I/O here. */
@@ -962,6 +1052,12 @@ int main(int argc, char **argv)
 			print_stats(&c, &st, &q, &w, (double)(now - t_start) / 1e6);
 			t_last_stats = now;
 		}
+		if (c.live && now - t_last_live >= 1000000) {
+			write_live_json(&c, &st, &q, &w, devpath, c.preview ? NULL : dir, now, t_start,
+					(double)(st.frames - live_frames0) * 1e6 / (double)(now - t_last_live));
+			live_frames0 = st.frames;
+			t_last_live = now;
+		}
 		if (c.seconds > 0 && now - t_start >= (int64_t)c.seconds * 1000000)
 			break;
 	}
@@ -982,13 +1078,21 @@ int main(int argc, char **argv)
 	pthread_cond_signal(&q.cv);
 	pthread_mutex_unlock(&q.m);
 	pthread_join(writer_thread, NULL);
-	close(w.vid_fd);
-	close(w.ts_fd);
-	close(w.idx_fd);
+	if (w.vid_fd >= 0) {
+		close(w.vid_fd);
+		close(w.ts_fd);
+		close(w.idx_fd);
+	}
+	if (c.live) {
+		snprintf(path, sizeof(path), "%s/%s.jpg", c.live, c.name);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/%s.json", c.live, c.name);
+		unlink(path);
+	}
 
 	if (exit_code == 0 && (st.lost || st.errors || q.overruns || w.error))
 		exit_code = 2;
-	{
+	if (!c.preview) {
 		int64_t mono1 = now_mono_us(), real1 = now_real_us();
 		snprintf(path, sizeof(path), "%s/%s_summary.json", dir, c.name);
 		write_summary(path, &c, &st, &q, &w, devpath, mono0, real0, mono1, real1, exit_code, tstamp_flags);

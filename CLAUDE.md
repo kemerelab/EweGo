@@ -28,7 +28,7 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
 - Keep C ports byte-compatible with the existing CSV / .ubx / int64-µs
   timestamp outputs so `play_with_timestamps.py` keeps working.
 
-## State (2026-11-12)
+## State (2026-11-13)
 
 - Branch `phase-a-image` (not merged to main). Releases v0.1.0 … v0.2.3
   built green. Test collar: hostname `ewego`, user `kemerelab`, web console
@@ -140,6 +140,25 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   --wait) and the confs default to auto:1/2 / auto:2/2, so no hub port is
   hard-coded anywhere. Console: Recorder card
   drives the target; the unit regex now allows the `.target` dot.
+- v0.6.3 (2026-11-13): ewego-imu-usb 0.3 is two-threaded (reader on the
+  hidraw node + RAM ring of 8192 + writer; `--rt` SCHED_FIFO for the reader,
+  on by default in imu-usb.conf) after 0.2 lost 480 samples in 9 gaps over
+  313 s on the collar: host stalls (drift spikes to -4800 ppm, stats
+  intervals stretching) while its CSV write blocked on the SD card under
+  camera load; the kernel buffers only 64 reports per hidraw reader. Ring
+  overruns are counted and fail the exit code. Both C recorders take
+  `--live /run/ewego` (newest JPEG <= 5/s + counters JSON for the cameras,
+  counters + last 64 samples at 10 Hz for the IMU; files removed at exit)
+  and `--preview` (live files only, no recording). Console: `/live` field
+  dashboard (two cameras with per-camera 180° flip, view rate 0.5–5 fps
+  with measured kB/s, 100 Hz IMU traces on canvas, GPS from the logger's
+  .ubx tail, battery/PPS/units, preview start/stop with a 90 s idle
+  timeout, start/stop recording, shutdown/reboot); SSE at
+  `/api/live/events`, multipart at `/api/live/cam/<name>?fps=`; POST
+  `/api/preview/start|stop`, `/api/power/poweroff|reboot` (stop target ->
+  sync -> systemctl). `Firmware/tools/ewego-check.py` validates a run
+  (console "Check last run"). Bench next: reflash v0.6.3, 10-minute run,
+  ewego-check PASS with IMU 0 lost / 0 overruns, live page on a phone.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
   burst reads (the systemd target replacing sensor_test.py exists since

@@ -37,7 +37,10 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
 2. Flash, boot. The wearable joins the configured Wi-Fi and is reachable as
    `<hostname>.local`, or on the UART console (TX0/RX0, 115200 baud).
    Open `http://<hostname>.local:8080/` for the test console: device
-   presence, battery, clock, and a button per sensor, plus a live camera view.
+   presence, battery, clock, and a button per sensor, plus a live camera
+   view. `http://<hostname>.local:8080/live` is the field dashboard: both
+   cameras (with a flip button), IMU traces, GPS, battery, and the
+   recorder, preview and shutdown controls.
 3. The camera units pick the two USB cameras by hub-port order
    (`DEVICE=auto:1/2`, `auto:2/2`): camera1 is the camera on the lower hub
    port, on any hub. `ewego-cam --list` shows the order; set `DEVICE=port:...`
@@ -50,8 +53,25 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
 
    Any member (`ewego-cam@camera1`, `ewego-imu-usb`, `ewego-gps`,
    `ewego-audio`, `ewego-fuel`) can be started on its own for
-   single-sensor testing. Each camera's `summary.json` should show 0 lost
-   frames and 0 overruns.
+   single-sensor testing.
+5. Check a run (or press **Check last run** on the console's Recorder card):
+
+       python3 /opt/ewego/Firmware/tools/ewego-check.py            # latest run
+       python3 /opt/ewego/Firmware/tools/ewego-check.py --list     # all runs
+       python3 /opt/ewego/Firmware/tools/ewego-check.py --collect /tmp/run1
+
+   It groups the sessions that started together into one run and prints a
+   PASS/WARN/FAIL line per stream (cameras: frames, lost, overruns, fps,
+   longest write; IMU: samples, lost, rate, drift; audio: duration, format,
+   peak level; fuel gauge: voltage and charge trend; GPS: NAV-PVT count, fix
+   types, last position), then how far apart the streams started. Exit
+   status 2 on any FAIL. `--collect DIR` lays the files out the way
+   `Firmware/dualcam/play_with_timestamps.py` expects, for rsync to a
+   workstation.
+6. Power off from the console (**Shut down** on the Recorder card or the
+   live page), not the switch: it stops the recorders so every summary is
+   written and syncs the card first. Power loss mid-write is what corrupts
+   the filesystem.
 
 ## Building the image
 

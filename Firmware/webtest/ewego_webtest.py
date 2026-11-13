@@ -3,9 +3,11 @@
 EweGo web test console.
 
 A small HTTP server (Python standard library only) that lets you exercise
-each piece of a collar from a browser: status strip, one test per sensor
+each piece of a wearable from a browser: status strip, one test per sensor
 with live output, a live camera view, unit start/stop, journal tails and
-a session listing. Everything runs the same tools you would use over SSH;
+a session listing. /live is the field dashboard: both cameras, IMU traces,
+GPS, battery and the recorder controls, fed by the files the recorders keep
+on tmpfs (/run/ewego) or by preview processes when nothing is recording. Everything runs the same tools you would use over SSH;
 this just puts their output in a browser.
 
     python3 ewego_webtest.py [--port 8080] [--ewego-dir /opt/ewego]
@@ -22,6 +24,7 @@ import select
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import termios
@@ -1053,6 +1056,291 @@ def test_config(write, q):
                     "echo cmdline.txt:; cat /boot/firmware/cmdline.txt"], write)
 
 
+
+# ---------------------------------------------------------------------------
+# live view: what the recorders publish on tmpfs, plus preview processes
+# ---------------------------------------------------------------------------
+
+LIVE_DIR = Path(os.environ.get("EWEGO_LIVE_DIR", "/run/ewego"))
+RECORDERS = ["ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb"]
+CAMERAS = ["camera1", "camera2"]
+FIX_NAMES = {0: "no fix", 1: "dead reckoning", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "time only"}
+
+
+def read_conf(path):
+    """KEY=VALUE lines of an /etc/ewego/*.conf file (comments ignored)."""
+    out = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return out
+
+
+def tool(name):
+    """Path of a C tool: the image installs them in /usr/local/bin; a checkout
+    may have a native build next to the source."""
+    p = shutil.which(name)
+    if p:
+        return p
+    for sub in ("uvccam", "usbimu"):
+        c = EWEGO / "Firmware" / sub / name
+        if c.exists():
+            return str(c)
+    return name
+
+
+class Preview:
+    """ewego-cam --preview and ewego-imu-usb --preview feeding LIVE_DIR while
+    nothing is recording: the live page's cameras and IMU without writing a
+    byte to the card. Stopped before any recorder starts (they need the
+    cameras), and on its own after IDLE_S without a live-page client."""
+    IDLE_S = 90
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.procs = {}
+        self.last_seen = time.monotonic()
+        self.message = ""
+        self.started = None
+        self.holding = False     # we hold LOCKS["camera"] while processes run
+        threading.Thread(target=self._reaper, daemon=True).start()
+
+    def touch(self):
+        self.last_seen = time.monotonic()
+
+    def status(self):
+        with self.lock:
+            procs = {n: ("running" if p.poll() is None else f"exited {p.returncode}") for n, p in self.procs.items()}
+        return {"running": any(v == "running" for v in procs.values()), "procs": procs,
+                "message": self.message, "since": self.started}
+
+    def start(self):
+        if self.status()["running"]:
+            self.touch()
+            return True, "preview already running"
+        active = [u for u in RECORDERS if unit_status(u)["active"] == "active"]
+        if active:
+            return False, "recorders are running (" + ", ".join(active) + "): the live view already shows their data"
+        with self.lock:
+            self._stop_locked()
+            if not LOCKS["camera"].acquire(blocking=False):
+                return False, "the cameras are busy with a console test; wait for it to finish"
+            self.holding = True
+            LIVE_DIR.mkdir(parents=True, exist_ok=True)
+            RUN_DIR.mkdir(parents=True, exist_ok=True)
+            n = max(len(video_devices()), 1)
+            for i, cam in enumerate(CAMERAS, 1):
+                conf = read_conf(f"/etc/ewego/cam-{cam}.conf")
+                argv = [tool("ewego-cam"), "--device", conf.get("DEVICE", f"auto:{i}/{n}"),
+                        "--size", conf.get("SIZE", "1920x1080"), "--fps", conf.get("FPS", "30"),
+                        "--name", cam, "--preview", "--live", str(LIVE_DIR), "--stats", "0", "--wait", "10"]
+                self._spawn(cam, argv)
+            conf = read_conf("/etc/ewego/imu-usb.conf")
+            argv = [tool("ewego-imu-usb"), "--preview", "--live", str(LIVE_DIR),
+                    "--name", conf.get("NAME", "imu"), "--stats", "0"] + conf.get("DEVICE_ARG", "").split()
+            self._spawn("imu", argv)
+            if not self.procs:
+                msg = self.message
+                self._stop_locked()
+                return False, "preview could not start: " + msg
+            self.started = time.time()
+            self.message = "preview running"
+            self.touch()
+        return True, "preview started: cameras and IMU streaming to the live view, nothing recorded"
+
+    def _spawn(self, name, argv):
+        log = open(RUN_DIR / f"preview-{name}.log", "wb")
+        try:
+            self.procs[name] = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
+                                                start_new_session=True)
+        except OSError as e:
+            self.message = f"{argv[0]}: {e}"
+        finally:
+            log.close()
+
+    def stop(self, why="stopped"):
+        with self.lock:
+            had = self._stop_locked()
+            if had:
+                self.message = f"preview {why}"
+        return had
+
+    def _stop_locked(self):
+        """Kill what is left, forget it, give the camera lock back. Caller holds self.lock."""
+        had = False
+        for p in self.procs.values():
+            if p.poll() is None:
+                had = True
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        for p in self.procs.values():
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                p.wait()
+        self.procs = {}
+        self.started = None
+        if self.holding:
+            self.holding = False
+            LOCKS["camera"].release()
+        return had
+
+    def _reaper(self):
+        while True:
+            time.sleep(5)
+            with self.lock:
+                running = any(p.poll() is None for p in self.procs.values())
+                stale = bool(self.procs) and not running
+            if stale:
+                self.stop("ended (see preview-*.log in the runtime directory)")
+            elif running and time.monotonic() - self.last_seen > self.IDLE_S:
+                self.stop(f"stopped after {self.IDLE_S} s without a live-view client")
+
+
+PREVIEW = Preview()
+
+
+def live_json(name):
+    p = LIVE_DIR / f"{name}.json"
+    try:
+        st = p.stat()
+        d = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    d["age_s"] = round(time.time() - st.st_mtime, 1)
+    return d
+
+
+def live_frame_info(name):
+    try:
+        st = (LIVE_DIR / f"{name}.jpg").stat()
+    except OSError:
+        return None
+    return {"age_s": round(time.time() - st.st_mtime, 1), "bytes": st.st_size}
+
+
+def parse_nav_pvt(data):
+    """Last complete UBX NAV-PVT in data, decoded, or None."""
+    last = None
+    i = 0
+    L = len(data)
+    while i < L - 8:
+        j = data.find(b"\xb5\x62", i)
+        if j < 0 or j + 6 > L:
+            break
+        cls, mid, ln = data[j + 2], data[j + 3], struct.unpack_from("<H", data, j + 4)[0]
+        if j + 6 + ln + 2 > L:
+            break
+        if cls == 1 and mid == 7 and ln >= 92:
+            p = j + 6
+            y, mo, d, h, mi, s = struct.unpack_from("<HBBBBB", data, p + 4)
+            valid = data[p + 11]
+            fix = data[p + 20]
+            flags = data[p + 21]
+            nsv = data[p + 23]
+            lon, lat, height, hmsl = struct.unpack_from("<iiii", data, p + 24)
+            hacc, vacc = struct.unpack_from("<II", data, p + 40)
+            gspeed = struct.unpack_from("<i", data, p + 60)[0]
+            carr = (flags >> 6) & 3
+            name = FIX_NAMES.get(fix, str(fix))
+            if fix == 3 and carr:
+                name = "RTK float" if carr == 1 else "RTK fixed"
+            last = {"fix": name, "fix_type": fix, "nsv": nsv, "lat": lat / 1e7, "lon": lon / 1e7,
+                    "height_m": round(height / 1000.0, 1), "hmsl_m": round(hmsl / 1000.0, 1),
+                    "hacc_m": round(hacc / 1000.0, 2), "vacc_m": round(vacc / 1000.0, 2),
+                    "speed_ms": round(gspeed / 1000.0, 2),
+                    "utc": f"{y:04d}-{mo:02d}-{d:02d} {h:02d}:{mi:02d}:{s:02d}" if valid & 0x03 else None,
+                    "valid_time": bool(valid & 0x03)}
+        i = j + 6 + ln + 2
+    return last
+
+
+def gps_live():
+    """Newest NAV-PVT in the GPS logger's current .ubx file (the logger owns the
+    serial port, so the live view reads its log; Python's file buffer puts a
+    few seconds between the receiver and the file)."""
+    logs = sorted((EWEGO / "gps-logs").glob("gps_log_*.ubx"), key=lambda p: p.stat().st_mtime) \
+        if (EWEGO / "gps-logs").is_dir() else []
+    if not logs:
+        return {"present": False}
+    p = logs[-1]
+    try:
+        st = p.stat()
+        with p.open("rb") as f:
+            f.seek(max(0, st.st_size - 65536))
+            tail = f.read()
+    except OSError:
+        return {"present": False}
+    out = {"present": True, "file": p.name, "age_s": round(time.time() - st.st_mtime, 1),
+           "size_mb": round(st.st_size / 1e6, 1)}
+    pvt = parse_nav_pvt(tail)
+    if pvt:
+        out.update(pvt)
+    return out
+
+
+_LIVE_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    now = time.monotonic()
+    hit = _LIVE_CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    v = fn()
+    _LIVE_CACHE[key] = (now, v)
+    return v
+
+
+def live_snapshot():
+    """Everything the live page shows, in one object (sent 4x a second over SSE).
+    Cheap file reads every time; subprocess- or bus-backed values are cached."""
+    units = cached("units", 2.0, lambda: {u: unit_status(u)["active"] for u in UNITS})
+    du = cached("disk", 5.0, lambda: shutil.disk_usage(EWEGO if EWEGO.exists() else "/"))
+    try:
+        temp = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000.0
+    except (OSError, ValueError):
+        temp = None
+    cams = {}
+    for cam in CAMERAS:
+        cams[cam] = {"stats": live_json(cam), "frame": live_frame_info(cam)}
+    return {
+        "t": time.time(),
+        "hostname": socket.gethostname(),
+        "units": units,
+        "recording": units.get("ewego-record.target") == "active",
+        "preview": PREVIEW.status(),
+        "cam": cams,
+        "imu": live_json("imu"),
+        "gps": cached("gps", 1.0, gps_live),
+        "pps": cached("pps", 1.0, pps_status),
+        "battery": cached("battery", 2.0, battery),
+        "disk": {"free_gb": round(du.free / 1e9, 2), "total_gb": round(du.total / 1e9, 2)},
+        "load": os.getloadavg()[0],
+        "temp_c": temp,
+    }
+
+
+def test_check(write, q):
+    argv = [sys.executable, "-u", str(EWEGO / "Firmware/tools/ewego-check.py"), "--root", str(EWEGO)]
+    if q.get("list"):
+        argv.append("--list")
+    if q.get("run"):
+        argv += ["--run", q["run"][0]]
+    stream_process(argv, write)
+
+
 TESTS = {
     "fuel": (test_fuel, None),
     "imu": (test_imu, "imu"),
@@ -1073,6 +1361,7 @@ TESTS = {
     "serial": (test_serial_ports, None),
     "config": (test_config, None),
     "firstboot": (test_firstboot, None),
+    "check": (test_check, None),
 }
 
 
@@ -1166,6 +1455,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "/":
                 self.send_bytes(PAGE.encode(), "text/html; charset=utf-8")
+            elif path == "/live":
+                self.send_bytes(LIVE_PAGE.encode(), "text/html; charset=utf-8")
+            elif path == "/api/live/events":
+                self.live_events(q)
+            elif path.startswith("/api/live/cam/"):
+                self.live_cam(q, path[len("/api/live/cam/"):])
             elif path == "/api/status":
                 self.send_json(status())
             elif path == "/api/sessions":
@@ -1196,8 +1491,18 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
+                if action != "stop" and PREVIEW.stop("stopped for the recorder"):
+                    time.sleep(1)   # let the preview processes release the cameras
                 rc, out = sh(["systemctl", action, unit], timeout=45)
                 self.send_json({"rc": rc, "output": out, "status": unit_status(unit)})
+            elif u.path in ("/api/preview/start", "/api/preview/stop"):
+                if u.path.endswith("start"):
+                    ok, msg = PREVIEW.start()
+                else:
+                    ok, msg = True, ("preview stopped" if PREVIEW.stop() else "preview was not running")
+                self.send_json({"ok": ok, "message": msg, "status": PREVIEW.status()})
+            elif u.path in ("/api/power/poweroff", "/api/power/reboot"):
+                self.power(u.path.rsplit("/", 1)[1])
             elif u.path == "/api/bridge/start":
                 if unit_status("ewego-gps")["active"] == "active":
                     self.send_json({"ok": False, "message": "ewego-gps is running and owns the port; stop it first"})
@@ -1216,6 +1521,84 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     # -- endpoints --
+    def live_events(self, q):
+        """Server-sent events: the live snapshot 4x a second, IMU samples
+        only the ones the client has not seen (by running sample index)."""
+        interval = min(max(float(q.get("interval", ["0.25"])[0]), 0.1), 0.5)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        last_n = -1
+        try:
+            while True:
+                PREVIEW.touch()
+                snap = live_snapshot()
+                imu = snap["imu"]
+                if imu:
+                    rows = [r for r in imu.pop("recent", []) if r[0] > last_n]
+                    if rows:
+                        last_n = rows[-1][0]
+                    imu["rows"] = rows
+                self.write_flush(b"data: " + json.dumps(snap).encode() + b"\n\n")
+                time.sleep(interval)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def live_cam(self, q, name):
+        """multipart/x-mixed-replace of the recorder's (or preview's) newest
+        frame, at most `fps` a second and only when the frame changed. The
+        file is replaced atomically, so every read is a whole JPEG."""
+        if name not in CAMERAS:
+            self.send_json({"error": "unknown camera"}, 404)
+            return
+        try:
+            fps = min(max(float(q.get("fps", ["2"])[0]), 0.2), 10.0)
+        except ValueError:
+            fps = 2.0
+        p = LIVE_DIR / f"{name}.jpg"
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        last_mtime, last_sent = None, 0.0
+        try:
+            while True:
+                # the browser never sends on this connection again: readable means closed
+                r, _, _ = select.select([self.connection], [], [], 0)
+                if r and not self.connection.recv(1, socket.MSG_PEEK):
+                    return
+                try:
+                    st = p.stat()
+                except OSError:
+                    st = None
+                now = time.monotonic()
+                if st and st.st_mtime_ns != last_mtime and now - last_sent >= 1.0 / fps:
+                    try:
+                        data = p.read_bytes()
+                    except OSError:
+                        data = b""
+                    if data.startswith(b"\xff\xd8"):
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                         + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+                        self.wfile.flush()
+                        last_mtime, last_sent = st.st_mtime_ns, now
+                time.sleep(0.05)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def power(self, action):
+        """Stop recording cleanly (every recorder writes its summary), flush
+        the card, then power off or reboot a second after answering."""
+        PREVIEW.stop("stopped for " + action)
+        rc, out = sh(["systemctl", "stop", "ewego-record.target"], timeout=90)
+        sh(["sync"], timeout=60)
+        self.send_json({"ok": True, "action": action, "stop_rc": rc, "output": out,
+                        "message": f"recorders stopped (rc {rc}), disk synced, {action} in a moment: "
+                                   "the wearable will drop off the network"})
+        threading.Thread(target=lambda: (time.sleep(1), subprocess.run(["systemctl", action])), daemon=True).start()
+
     def run_test(self, name, q):
         if name not in TESTS:
             self.send_json({"error": f"unknown test {name}"}, 404)
@@ -1346,6 +1729,7 @@ PAGE = r"""<!doctype html>
   <span id="disk"></span>
   <span id="load"></span>
   <span id="ips"></span>
+  <span><a href="/live" style="color:var(--accent)">Live view</a></span>
 </header>
 <main>
 
@@ -1472,6 +1856,14 @@ PAGE = r"""<!doctype html>
     <button onclick="journal('ewego-cam@camera1','out-rec')">camera1 journal</button>
     <button onclick="journal('ewego-imu-usb','out-rec')">IMU journal</button>
     <button onclick="listSessions('out-rec')">Sessions</button>
+    <button onclick="run('check','out-rec')">Check last run</button>
+    <button onclick="run('check','out-rec','&list=1')">List runs</button>
+    <a href="/live">Live view</a>
+  </div>
+  <div class="row">
+    <button onclick="power('poweroff')">Shut down</button>
+    <button onclick="power('reboot')">Reboot</button>
+    <span style="color:var(--muted);font-size:13px">stops the recorders first so every summary gets written, syncs the card, then powers off: use this instead of the switch after a recording</span>
   </div>
   <pre id="out-rec" class="tall"></pre>
 </section>
@@ -1549,6 +1941,13 @@ async function bridge(action) {
   refresh();
 }
 
+async function power(action) {
+  if (!confirm((action === 'poweroff' ? 'Shut down' : 'Reboot') + ' the wearable? Recording stops first.')) return;
+  $('out-rec').textContent = 'stopping recorders…';
+  const r = await (await fetch('/api/power/' + action, {method: 'POST'})).json();
+  $('out-rec').textContent = r.message + '\n' + (r.output || '');
+}
+
 async function journal(unitName, paneId) {
   const u = unitName || val('jr-unit'); const pane = $(paneId || 'out-units');
   pane.textContent = await (await fetch('/api/journal?unit=' + u + '&n=150&t=' + Date.now())).text();
@@ -1595,6 +1994,337 @@ function camSnap() {
 }
 
 refresh(); setInterval(refresh, 5000);
+</script>
+</body></html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# live page: cameras, IMU traces, GPS, battery, recorder controls
+# ---------------------------------------------------------------------------
+
+LIVE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EweGo live</title>
+<style>
+  :root { --bg:#f4f5f0; --card:#fbfbf8; --ink:#1e2420; --muted:#5c665f; --line:#d6dad2; --grid:#e3e6de;
+          --accent:#b94a15; --ok:#2f6b3a; --bad:#9b2c2c; --warn:#8a5a00; --code:#eceee7;
+          --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#151816; --card:#1c201d; --ink:#e4e7df; --muted:#9aa39b; --line:#313732; --grid:#262b27;
+            --accent:#e8834e; --ok:#7fbf8a; --bad:#e07a7a; --warn:#e0b25a; --code:#232823;
+            --s1:#3987e5; --s2:#d95926; --s3:#199e70; } }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:6px 18px; align-items:baseline; }
+  header h1 { font-size:17px; margin:0; }
+  header a { color:var(--accent); }
+  header span { color:var(--muted); font-size:13px; }
+  .badge { font-weight:700; font-size:12px; padding:2px 8px; border-radius:3px; color:#fff; background:var(--muted); }
+  .badge.rec { background:var(--bad); } .badge.pre { background:var(--ok); }
+  .ok { color:var(--ok); font-weight:600; } .bad { color:var(--bad); font-weight:600; } .warn { color:var(--warn); font-weight:600; }
+  .bar { padding:8px 16px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-bottom:1px solid var(--line); }
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; padding:12px 16px 30px; }
+  .card { background:var(--card); border:1px solid var(--line); padding:10px 12px; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  .card h2 { font-size:14px; margin:0; display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .card h2 small { color:var(--muted); font-weight:400; font-size:12px; }
+  .wide { grid-column:1 / -1; }
+  .camwrap { position:relative; background:#000; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  .camwrap img { width:100%; height:100%; object-fit:contain; display:block; }
+  .camwrap img.flip { transform:rotate(180deg); }
+  .camwrap .msg { position:absolute; color:#ddd; font-size:13px; background:rgba(0,0,0,.55); padding:4px 8px; display:none; }
+  .camwrap.stale .msg { display:block; }
+  .stats { font:12px/1.4 ui-monospace, Menlo, Consolas, monospace; color:var(--muted); white-space:pre-wrap; }
+  button { font:inherit; font-size:13px; padding:5px 10px; border:1px solid var(--line); background:var(--code); color:var(--ink); cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.danger { border-color:var(--bad); color:var(--bad); }
+  button.on { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); }
+  select { font:inherit; font-size:13px; padding:4px 6px; background:var(--code); color:var(--ink); border:1px solid var(--line); }
+  canvas { width:100%; height:130px; display:block; }
+  .chart { position:relative; }
+  .legend { display:flex; gap:14px; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .legend i { display:inline-block; width:10px; height:3px; vertical-align:middle; margin-right:5px; border-radius:2px; }
+  .legend b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
+  .kv b { color:var(--muted); font-weight:500; }
+  #msg { color:var(--muted); font-size:13px; }
+  .hint { color:var(--muted); font-size:12px; }
+</style></head>
+<body>
+<header>
+  <h1 id="host">EweGo live</h1>
+  <span id="state" class="badge">…</span>
+  <span id="batt"></span>
+  <span id="gpsq"></span>
+  <span id="disk"></span>
+  <span id="load"></span>
+  <span id="link"></span>
+  <span><a href="/">test console</a></span>
+</header>
+<div class="bar">
+  view rate <select id="rate"><option value="0.5">0.5 fps</option><option value="1">1 fps</option><option value="2" selected>2 fps</option><option value="5">5 fps</option></select>
+  <button id="pause" onclick="togglePause()">Pause views</button>
+  <span style="flex:1"></span>
+  <button id="pv" onclick="preview()">Preview (no recording)</button>
+  <button class="primary" onclick="rec('start')">Start recording</button>
+  <button onclick="rec('stop')">Stop recording</button>
+  <button class="danger" onclick="power('poweroff')">Shut down</button>
+  <button class="danger" onclick="power('reboot')">Reboot</button>
+  <span id="msg"></span>
+</div>
+<main>
+
+<section class="card">
+  <h2>camera1 <small id="c1-tag"></small><button onclick="flip('camera1')" id="flip-camera1">Flip 180°</button></h2>
+  <div class="camwrap" id="w-camera1"><img id="img-camera1" alt="camera1"><span class="msg" id="m-camera1">no frames</span></div>
+  <div class="stats" id="s-camera1">–</div>
+</section>
+
+<section class="card">
+  <h2>camera2 <small id="c2-tag"></small><button onclick="flip('camera2')" id="flip-camera2">Flip 180°</button></h2>
+  <div class="camwrap" id="w-camera2"><img id="img-camera2" alt="camera2"><span class="msg" id="m-camera2">no frames</span></div>
+  <div class="stats" id="s-camera2">–</div>
+</section>
+
+<section class="card wide">
+  <h2>USB IMU (BNO055) <small>last 10 s · hover for values</small></h2>
+  <div class="stats" id="s-imu">–</div>
+  <div class="chart"><div class="legend" id="lg-acc"></div><canvas id="ch-acc"></canvas></div>
+  <div class="chart"><div class="legend" id="lg-gyr"></div><canvas id="ch-gyr"></canvas></div>
+  <div class="chart"><div class="legend" id="lg-eul"></div><canvas id="ch-eul"></canvas></div>
+</section>
+
+<section class="card">
+  <h2>GPS <small id="gps-src"></small></h2>
+  <div class="kv" id="gps"></div>
+  <div class="hint">Position comes from the GPS logger's file, so it is only live while ewego-gps runs (a few seconds behind the receiver). PPS is read from the kernel directly.</div>
+</section>
+
+<section class="card">
+  <h2>Wearable</h2>
+  <div class="kv" id="sys"></div>
+  <table style="font-size:13px;border-collapse:collapse"><tbody id="units"></tbody></table>
+</section>
+
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const fmtDur = s => { s = Math.round(s||0); return s >= 3600 ? Math.floor(s/3600)+'h'+String(Math.floor(s%3600/60)).padStart(2,'0')+'m' : Math.floor(s/60)+'m'+String(s%60).padStart(2,'0')+'s'; };
+const SERIES = [getComputedStyle(document.documentElement).getPropertyValue('--s1').trim(),
+                getComputedStyle(document.documentElement).getPropertyValue('--s2').trim(),
+                getComputedStyle(document.documentElement).getPropertyValue('--s3').trim()];
+
+// ---- cameras: one multipart stream per camera, parsed by hand so the page can count bytes ----
+const cams = {camera1: {}, camera2: {}};
+let paused = false, bytesThisSec = 0, kbps = 0;
+setInterval(() => { kbps = bytesThisSec / 1024; bytesThisSec = 0; $('link').textContent = 'views ' + kbps.toFixed(0) + ' kB/s'; }, 1000);
+
+function findSeq(buf, seq, from) {
+  outer: for (let i = from; i <= buf.length - seq.length; i++) {
+    for (let j = 0; j < seq.length; j++) if (buf[i+j] !== seq[j]) continue outer;
+    return i;
+  }
+  return -1;
+}
+const CRLF2 = [13,10,13,10];
+
+async function streamCam(name) {
+  const c = cams[name];
+  if (c.ctl) c.ctl.abort();
+  if (paused) return;
+  const ctl = new AbortController(); c.ctl = ctl;
+  try {
+    const r = await fetch('/api/live/cam/' + name + '?fps=' + $('rate').value + '&t=' + Date.now(), {signal: ctl.signal});
+    const reader = r.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const {value, done} = await reader.read(); if (done) break;
+      bytesThisSec += value.length;
+      const nb = new Uint8Array(buf.length + value.length); nb.set(buf); nb.set(value, buf.length); buf = nb;
+      for (;;) {
+        const h = findSeq(buf, CRLF2, 0); if (h < 0) { if (buf.length > 1<<20) buf = new Uint8Array(0); break; }
+        const hdr = new TextDecoder().decode(buf.subarray(0, h));
+        const m = /Content-Length:\s*(\d+)/i.exec(hdr);
+        if (!m) { buf = buf.subarray(h + 4); continue; }
+        const len = +m[1]; if (buf.length < h + 4 + len) break;
+        const body = buf.slice(h + 4, h + 4 + len); buf = buf.subarray(h + 4 + len);
+        const url = URL.createObjectURL(new Blob([body], {type: 'image/jpeg'}));
+        const img = $('img-' + name); const old = img.src; img.src = url; if (old) URL.revokeObjectURL(old);
+        c.lastFrame = Date.now(); c.frameBytes = len;
+      }
+    }
+  } catch (e) { /* aborted or dropped */ }
+  if (!ctl.signal.aborted) setTimeout(() => streamCam(name), 2000);
+}
+function restartCams() { for (const n in cams) streamCam(n); }
+$('rate').onchange = restartCams;
+function togglePause() {
+  paused = !paused; $('pause').textContent = paused ? 'Resume views' : 'Pause views'; $('pause').classList.toggle('on', paused);
+  if (paused) { for (const n in cams) if (cams[n].ctl) cams[n].ctl.abort(); } else restartCams();
+}
+function flip(name) {
+  const img = $('img-' + name); img.classList.toggle('flip');
+  try { localStorage.setItem('ewego.flip.' + name, img.classList.contains('flip') ? '1' : '0'); } catch (e) {}
+  $('flip-' + name).classList.toggle('on', img.classList.contains('flip'));
+}
+for (const n in cams) { try { if (localStorage.getItem('ewego.flip.' + n) === '1') { $('img-' + n).classList.add('flip'); $('flip-' + n).classList.add('on'); } } catch (e) {} }
+
+// ---- IMU traces ----
+const WIN_US = 10e6;
+const imu = {t: [], ch: {heading: [], roll: [], pitch: [], ax: [], ay: [], az: [], gx: [], gy: [], gz: []}};
+const CHARTS = [
+  {id: 'acc', title: 'acceleration m/s²', keys: ['ax', 'ay', 'az'], names: ['x', 'y', 'z']},
+  {id: 'gyr', title: 'angular rate °/s', keys: ['gx', 'gy', 'gz'], names: ['x', 'y', 'z']},
+  {id: 'eul', title: 'orientation °', keys: ['heading', 'roll', 'pitch'], names: ['heading', 'roll', 'pitch']},
+];
+let hoverX = null;
+for (const ch of CHARTS) {
+  const cv = $('ch-' + ch.id);
+  cv.addEventListener('mousemove', e => { hoverX = e.offsetX / cv.clientWidth; draw(); });
+  cv.addEventListener('mouseleave', () => { hoverX = null; draw(); });
+}
+function addRows(rows) {
+  // cols: n, seq, dev_ts_us, host_mono_us, heading, roll, pitch, ax, ay, az, gx, gy, gz, lax, lay, laz, flags
+  for (const r of rows) {
+    if (r[4] === null) continue;
+    imu.t.push(r[3]);
+    imu.ch.heading.push(r[4]); imu.ch.roll.push(r[5]); imu.ch.pitch.push(r[6]);
+    imu.ch.ax.push(r[7]); imu.ch.ay.push(r[8]); imu.ch.az.push(r[9]);
+    imu.ch.gx.push(r[10]); imu.ch.gy.push(r[11]); imu.ch.gz.push(r[12]);
+  }
+  const tEnd = imu.t.length ? imu.t[imu.t.length - 1] : 0;
+  let cut = 0; while (cut < imu.t.length && imu.t[cut] < tEnd - WIN_US - 2e6) cut++;
+  if (cut) { imu.t.splice(0, cut); for (const k in imu.ch) imu.ch[k].splice(0, cut); }
+}
+let drawPending = false;
+function draw() { if (drawPending) return; drawPending = true; requestAnimationFrame(() => { drawPending = false; drawNow(); }); }
+function drawNow() {
+  const n = imu.t.length; if (!n) return;
+  const tEnd = imu.t[n - 1], t0 = tEnd - WIN_US;
+  const css = getComputedStyle(document.documentElement);
+  const grid = css.getPropertyValue('--grid').trim(), muted = css.getPropertyValue('--muted').trim(), ink = css.getPropertyValue('--ink').trim();
+  for (const ch of CHARTS) {
+    const cv = $('ch-' + ch.id), dpr = window.devicePixelRatio || 1;
+    const W = cv.clientWidth, H = cv.clientHeight;
+    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+    const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const padL = 44, padR = 8, padT = 6, padB = 16;
+    let lo = Infinity, hi = -Infinity, i0 = 0;
+    while (i0 < n && imu.t[i0] < t0) i0++;
+    for (const k of ch.keys) for (let i = i0; i < n; i++) { const v = imu.ch[k][i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (!isFinite(lo)) continue;
+    if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
+    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+    const X = t => padL + (t - t0) / WIN_US * (W - padL - padR), Y = v => padT + (hi - v) / (hi - lo) * (H - padT - padB);
+    // recessive grid: 3 horizontal lines with labels, 1-second ticks
+    g.strokeStyle = grid; g.lineWidth = 1; g.fillStyle = muted; g.font = '10px ui-monospace, Menlo, monospace'; g.textAlign = 'right';
+    for (let k = 0; k <= 2; k++) { const v = lo + (hi - lo) * k / 2, y = Y(v); g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(v.toFixed(Math.abs(hi - lo) < 5 ? 2 : 0), padL - 4, y + 3); }
+    g.textAlign = 'center';
+    for (let s = 0; s <= 10; s += 2) { const x = X(t0 + s * 1e6); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.fillText('-' + (10 - s) + ' s', x, H - 4); }
+    // the traces: 2 px, series colors in fixed order
+    ch.keys.forEach((k, si) => {
+      g.strokeStyle = SERIES[si]; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();
+      let first = true;
+      for (let i = i0; i < n; i++) { const x = X(imu.t[i]), y = Y(imu.ch[k][i]); if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y); }
+      g.stroke();
+    });
+    // hover crosshair: values at the pointer's time go into the legend
+    let hi_i = n - 1;
+    if (hoverX !== null) {
+      const th = t0 + Math.min(Math.max((hoverX * W - padL) / (W - padL - padR), 0), 1) * WIN_US;
+      hi_i = i0; while (hi_i < n - 1 && imu.t[hi_i] < th) hi_i++;
+      const x = X(imu.t[hi_i]); g.strokeStyle = ink; g.lineWidth = 1; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.setLineDash([]);
+      ch.keys.forEach((k, si) => { g.fillStyle = SERIES[si]; g.beginPath(); g.arc(x, Y(imu.ch[k][hi_i]), 4, 0, 7); g.fill(); });
+    }
+    $('lg-' + ch.id).innerHTML = '<span>' + ch.title + (hoverX !== null ? ' at -' + ((tEnd - imu.t[hi_i]) / 1e6).toFixed(2) + ' s' : '') + '</span>' +
+      ch.keys.map((k, si) => '<span><i style="background:' + SERIES[si] + '"></i>' + ch.names[si] + ' <b>' + imu.ch[k][hi_i].toFixed(2) + '</b></span>').join('');
+  }
+}
+window.addEventListener('resize', draw);
+
+// ---- status stream ----
+function camLine(name, c) {
+  const st = c.stats, fr = c.frame, wrap = $('w-' + name), m = $('m-' + name);
+  if (!st && !fr) { wrap.classList.add('stale'); m.textContent = 'no frames: not recording and no preview'; $('s-' + name).textContent = '–'; return; }
+  const stale = fr && fr.age_s > 4;
+  wrap.classList.toggle('stale', !!stale); if (stale) m.textContent = 'last frame ' + Math.round(fr.age_s) + ' s ago';
+  if (!st) { $('s-' + name).textContent = fr ? 'frame ' + (fr.bytes / 1024).toFixed(0) + ' kB, ' + fr.age_s + ' s old' : '–'; return; }
+  $('c' + name.slice(-1) + '-tag').textContent = (st.preview ? 'preview' : 'recording') + ' · ' + st.width + '×' + st.height + ' @ ' + st.fps_requested;
+  const bad = st.lost || st.overruns || st.errors;
+  $('s-' + name).innerHTML = st.fps.toFixed(1) + ' fps · ' + st.frames + ' frames · ' + (bad ? '<span class="bad">' : '') + st.lost + ' lost, ' + st.overruns + ' overruns, ' + st.errors + ' err' + (bad ? '</span>' : '') +
+    ' · ' + fmtDur(st.elapsed_s) + (st.preview ? '' : ' · ' + st.written_mb.toFixed(0) + ' MB · write max ' + st.write_max_ms + ' ms · queue ' + st.queue_mb + ' MB (peak ' + st.queue_peak_mb + ')') +
+    (fr ? ' · frame ' + (fr.bytes / 1024).toFixed(0) + ' kB' : '');
+}
+function imuLine(st) {
+  if (!st) { $('s-imu').textContent = 'no data: not recording and no preview'; return; }
+  const bad = st.lost || st.queue_overruns || st.flagged;
+  $('s-imu').innerHTML = (st.preview ? 'preview' : 'recording') + ' · ' + st.hz.toFixed(1) + ' Hz · ' + st.samples + ' samples · ' + (bad ? '<span class="bad">' : '') + st.lost + ' lost, ' + st.flagged + ' flagged, ' + st.queue_overruns + ' overruns' + (bad ? '</span>' : '') +
+    ' · drift ' + (st.drift_ppm >= 0 ? '+' : '') + st.drift_ppm + ' ppm · queue peak ' + st.queue_peak + ' · ' + fmtDur(st.elapsed_s) +
+    (st.cal ? ' · cal sys' + st.cal[0] + ' gyro' + st.cal[1] + ' acc' + st.cal[2] + ' mag' + st.cal[3] : '') + (st.temp_c != null ? ' · ' + st.temp_c + ' °C' : '') +
+    (st.age_s > 2 ? ' · <span class="warn">stale ' + st.age_s + ' s</span>' : '');
+}
+function gpsBlock(gp, pps) {
+  const fixCls = f => /RTK|3D|GNSS/.test(f || '') ? 'ok' : (f === '2D' ? 'warn' : 'bad');
+  $('gps-src').textContent = gp.present ? gp.file + ' · ' + gp.size_mb + ' MB · written ' + Math.round(gp.age_s) + ' s ago' : 'no GPS log';
+  let h = '';
+  if (gp.fix !== undefined) {
+    h += '<b>fix</b><span class="' + fixCls(gp.fix) + '">' + gp.fix + '</span><b>satellites</b><span>' + gp.nsv + '</span>' +
+         '<b>accuracy</b><span>h ' + gp.hacc_m + ' m · v ' + gp.vacc_m + ' m</span>' +
+         '<b>position</b><span>' + gp.lat.toFixed(6) + ', ' + gp.lon.toFixed(6) + ' <a target="_blank" href="https://www.openstreetmap.org/?mlat=' + gp.lat + '&mlon=' + gp.lon + '#map=17/' + gp.lat + '/' + gp.lon + '">map</a></span>' +
+         '<b>height</b><span>' + gp.hmsl_m + ' m MSL · ' + gp.height_m + ' m ellipsoid</span><b>speed</b><span>' + gp.speed_ms + ' m/s</span>' +
+         '<b>GPS time</b><span>' + (gp.utc || 'not valid') + '</span>';
+  } else if (gp.present) h += '<b>fix</b><span class="bad">no NAV-PVT in the last 64 kB of the log</span>';
+  else h += '<b>fix</b><span>start recording (or ewego-gps) to see the receiver</span>';
+  h += '<b>PPS</b>' + (!pps.present ? '<span class="bad">no device</span>' : pps.pulses ? '<span class="ok">live</span> <span>seq ' + pps.seq + (pps.rate_hz != null ? ' · ' + pps.rate_hz.toFixed(2) + ' Hz' : '') + ' · clock ' + (pps.clock_offset_ms >= 0 ? '+' : '') + pps.clock_offset_ms + ' ms</span>' : '<span class="bad">no pulse</span>');
+  $('gps').innerHTML = h;
+  $('gpsq').innerHTML = gp.fix !== undefined ? 'GPS <span class="' + fixCls(gp.fix) + '">' + gp.fix + '</span> ' + gp.nsv + ' sv · ' + gp.hacc_m + ' m' : 'GPS: no data';
+}
+let lastSnap = 0;
+function update(s) {
+  lastSnap = Date.now();
+  $('host').textContent = 'EweGo live · ' + s.hostname;
+  const st = $('state'); st.className = 'badge ' + (s.recording ? 'rec' : s.preview.running ? 'pre' : '');
+  st.textContent = s.recording ? 'RECORDING' : s.preview.running ? 'PREVIEW' : 'IDLE';
+  $('pv').textContent = s.preview.running ? 'Stop preview' : 'Preview (no recording)'; $('pv').classList.toggle('on', s.preview.running);
+  $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>' : 'battery ' + s.battery.voltage + ' V · <span class="' + (s.battery.soc < 15 ? 'bad' : s.battery.soc < 30 ? 'warn' : '') + '">' + s.battery.soc.toFixed(0) + ' %</span>';
+  $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
+  $('load').textContent = 'load ' + s.load.toFixed(2) + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
+  for (const n in cams) camLine(n, s.cam[n]);
+  imuLine(s.imu);
+  if (s.imu && s.imu.rows && s.imu.rows.length) { addRows(s.imu.rows); draw(); }
+  gpsBlock(s.gps, s.pps);
+  $('sys').innerHTML = '<b>preview</b><span>' + (s.preview.message || 'off') + '</span><b>clock</b><span>' + new Date(s.t * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC</span>';
+  $('units').innerHTML = Object.entries(s.units).map(([u, a]) => '<tr><td style="padding:2px 8px 2px 0">' + u + '</td><td class="' + (a === 'active' ? 'ok' : a === 'failed' ? 'bad' : '') + '">' + a + '</td></tr>').join('');
+}
+function connect() {
+  const es = new EventSource('/api/live/events');
+  es.onmessage = e => { try { update(JSON.parse(e.data)); } catch (err) { $('msg').textContent = 'bad update: ' + err; } };
+  es.onerror = () => { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; };
+}
+setInterval(() => { if (Date.now() - lastSnap > 5000) { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; } }, 2000);
+
+// ---- controls ----
+async function post(url) { const r = await fetch(url, {method: 'POST'}); return r.json(); }
+async function preview() {
+  const on = $('pv').classList.contains('on');
+  const r = await post('/api/preview/' + (on ? 'stop' : 'start'));
+  $('msg').textContent = r.message;
+  if (!on && r.ok) setTimeout(restartCams, 1500);
+}
+async function rec(action) {
+  $('msg').textContent = action + 'ing recorder…';
+  const r = await post('/api/unit/ewego-record.target/' + action);
+  $('msg').textContent = 'systemctl ' + action + ' ewego-record.target → rc ' + r.rc + (r.output ? ' ' + r.output.trim() : '');
+  setTimeout(restartCams, 3000);
+}
+async function power(action) {
+  if (!confirm((action === 'poweroff' ? 'Shut down' : 'Reboot') + ' the wearable? Recording stops first and every recorder writes its summary.')) return;
+  $('msg').textContent = 'stopping recorders…';
+  const r = await post('/api/power/' + action);
+  $('msg').textContent = r.message;
+}
+restartCams(); connect();
 </script>
 </body></html>
 """

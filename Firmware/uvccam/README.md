@@ -82,6 +82,19 @@ line to `systemctl status` via the notify socket.
 - Wall time: `realtime_minus_monotonic_us` in the summary, taken at start
   and at end, converts the monotonic stamps to UTC for a session.
 
+## Live view
+
+`--live DIR` keeps two small files in DIR (meant for tmpfs, `/run/ewego`
+on the image): `<name>.jpg`, the newest frame, replaced atomically at most
+five times a second from the writer thread, and `<name>.json`, the
+counters (frames, lost, overruns, fps over the last second, write max,
+queue), rewritten once a second. The web console's `/live` page streams the
+JPEG to the browser at the rate you choose there, so the Wi-Fi cost is
+yours to set (a 1080p MJPEG frame is 150–300 kB). `--preview --live DIR`
+streams the camera into those files and records nothing; the console uses
+it to show the cameras before a recording starts. Both files are removed at
+exit.
+
 ## Under systemd
 
 `ewego-cam@camera1.service` and `ewego-cam@camera2.service` read
@@ -89,6 +102,7 @@ line to `systemctl status` via the notify socket.
 OUT_DIR, EXTRA_ARGS). Installed on the image, not enabled. DEVICE defaults
 to `auto:1/2` / `auto:2/2`; pin a `port:` from `ewego-cam --list` only if a
 specific physical side must keep a name when the hub wiring changes.
+EXTRA_ARGS defaults to `--stats 5 --live /run/ewego`.
 
 ## Build
 

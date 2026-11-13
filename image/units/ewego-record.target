@@ -1,6 +1,6 @@
 [Unit]
 Description=EweGo recorder: USB cameras, USB IMU, GPS, audio, fuel gauge
-Documentation=file:///opt/ewego/image/README.md
+Documentation=https://github.com/kemerelab/EweGo/blob/phase-a-image/image/README.md
 # The default recording set. Starting the target starts every unit listed
 # here; each of them is PartOf= this target, so stopping or restarting the
 # target does the same to all of them. Any unit can still be run alone.

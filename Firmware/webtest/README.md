@@ -15,8 +15,9 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
   voicehat sound card and any cameras exist, plus buttons for serial port
   mapping, `i2cdetect`, USB tree, ALSA cards, the effective `config.txt`,
   and a `dmesg` tail.
-- **Units**: state of `ewego-sensors`, `ewego-gps`, `ewego-dualcam`, with
-  start/stop, journal tail, and a listing of session directories.
+- **Units**: state of `ewego-record.target` and its members (`ewego-cam@camera1/2`,
+  `ewego-imu-usb`, `ewego-gps`, `ewego-audio`, `ewego-fuel`), with
+  start/stop, journal tail, and a listing of recording directories.
 - **Fuel gauge**: read voltage, SOC, IC version.
 - **IMU**: run `log_imu_data.py` for N seconds and watch it.
 - **GPS**: raw read of the port at a chosen baud rate (counts UBX sync
@@ -41,7 +42,8 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
   were, error-flagged frames, effective fps, min/max inter-frame interval,
   and data rate, then PASS/FAIL and any recent UVC/USB kernel messages.
   This is the bench test for two cameras on a hub.
-- **All-sensors recorder**: start/stop `ewego-sensors`, journal, sessions.
+- **Recorder**: start/stop `ewego-record.target` (all recorders at once),
+  camera and IMU journals, recording directories.
 
 ## Running it
 

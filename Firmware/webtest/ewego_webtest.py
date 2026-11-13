@@ -33,7 +33,8 @@ from urllib.parse import parse_qs, urlparse
 
 EWEGO = Path(os.environ.get("EWEGO_DIR", "/opt/ewego"))
 RUN_DIR = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/ewego-webtest"))
-UNITS = ["ewego-sensors", "ewego-gps", "ewego-dualcam", "ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb"]
+UNITS = ["ewego-record.target", "ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb",
+         "ewego-gps", "ewego-audio", "ewego-fuel"]
 GPS_PORT = "/dev/ttyAMA4"
 GPS_BAUD = 460800
 IMU_PORT = "/dev/ttyAMA5"
@@ -369,7 +370,9 @@ def sessions():
     out = []
     if not EWEGO.exists():
         return out
-    candidates = list(EWEGO.glob("sensor_test_*")) + list((EWEGO / "recordings").glob("*")) \
+    # recordings/<unit>/<YYYYmmdd_HHMMSS>/ from the C recorders and the audio/fuel
+    # units; sensor_test_* and gps-logs/ from the older Python scripts
+    candidates = list(EWEGO.glob("sensor_test_*")) + list((EWEGO / "recordings").glob("*/*")) \
         + list((EWEGO / "gps-logs").glob("*"))
     for p in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[:40]:
         if p.is_dir():
@@ -1189,7 +1192,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        m = re.fullmatch(r"/api/unit/([a-z0-9@-]+)/(start|stop|restart)", u.path)
+        m = re.fullmatch(r"/api/unit/([a-z0-9@.-]+)/(start|stop|restart)", u.path)
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
@@ -1237,7 +1240,7 @@ class Handler(BaseHTTPRequestHandler):
                 lock.release()
 
     def journal(self, q):
-        unit = q.get("unit", ["ewego-sensors"])[0]
+        unit = q.get("unit", ["ewego-cam@camera1"])[0]
         n = min(int(q.get("n", ["100"])[0]), 2000)
         if unit not in UNITS + ["ewego-webtest"]:
             self.send_json({"error": "unknown unit"}, 404)
@@ -1365,7 +1368,7 @@ PAGE = r"""<!doctype html>
   <h2>Units</h2>
   <table><thead><tr><th>unit</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody id="units"></tbody></table>
   <div class="row">
-    <select id="jr-unit"><option>ewego-sensors</option><option>ewego-gps</option><option>ewego-dualcam</option><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-webtest</option></select>
+    <select id="jr-unit"><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-gps</option><option>ewego-audio</option><option>ewego-fuel</option><option>ewego-record.target</option><option>ewego-webtest</option></select>
     <button onclick="journal()">Journal tail</button>
     <button onclick="listSessions()">Sessions</button>
   </div>
@@ -1462,11 +1465,12 @@ PAGE = r"""<!doctype html>
 </section>
 
 <section class="card wide">
-  <h2>All-sensors recorder (ewego-sensors)</h2>
+  <h2>Recorder (ewego-record.target: cameras, USB IMU, GPS, audio, fuel gauge)</h2>
   <div class="row">
-    <button class="primary" onclick="unit('ewego-sensors','start')">Start</button>
-    <button onclick="unit('ewego-sensors','stop')">Stop</button>
-    <button onclick="journal('ewego-sensors','out-rec')">Journal</button>
+    <button class="primary" onclick="unit('ewego-record.target','start')">Start all</button>
+    <button onclick="unit('ewego-record.target','stop')">Stop all</button>
+    <button onclick="journal('ewego-cam@camera1','out-rec')">camera1 journal</button>
+    <button onclick="journal('ewego-imu-usb','out-rec')">IMU journal</button>
     <button onclick="listSessions('out-rec')">Sessions</button>
   </div>
   <pre id="out-rec" class="tall"></pre>

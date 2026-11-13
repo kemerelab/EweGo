@@ -52,6 +52,15 @@ jobs:
               grep -q "^\[$s\]" "$u" || { echo "$u: missing [$s]"; exit 1; }
             done
           done
+          for u in image/units/*.target; do
+            for s in Unit Install; do
+              grep -q "^\[$s\]" "$u" || { echo "$u: missing [$s]"; exit 1; }
+            done
+            # every unit the target wants must ship in the image
+            for w in $(grep -h "^Wants=" "$u" | cut -d= -f2); do
+              f=image/units/${w%%@*.service}@.service; [ -f "$f" ] || [ -f "image/units/$w" ] || { echo "$u wants $w, not in image/units"; exit 1; }
+            done
+          done
       - name: Vendor pure-Python packages
         run: bash image/vendor-pylib.sh build/pylib
       - uses: actions/upload-artifact@v6
@@ -136,7 +145,8 @@ jobs:
           echo "--- /etc/ewego-image-release"; cat rootmnt/etc/ewego-image-release
           echo "--- units"; ls -la rootmnt/etc/systemd/system/ewego-*
           echo "--- pylib"; ls rootmnt/opt/ewego/pylib
-          echo "--- picamera2"; ls -d rootmnt/usr/lib/python3/dist-packages/picamera2
+          echo "--- no picamera2"; ! ls -d rootmnt/usr/lib/python3/dist-packages/picamera2 2>/dev/null
+          echo "--- record target"; cat rootmnt/etc/systemd/system/ewego-record.target
           echo "--- patched uvcvideo"; ls -la rootmnt/lib/modules/*/updates/uvcvideo.ko; cat rootmnt/etc/modprobe.d/ewego-uvc.conf
           echo "--- ewego-cam"; ls -la rootmnt/usr/local/bin/ewego-cam; file rootmnt/usr/local/bin/ewego-cam; ls rootmnt/etc/ewego/
           echo "--- cloud-init: no apt at first boot"; cat rootmnt/etc/cloud/cloud.cfg.d/99-ewego-no-apt.cfg

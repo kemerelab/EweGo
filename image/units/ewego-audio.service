@@ -1,0 +1,20 @@
+[Unit]
+Description=EweGo audio recorder (stereo mics via arecord)
+Documentation=file:///opt/ewego/Firmware/audio/README.md
+After=local-fs.target sound.target
+PartOf=ewego-record.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ewego/audio.conf
+# One timestamped directory per start, like the other recorders:
+# $OUT_DIR/<YYYYmmdd_HHMMSS>/audio.wav (48 kHz, stereo, S32_LE).
+ExecStart=/bin/sh -c 'd="$OUT_DIR/$(date +%%Y%%m%%d_%%H%%M%%S)"; mkdir -p "$d"; exec /usr/bin/python3 -u /opt/ewego/Firmware/audio/record_audio.py --output "$d/audio.wav" $DEVICE_ARG'
+# SIGINT reaches arecord too (default KillMode), so it finishes the WAV header
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

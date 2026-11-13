@@ -11,10 +11,9 @@ enable_uart=1
 # cmdline.txt console=serial0,115200 then lands there.
 dtoverlay=disable-bt
 
-# Camera configuration (dual IMX708 on CSI). Harmless when using USB cameras.
+# Cameras are USB (UVC, recorded by ewego-cam): no CSI camera overlays, and
+# no auto-detect so libcamera never probes the CSI ports.
 camera_auto_detect=0
-dtoverlay=imx708,cam0
-dtoverlay=imx708,cam1
 
 # Audio (stereo PDM mics through the voicehat soundcard overlay)
 dtoverlay=googlevoicehat-soundcard
@@ -36,5 +35,3 @@ dtoverlay=uart5
 # Fuel gauge MAX17048 on I2C bus 1 (GPIO 2/3)
 dtparam=i2c_arm=on
 
-# GPU memory for H.264 encoding
-gpu_mem=256

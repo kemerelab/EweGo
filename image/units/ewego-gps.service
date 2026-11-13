@@ -2,6 +2,7 @@
 Description=EweGo GPS logger (raw UBX + time sync CSV)
 Documentation=file:///opt/ewego/Firmware/gps-test/GPS_SERVICE_SETUP.md
 After=local-fs.target
+PartOf=ewego-record.target
 StartLimitIntervalSec=200
 StartLimitBurst=5
 

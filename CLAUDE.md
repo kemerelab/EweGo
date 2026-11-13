@@ -28,14 +28,16 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
 - Keep C ports byte-compatible with the existing CSV / .ubx / int64-µs
   timestamp outputs so `play_with_timestamps.py` keeps working.
 
-## State (2026-09-09)
+## State (2026-11-12)
 
 - Branch `phase-a-image` (not merged to main). Releases v0.1.0 … v0.2.3
   built green. Test collar: hostname `ewego`, user `kemerelab`, web console
   at http://ewego.local:8080.
-- Phase A done: Python firmware installed but not enabled; units
-  `ewego-sensors`, `ewego-gps`, `ewego-dualcam` (disabled) and
-  `ewego-webtest` (enabled). Wi-Fi/hostname/user via Imager customisation.
+- Recording units (all installed, disabled until started): `ewego-record.target`
+  = `ewego-cam@camera1/2` + `ewego-imu-usb` + `ewego-gps` + `ewego-audio` +
+  `ewego-fuel`; `ewego-webtest` enabled. Wi-Fi/hostname/user via Imager
+  customisation. (Phase A's `ewego-sensors`/`ewego-dualcam` units were
+  removed 2026-11-12; see below.)
 - GPS: data on UART4 (`/dev/ttyAMA4` @ 460800), module UART2 on GPIO 4/5 is
   unused and left as unpulled inputs (`gpio=4,5=ip,pn`). Nav rate lowered to
   5 Hz (`CFG-RATE-MEAS` 200). TP1 PPS on GPIO 6 → `/dev/pps0`
@@ -121,9 +123,21 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   has README.md + NOTES.md. hub_cam is laid out, not fabricated; on it the
   cameras move to hub ports 1/3 (expect `port:1.1`/`port:1.3`). The image
   build now ignores `Hardware/**`.
+- 2026-11-12: `ewego-sensors` on the collar failed with "Control
+  FrameDurationLimits is not advertised by libcamera": with no CSI cameras,
+  libcamera handed Picamera2 the USB webcams through its UVC pipeline. The
+  USB setup is now the default: `ewego-record.target` wants
+  `ewego-cam@camera1/2`, `ewego-imu-usb`, `ewego-gps`, `ewego-audio`
+  (record_audio.py/arecord), `ewego-fuel` (new `Firmware/fuel_gauge/
+  log_fuel_gauge.py`); members are `PartOf=` the target. `ewego-sensors`
+  and `ewego-dualcam` units, `python3-picamera2`, the imx708 overlays and
+  `gpu_mem=256` are gone from the image (scripts stay in Firmware/ for
+  reference). cam confs default to port:1.3/1.4. Console: Recorder card
+  drives the target; the unit regex now allows the `.target` dot.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
-  burst reads; then a systemd target replacing sensor_test.py.
+  burst reads (the systemd target replacing sensor_test.py exists since
+  2026-11-12: `ewego-record.target`).
 - Known limits: NetworkManager still in use (SD corruption after power
   loss, bug 001, until low-battery shutdown lands); no RTC on the CM4.
   (NTRIP is no longer hard-coded: `--ntrip HOST:PORT/MOUNT` with a 5 s

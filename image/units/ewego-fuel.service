@@ -1,0 +1,18 @@
+[Unit]
+Description=EweGo fuel gauge logger (MAX17048 on I2C1)
+Documentation=file:///opt/ewego/Firmware/fuel_gauge/README.md
+After=local-fs.target
+PartOf=ewego-record.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ewego/fuel.conf
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/fuel_gauge/log_fuel_gauge.py --out ${OUT_DIR} --interval ${INTERVAL}
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -2,6 +2,7 @@
 Description=EweGo USB IMU logger (hub_imu, BNO055 over HID)
 Documentation=file:///opt/ewego/Firmware/usbimu/README.md
 After=local-fs.target
+PartOf=ewego-record.target
 
 [Service]
 Type=simple

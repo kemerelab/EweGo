@@ -181,11 +181,12 @@ done
 
 # --- rootfs: units (installed, deliberately not enabled) ------------------
 log "Installing systemd units (not enabled)"
-for u in "$IMAGE_DIR"/units/*.service; do
+for u in "$IMAGE_DIR"/units/*.service "$IMAGE_DIR"/units/*.target; do
     install -m 644 "$u" "$ROOT_MNT/etc/systemd/system/$(basename "$u")"
 done
 # make sure a re-run never leaves a stale enable symlink behind
-rm -f "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.service
+rm -f "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.service \
+      "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.target
 
 # The only unit enabled by default is the web test console (port 8080,
 # no authentication), so a freshly flashed collar can be exercised from a
@@ -356,4 +357,4 @@ sync
 log "done: EweGo $EWEGO_VERSION injected into $TARGET"
 echo "    units installed: $(ls "$IMAGE_DIR"/units | tr '\n' ' ')"
 echo "    enabled by default: $ENABLE_UNITS (web console at http://<host>:8080)"
-echo "    start recording on the collar with: sudo systemctl start ewego-sensors"
+echo "    start recording on the wearable with: sudo systemctl start ewego-record.target"

@@ -2,6 +2,7 @@
 Description=EweGo USB camera recorder (%i)
 Documentation=file:///opt/ewego/Firmware/uvccam/README.md
 After=local-fs.target
+PartOf=ewego-record.target
 
 [Service]
 Type=notify

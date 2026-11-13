@@ -103,8 +103,9 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   any Debian/Ubuntu kernel (e.g. the user's Ubuntu guest in Parallels);
   patch verified against mainline v6.8/v6.14/v6.17 in CI.
 - **Collar PASS 2026-10-05:** bus-test.py on v0.5.1: both cameras 600/600
-  frames at 1080p30, IMU 100 Hz 0 lost, one bus. Cameras are on hub ports
-  1.3 and 1.4 (`port:1.3` / `port:1.4` for /etc/ewego/cam-camera*.conf).
+  frames at 1080p30, IMU 100 Hz 0 lost, one bus. Cameras were on hub ports
+  1.3 and 1.4 on the hand-wired hub; on hub_cam (in use since 2026-11-12)
+  they are `port:1.1` / `port:1.3`.
   udev makes -usb- and -usbv2- by-path links per camera; listings dedupe
   by device node (1d5267b).
 - **2026-10-06 production run:** all three units together: 7.5 min clean
@@ -132,7 +133,8 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   log_fuel_gauge.py`); members are `PartOf=` the target. `ewego-sensors`
   and `ewego-dualcam` units, `python3-picamera2`, the imx708 overlays and
   `gpu_mem=256` are gone from the image (scripts stay in Firmware/ for
-  reference). cam confs default to port:1.3/1.4. Console: Recorder card
+  reference). cam confs default to port:1.1/1.3 (hub_cam; the hand-wired hub was 1.3/1.4,
+  which v0.6.0 shipped and recorded only one camera on the collar). Console: Recorder card
   drives the target; the unit regex now allows the `.target` dot.
 - After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with

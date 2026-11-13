@@ -1211,6 +1211,13 @@ class Preview:
 PREVIEW = Preview()
 
 
+def units_active():
+    """active/inactive/failed for every unit in one systemctl call."""
+    rc, out = sh(["systemctl", "is-active"] + UNITS)
+    lines = out.split()
+    return {u: (lines[i] if i < len(lines) else out.strip()) for i, u in enumerate(UNITS)}
+
+
 def live_json(name):
     p = LIVE_DIR / f"{name}.json"
     try:
@@ -1306,7 +1313,7 @@ def cached(key, ttl, fn):
 def live_snapshot():
     """Everything the live page shows, in one object (sent 4x a second over SSE).
     Cheap file reads every time; subprocess- or bus-backed values are cached."""
-    units = cached("units", 2.0, lambda: {u: unit_status(u)["active"] for u in UNITS})
+    units = cached("units", 2.0, units_active)
     du = cached("disk", 5.0, lambda: shutil.disk_usage(EWEGO if EWEGO.exists() else "/"))
     try:
         temp = int(Path("/sys/class/thermal/thermal_zone0/temp").read_text()) / 1000.0
@@ -1491,7 +1498,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
-                if action != "stop" and PREVIEW.stop("stopped for the recorder"):
+                if action != "stop" and (unit == "ewego-record.target" or unit in RECORDERS) \
+                        and PREVIEW.stop("stopped for the recorder"):
                     time.sleep(1)   # let the preview processes release the cameras
                 rc, out = sh(["systemctl", action, unit], timeout=45)
                 self.send_json({"rc": rc, "output": out, "status": unit_status(unit)})

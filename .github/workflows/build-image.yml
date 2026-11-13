@@ -22,7 +22,7 @@ jobs:
   # Cheap checks on every push: scripts parse and lint, the Python firmware
   # at least compiles, and the vendored packages are really pure Python.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest became 26.04 (2026-11), where qemu-user-static is not installable
     steps:
       - uses: actions/checkout@v5
       - name: Shell scripts
@@ -92,7 +92,7 @@ jobs:
   image:
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     needs: check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest became 26.04 (2026-11), where qemu-user-static is not installable
     permissions:
       contents: write
     steps:

@@ -20,7 +20,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # ubuntu-latest became 26.04 (2026-11), where qemu-user-static is not installable
     permissions:
       contents: write
     steps:

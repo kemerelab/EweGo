@@ -182,6 +182,10 @@ def check_imu(d, name="imu"):
         notes.append(f"device clock drift {s['device_minus_host_drift_ppm']:.0f} ppm vs host")
     if s.get("late_ticks"):
         notes.append(f"{s['late_ticks']} late ticks (reader fell a whole period behind)")
+    if s.get("i2c_us_max", 0) > 8000:
+        verdict = "WARN" if verdict == "PASS" else verdict
+        notes.append(f"module I2C burst up to {s['i2c_us_max'] / 1000:.1f} ms of the 10 ms period (normal 5 ms): the BNO055 "
+                     "is stretching the clock; a module reset restores it (seen 2026-11-14 at 9.5 ms, every other sample lost on hubimu-v0.3.0)")
     expected = s.get("rate_hz", 100)
     if abs(s["effective_hz"] - expected) > 1:
         verdict = "WARN" if verdict == "PASS" else verdict

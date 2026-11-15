@@ -2271,7 +2271,7 @@ function makeImu(sfx, what) {
     const bad = st.lost || st.queue_overruns || st.flagged;
     const timing = st.xfer_us_max !== undefined
       ? ' · uart round trip max ' + (st.xfer_us_max / 1000).toFixed(1) + ' ms · jitter max ' + (st.jitter_us_max / 1000).toFixed(1) + ' ms'
-      : ' · drift ' + (st.drift_ppm >= 0 ? '+' : '') + st.drift_ppm + ' ppm';
+      : ' · drift ' + (st.drift_ppm >= 0 ? '+' : '') + st.drift_ppm + ' ppm · i2c max ' + (st.i2c_us_max > 8000 ? '<span class="warn">' + (st.i2c_us_max / 1000).toFixed(1) + ' ms (sensor slow: re-plug the module)</span>' : (st.i2c_us_max / 1000).toFixed(1) + ' ms');
     el('s-imu').innerHTML = (st.preview ? 'preview' : 'recording') + ' · ' + st.hz.toFixed(1) + ' Hz · ' + st.samples + ' samples · ' + (bad ? '<span class="bad">' : '') +
       (st.read_errors !== undefined ? st.read_errors + ' read errors, ' : st.lost + ' lost, ' + st.flagged + ' flagged, ') + st.queue_overruns + ' overruns' + (bad ? '</span>' : '') +
       timing + ' · queue peak ' + st.queue_peak + ' · ' + fmtDur(st.elapsed_s) +

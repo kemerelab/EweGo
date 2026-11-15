@@ -187,8 +187,13 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   else on the bus. Fix hubimu-v0.3.1: `bno055_yield()` (tud_task) inside
   `wait_flag`, a report that finds the endpoint busy is held and sent on
   the next main-loop pass (`held` counter in `stats`), DROPPED only when
-  the held one is overwritten. Open question: why the burst grew to 9.5 ms
-  (BNO055 clock stretching; check I2C speed actually achieved).
+  the held one is overwritten. After a module reset the burst was 5.25 ms
+  and the stream clean (0 lost / 20 s) on the old firmware, so the trigger
+  was the BNO055 drifting into a slow-stretching state during a 65-minute
+  session; cause unknown, a reset recovers it. ewego-check and the live
+  page warn when i2c_us_max > 8 ms. The console `dfu` command reboots the
+  module but it comes back in the application (bootloader jump does not
+  take on this board): flash with BOOT0 high at plug-in.
 - After that (Phase C): C port of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown.
 - Known limits: NetworkManager still in use (SD corruption after power

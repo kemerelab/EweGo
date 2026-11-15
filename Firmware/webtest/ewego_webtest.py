@@ -1298,6 +1298,23 @@ def gps_live():
 
 
 _LIVE_CACHE = {}
+_TX = {"sec": 0, "bytes": 0, "rate": 0}
+_TX_LOCK = threading.Lock()
+
+
+def tx_add(n):
+    """Count bytes sent on the camera view streams; per-second rate for the page."""
+    with _TX_LOCK:
+        sec = int(time.monotonic())
+        if sec != _TX["sec"]:
+            _TX["rate"] = _TX["bytes"] if sec == _TX["sec"] + 1 else 0
+            _TX["sec"], _TX["bytes"] = sec, 0
+        _TX["bytes"] += n
+
+
+def tx_rate():
+    with _TX_LOCK:
+        return _TX["rate"] if int(time.monotonic()) - _TX["sec"] <= 1 else 0
 
 
 def cached(key, ttl, fn):
@@ -1336,6 +1353,7 @@ def live_snapshot():
         "disk": {"free_gb": round(du.free / 1e9, 2), "total_gb": round(du.total / 1e9, 2)},
         "load": os.getloadavg()[0],
         "temp_c": temp,
+        "view_bytes_per_s": tx_rate(),
     }
 
 
@@ -1555,14 +1573,12 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def live_cam(self, q, name):
-        """The recorder's (or preview's) newest frame as a stream of parts
-        (--frame / Content-Length / blank line / JPEG), at most `fps` a second
-        and only when the frame changed. The file is replaced atomically, so
-        every read is a whole JPEG. Sent as application/octet-stream for the
-        live page's fetch() reader: browsers run their own multipart splitter
-        on multipart/x-mixed-replace and a fetch reader may then see only the
-        first part. `native=1` labels it multipart/x-mixed-replace for a
-        plain <img src>, the fallback the page uses if its reader fails."""
+        """multipart/x-mixed-replace of the recorder's (or preview's) newest
+        frame for a plain <img>, at most `fps` a second and only when the
+        frame changed. The file is replaced atomically, so every read is a
+        whole JPEG. The bytes sent are counted for the page's rate display
+        (a fetch()-side reader was tried first and showed nothing in the
+        field browser, while <img> works everywhere as the test page shows)."""
         if name not in CAMERAS:
             self.send_json({"error": "unknown camera"}, 404)
             return
@@ -1572,10 +1588,8 @@ class Handler(BaseHTTPRequestHandler):
             fps = 2.0
         p = LIVE_DIR / f"{name}.jpg"
         self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame" if q.get("native")
-                         else "application/octet-stream")
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         last_mtime, last_sent = None, 0.0
         try:
@@ -1598,6 +1612,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                          + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
                         self.wfile.flush()
+                        tx_add(len(data))
                         last_mtime, last_sent = st.st_mtime_ns, now
                 time.sleep(0.05)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -2130,65 +2145,22 @@ const SERIES = [getComputedStyle(document.documentElement).getPropertyValue('--s
                 getComputedStyle(document.documentElement).getPropertyValue('--s2').trim(),
                 getComputedStyle(document.documentElement).getPropertyValue('--s3').trim()];
 
-// ---- cameras: one multipart stream per camera, parsed by hand so the page can count bytes ----
+// ---- cameras: a plain <img> on a multipart stream per camera, as on the test
+// page (a fetch() reader showed nothing in the field browser). The wearable
+// counts the bytes it sends; the header shows that rate.
 const cams = {camera1: {}, camera2: {}};
-let paused = false, bytesThisSec = 0, kbps = 0;
-setInterval(() => { kbps = bytesThisSec / 1024; bytesThisSec = 0; $('link').textContent = 'views ' + kbps.toFixed(0) + ' kB/s'; }, 1000);
-
-function findSeq(buf, seq, from) {
-  outer: for (let i = from; i <= buf.length - seq.length; i++) {
-    for (let j = 0; j < seq.length; j++) if (buf[i+j] !== seq[j]) continue outer;
-    return i;
-  }
-  return -1;
+let paused = false;
+function streamCam(name) {
+  const img = $('img-' + name);
+  if (paused) { img.removeAttribute('src'); return; }
+  img.onload = () => { cams[name].shown = (cams[name].shown || 0) + 1; cams[name].lastFrame = Date.now(); };
+  img.src = '/api/live/cam/' + name + '?fps=' + $('rate').value + '&t=' + Date.now();
 }
-const CRLF2 = [13,10,13,10];
-
-async function streamCam(name) {
-  const c = cams[name];
-  if (c.ctl) c.ctl.abort();
-  if (paused) return;
-  const ctl = new AbortController(); c.ctl = ctl;
-  try {
-    const r = await fetch('/api/live/cam/' + name + '?fps=' + $('rate').value + '&t=' + Date.now(), {signal: ctl.signal});
-    const reader = r.body.getReader();
-    let buf = new Uint8Array(0);
-    for (;;) {
-      const {value, done} = await reader.read(); if (done) break;
-      bytesThisSec += value.length;
-      const nb = new Uint8Array(buf.length + value.length); nb.set(buf); nb.set(value, buf.length); buf = nb;
-      for (;;) {
-        const h = findSeq(buf, CRLF2, 0); if (h < 0) { if (buf.length > 1<<20) buf = new Uint8Array(0); break; }
-        const hdr = new TextDecoder().decode(buf.subarray(0, h));
-        const m = /Content-Length:\s*(\d+)/i.exec(hdr);
-        if (!m) { buf = buf.subarray(h + 4); continue; }
-        const len = +m[1]; if (buf.length < h + 4 + len) break;
-        const body = buf.slice(h + 4, h + 4 + len); buf = buf.subarray(h + 4 + len);
-        showFrame(name, new Blob([body], {type: 'image/jpeg'}), len);
-      }
-    }
-  } catch (e) { /* aborted or dropped */ }
-  if (!ctl.signal.aborted) setTimeout(() => streamCam(name), 2000);
-}
-function showFrame(name, blob, len) {
-  const c = cams[name], img = $('img-' + name), url = URL.createObjectURL(blob);
-  c.received = (c.received || 0) + 1;
-  img.onload = () => { if (c.shown) URL.revokeObjectURL(c.shown); c.shown = url; c.decoded = (c.decoded || 0) + 1; c.lastFrame = Date.now(); };
-  img.onerror = () => { URL.revokeObjectURL(url); c.decodeErrors = (c.decodeErrors || 0) + 1; };
-  img.src = url; c.frameBytes = len;
-  // frames arrive but the browser shows none: hand the stream to a plain <img>
-  if (!c.native && c.received >= 4 && !c.decoded) nativeCam(name);
-}
-function nativeCam(name) {
-  const c = cams[name]; if (c.ctl) c.ctl.abort(); c.native = true;
-  const img = $('img-' + name); img.onload = null; img.onerror = null;
-  img.src = '/api/live/cam/' + name + '?fps=' + $('rate').value + '&native=1&t=' + Date.now();
-}
-function restartCams() { for (const n in cams) { if (cams[n].native) nativeCam(n); else streamCam(n); } }
+function restartCams() { for (const n in cams) streamCam(n); }
 $('rate').onchange = restartCams;
 function togglePause() {
   paused = !paused; $('pause').textContent = paused ? 'Resume views' : 'Pause views'; $('pause').classList.toggle('on', paused);
-  if (paused) { for (const n in cams) { if (cams[n].ctl) cams[n].ctl.abort(); if (cams[n].native) $('img-' + n).removeAttribute('src'); } } else restartCams();
+  restartCams();
 }
 function flip(name) {
   const img = $('img-' + name); img.classList.toggle('flip');
@@ -2285,9 +2257,7 @@ function camLine(name, c) {
 }
 function browserLine(name) {
   const c = cams[name];
-  if (c.native) return ' · browser: native image stream' + (kbps ? '' : ' (bytes not counted)');
-  if (c.decodeErrors) return ' · <span class="bad">browser could not decode ' + c.decodeErrors + ' frame(s)</span>';
-  return c.received ? ' · browser: ' + c.received + ' frames received, ' + (c.decoded || 0) + ' shown' : ' · browser: waiting for the first frame';
+  return paused ? ' · views paused' : c.shown ? ' · browser: ' + c.shown + ' frame(s) shown' : ' · browser: waiting for the first frame';
 }
 function imuLine(st) {
   if (!st) { $('s-imu').textContent = 'no data: not recording and no preview'; return; }
@@ -2323,6 +2293,7 @@ function update(s) {
   $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>' : 'battery ' + s.battery.voltage + ' V · <span class="' + (s.battery.soc < 15 ? 'bad' : s.battery.soc < 30 ? 'warn' : '') + '">' + s.battery.soc.toFixed(0) + ' %</span>';
   $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
   $('load').textContent = 'load ' + s.load.toFixed(2) + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
+  $('link').textContent = 'views ' + (s.view_bytes_per_s / 1024).toFixed(0) + ' kB/s sent';
   for (const n in cams) camLine(n, s.cam[n]);
   imuLine(s.imu);
   if (s.imu && s.imu.rows && s.imu.rows.length) { addRows(s.imu.rows); draw(); }

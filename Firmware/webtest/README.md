@@ -60,8 +60,9 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
   in the browser) for a wearable mounted upside down, and a stats line
   (fps, frames, lost/overruns, write max, queue). The frames are the
   recorders' own: `ewego-cam --live /run/ewego` keeps the newest JPEG on
-  tmpfs and the page fetches it as a multipart stream at the **view rate**
-  you pick (0.5–5 fps; the header shows the measured kB/s). A 1080p MJPEG
+  tmpfs and the page shows it as a plain multipart image stream (the same
+  mechanism as the test console's camera view) at the **view rate** you
+  pick (0.5–5 fps; the header shows the kB/s the wearable is sending). A 1080p MJPEG
   frame is 150–300 kB, so 2 fps for two cameras is roughly 1 MB/s and
   5 fps is about the most a weak Wi-Fi link will carry. *Pause views* stops
   the image streams and leaves the rest running.
@@ -83,6 +84,9 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
 
 The page is a single server-sent-events stream (4 updates a second) plus
 one multipart image stream per camera; nothing is decoded on the wearable.
+(A first version read the image streams with a JavaScript fetch so the
+browser could count bytes; it showed nothing in the field browser, so the
+images are plain `<img>` elements and the wearable counts what it sends.)
 
 ## Running it
 

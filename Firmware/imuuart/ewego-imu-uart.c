@@ -48,7 +48,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 
 #define BNO_CHIP_ID   0xA0
 #define REG_CHIP_ID   0x00
@@ -210,13 +210,37 @@ static int bno_write(int fd, uint8_t reg, uint8_t val)
 	return (rsp[0] == 0xEE && rsp[1] == 0x01) ? 0 : (rsp[1] ? rsp[1] : -1);
 }
 
+/* BNO055 UART status codes (datasheet 4.7); index 0 is our own "timeout or garbage" */
+static const char *const ERR_NAMES[16] = {
+	"timeout/garbage", "write ok", "read fail", "write fail", "invalid address", "write disabled",
+	"wrong start byte", "bus overrun", "max length", "min length", "receive timeout",
+	"0x0B", "0x0C", "0x0D", "0x0E", "0x0F",
+};
+
+/* After a failed transaction the sensor's (late) answer may still be
+ * arriving; read and discard until the line is quiet for quiet_ms, so the
+ * next request's reply is not glued to stale bytes. */
+static void drain_quiet(int fd, int quiet_ms, int max_ms)
+{
+	int64_t end = mono_us() + (int64_t)max_ms * 1000;
+	uint8_t junk[128];
+
+	while (mono_us() < end) {
+		struct pollfd p = {.fd = fd, .events = POLLIN};
+		if (poll(&p, 1, quiet_ms) <= 0)
+			return;
+		if (read(fd, junk, sizeof(junk)) <= 0)
+			return;
+	}
+}
+
 /* chip id with retries (the BNO055 UART is slow to answer after power-up), then NDOF */
-static int bno_init(int fd, int quiet)
+static int bno_init(int fd, int quiet, int attempts)
 {
 	uint8_t id = 0;
 	int i, r = -1;
 
-	for (i = 0; i < 20 && !g_stop; i++) {
+	for (i = 0; i < attempts && !g_stop; i++) {
 		tcflush(fd, TCIOFLUSH);
 		r = bno_read(fd, REG_CHIP_ID, 1, &id, 300);
 		if (r == 0 && id == BNO_CHIP_ID)
@@ -514,7 +538,8 @@ int main(int argc, char **argv)
 	FILE *csv = NULL;
 	int fd, exit_code = 0, r;
 	int64_t t_start, t_last_ok, real0, period_us, next_tick;
-	uint64_t late_ticks = 0;
+	uint64_t late_ticks = 0, err_by_code[16] = {0}, err_total = 0, reinits = 0;
+	int64_t t_last_reinit = 0;
 	uint32_t seq = 0;
 
 	while ((opt = getopt_long(argc, argv, "p:b:R:o:n:t:S:x:NrL:Pqh", lo, NULL)) != -1) {
@@ -568,7 +593,7 @@ int main(int argc, char **argv)
 	fd = uart_open(port, baud);
 	if (fd < 0)
 		return 1;
-	r = bno_init(fd, quiet);
+	r = bno_init(fd, quiet, 20);
 	if (r) {
 		fprintf(stderr, "ewego-imu-uart: %s: %s\n", port,
 			r == -1 ? "no BNO055 answered (chip id)" : "could not configure the sensor");
@@ -646,17 +671,35 @@ int main(int argc, char **argv)
 		s.tick_mono = next_tick;
 		s.seq = seq++;
 		t0 = mono_us();
-		r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, period_us > 20000 ? 20 : (int)(period_us / 1000));
-		if (r == 0x07)       /* buffer overrun: the sensor was mid-update; ask again right away */
-			r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 10);
+		/* 30 ms: the 48-byte answer takes 4.2 ms on the wire plus whatever
+		 * the sensor adds; a tick that runs long is resynchronised below */
+		r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 30);
+		if (r == 0x07) {     /* bus overrun: the sensor was mid-update; give it 2 ms and ask once more */
+			drain_quiet(fd, 2, 10);
+			r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 30);
+		}
 		now = mono_us();
 		s.host_mono = now;
 		s.host_real = real_us();
 		s.xfer_us = (uint32_t)(now - t0);
 		if (r) {
+			int code = (r > 0 && r < 16) ? r : 0;
 			s.flags |= FLAG_READ_ERROR;
-			if (r < 0)
-				tcflush(fd, TCIFLUSH);
+			err_by_code[code]++;
+			err_total++;
+			if (!quiet && (err_total <= 10 || err_total % 1000 == 0))
+				fprintf(stderr, "read error #%" PRIu64 " at %.1f s: %s (0x%02X)\n", err_total,
+					(double)(now - t_start) / 1e6, ERR_NAMES[code], r > 0 ? r : 0);
+			drain_quiet(fd, 5, 60);
+			/* two seconds without a sample: the sensor may have reset (it
+			 * comes back in config mode, silent on the fusion registers) */
+			if (now - t_last_ok > 2000000 && now - t_last_reinit > 2000000) {
+				t_last_reinit = now;
+				reinits++;
+				fprintf(stderr, "no valid sample for 2 s: re-initialising the sensor (attempt %" PRIu64 ")\n", reinits);
+				if (bno_init(fd, quiet, 3) == 0)
+					fprintf(stderr, "sensor re-initialised\n");
+			}
 			if (now - t_last_ok > (int64_t)stall * 1000000) {
 				fprintf(stderr, "no valid sample for %d s: sensor or UART gone\n", stall);
 				exit_code = 3;
@@ -714,6 +757,8 @@ int main(int argc, char **argv)
 				    "  \"rate_hz\": %d,\n  \"samples\": %" PRIu64 ",\n"
 				    "  \"lost\": %" PRIu64 ",\n  \"gaps\": %" PRIu64 ",\n  \"flagged\": %" PRIu64 ",\n"
 				    "  \"read_errors\": %" PRIu64 ",\n  \"error_runs\": %" PRIu64 ",\n  \"late_ticks\": %" PRIu64 ",\n"
+				    "  \"errors_by_code\": {\"timeout_or_garbage\": %" PRIu64 ", \"bus_overrun_07\": %" PRIu64
+				    ", \"receive_timeout_0a\": %" PRIu64 ", \"other\": %" PRIu64 "},\n  \"reinits\": %" PRIu64 ",\n"
 				    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
 				    "  \"realtime\": %d,\n"
 				    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
@@ -721,14 +766,19 @@ int main(int argc, char **argv)
 				    "  \"first_host_mono_us\": %" PRId64 ",\n"
 				    "  \"realtime_minus_monotonic_us\": %" PRId64 ",\n  \"exit_code\": %d\n}\n",
 				VERSION, port, baud, rate, w.valid, w.read_errors, w.error_runs, w.read_errors,
-				w.read_errors, w.error_runs, late_ticks, ring.overruns, ring.peak, RING_N, realtime,
+				w.read_errors, w.error_runs, late_ticks,
+				err_by_code[0], err_by_code[7], err_by_code[10],
+				err_total - err_by_code[0] - err_by_code[7] - err_by_code[10], reinits,
+				ring.overruns, ring.peak, RING_N, realtime,
 				w.dt_n ? w.dt_min : 0.0, w.dt_n ? w.dt_sum / (double)w.dt_n : 0.0, w.dt_n ? w.dt_max : 0.0, w.dt_n,
 				rate_hz(&w), w.xfer_us_max, w.jitter_us_max, w.first_host, real0 - t_start, exit_code);
 			fclose(js);
 		}
 	}
-	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s), %" PRIu64
+	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s) (timeout/garbage %" PRIu64
+		", bus overrun %" PRIu64 ", receive timeout %" PRIu64 "), %" PRIu64 " re-inits, %" PRIu64
 		" late ticks, queue peak %u, %" PRIu64 " overruns -> exit %d\n",
-		name, w.valid, w.read_errors, w.error_runs, late_ticks, ring.peak, ring.overruns, exit_code);
+		name, w.valid, w.read_errors, w.error_runs, err_by_code[0], err_by_code[7], err_by_code[10], reinits,
+		late_ticks, ring.peak, ring.overruns, exit_code);
 	return exit_code;
 }

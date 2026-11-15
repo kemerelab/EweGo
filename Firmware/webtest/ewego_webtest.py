@@ -2065,29 +2065,32 @@ LIVE_PAGE = r"""<!doctype html>
   .badge.rec { background:var(--bad); } .badge.pre { background:var(--ok); }
   .ok { color:var(--ok); font-weight:600; } .bad { color:var(--bad); font-weight:600; } .warn { color:var(--warn); font-weight:600; }
   .bar { padding:8px 16px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-bottom:1px solid var(--line); }
-  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); gap:12px; padding:12px 16px 30px; }
-  .card { background:var(--card); border:1px solid var(--line); padding:10px 12px; display:flex; flex-direction:column; gap:6px; min-width:0; }
+  /* two columns: a camera each on top, an IMU each below, so both pictures and
+     both sensors fit one laptop screen; one column on a phone */
+  main { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; padding:10px 16px 30px; }
+  @media (max-width: 760px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); padding:8px 10px; display:flex; flex-direction:column; gap:4px; min-width:0; }
   .card h2 { font-size:14px; margin:0; display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .card h2 small { color:var(--muted); font-weight:400; font-size:12px; }
   .wide { grid-column:1 / -1; }
   main > section { order:10; }
-  #sec-camera1 { order:1; } #sec-camera2 { order:2; }
+  #sec-camera1 { order:1; } #sec-camera2 { order:2; } #sec-imu { order:3; } #sec-imu-u { order:4; }
   main.swapped #sec-camera1 { order:2; } main.swapped #sec-camera2 { order:1; }
   .camwrap { position:relative; background:#000; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; overflow:hidden; }
   .camwrap img { width:100%; height:100%; object-fit:contain; display:block; }
   .camwrap img.flip { transform:rotate(180deg); }
   .camwrap .msg { position:absolute; color:#ddd; font-size:13px; background:rgba(0,0,0,.55); padding:4px 8px; display:none; }
   .camwrap.stale .msg { display:block; }
-  .stats { font:12px/1.4 ui-monospace, Menlo, Consolas, monospace; color:var(--muted); white-space:pre-wrap; }
+  .stats { font:11px/1.35 ui-monospace, Menlo, Consolas, monospace; color:var(--muted); white-space:pre-wrap; }
   button { font:inherit; font-size:13px; padding:5px 10px; border:1px solid var(--line); background:var(--code); color:var(--ink); cursor:pointer; }
   button:hover { border-color:var(--accent); }
   button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
   button.danger { border-color:var(--bad); color:var(--bad); }
   button.on { border-color:var(--accent); box-shadow:inset 0 0 0 1px var(--accent); }
   select { font:inherit; font-size:13px; padding:4px 6px; background:var(--code); color:var(--ink); border:1px solid var(--line); }
-  canvas { width:100%; height:130px; display:block; }
+  canvas { width:100%; height:72px; display:block; }
   .chart { position:relative; }
-  .legend { display:flex; gap:14px; font-size:12px; color:var(--muted); flex-wrap:wrap; }
+  .legend { display:flex; gap:10px; font-size:11px; color:var(--muted); flex-wrap:wrap; line-height:1.2; }
   .legend i { display:inline-block; width:10px; height:3px; vertical-align:middle; margin-right:5px; border-radius:2px; }
   .legend b { color:var(--ink); font-weight:600; font-variant-numeric:tabular-nums; }
   .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; font-size:13px; }
@@ -2132,15 +2135,15 @@ LIVE_PAGE = r"""<!doctype html>
   <div class="stats" id="s-camera2">–</div>
 </section>
 
-<section class="card wide">
-  <h2>USB IMU (hub_imu module on the camera hub) <small>last 10 s · hover for values</small></h2>
+<section class="card" id="sec-imu">
+  <h2>USB IMU (hub_imu module) <small>last 10 s · hover for values</small></h2>
   <div class="stats" id="s-imu">–</div>
   <div class="chart"><div class="legend" id="lg-acc"></div><canvas id="ch-acc"></canvas></div>
   <div class="chart"><div class="legend" id="lg-gyr"></div><canvas id="ch-gyr"></canvas></div>
   <div class="chart"><div class="legend" id="lg-eul"></div><canvas id="ch-eul"></canvas></div>
 </section>
 
-<section class="card wide">
+<section class="card" id="sec-imu-u">
   <h2>Wearable IMU (BNO055 on UART5) <small>last 10 s · hover for values</small></h2>
   <div class="stats" id="s-imu-u">–</div>
   <div class="chart"><div class="legend" id="lg-acc-u"></div><canvas id="ch-acc-u"></canvas></div>
@@ -2231,7 +2234,7 @@ function makeImu(sfx, what) {
       const W = cv.clientWidth, H = cv.clientHeight;
       if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
       const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-      const padL = 44, padR = 8, padT = 6, padB = 16;
+      const padL = 40, padR = 6, padT = 4, padB = 13;
       let lo = Infinity, hi = -Infinity, i0 = 0;
       while (i0 < n && I.t[i0] < t0) i0++;
       for (const k of ch.keys) for (let i = i0; i < n; i++) { const v = I.ch[k][i]; if (v < lo) lo = v; if (v > hi) hi = v; }
@@ -2243,7 +2246,7 @@ function makeImu(sfx, what) {
       g.strokeStyle = grid; g.lineWidth = 1; g.fillStyle = muted; g.font = '10px ui-monospace, Menlo, monospace'; g.textAlign = 'right';
       for (let k = 0; k <= 2; k++) { const v = lo + (hi - lo) * k / 2, y = Y(v); g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(v.toFixed(Math.abs(hi - lo) < 5 ? 2 : 0), padL - 4, y + 3); }
       g.textAlign = 'center';
-      for (let sec = 0; sec <= 10; sec += 2) { const x = X(t0 + sec * 1e6); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.fillText('-' + (10 - sec) + ' s', x, H - 4); }
+      for (let sec = 0; sec <= 10; sec += 2) { const x = X(t0 + sec * 1e6); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.fillText('-' + (10 - sec) + ' s', x, H - 3); }
       // the traces: 2 px, series colors in fixed order
       ch.keys.forEach((k, si) => {
         g.strokeStyle = SERIES[si]; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();

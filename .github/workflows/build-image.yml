@@ -41,7 +41,8 @@ jobs:
             repo=${src%%:*}; br=${src##*:}
             rm -rf uvc-src && mkdir -p uvc-src
             for f in uvc_driver.c uvc_video.c uvcvideo.h; do
-              curl -fsSL -o uvc-src/$f "https://raw.githubusercontent.com/$repo/$br/drivers/media/usb/uvc/$f"
+              # raw.githubusercontent.com rate-limits busy days with 429; retry rather than fail the tag build
+              curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 -o uvc-src/$f "https://raw.githubusercontent.com/$repo/$br/drivers/media/usb/uvc/$f"
             done
             echo "== $src"; python3 image/uvcvideo/patch-uvcvideo.py uvc-src
           done

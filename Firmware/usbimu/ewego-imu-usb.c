@@ -51,7 +51,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.3"
+#define VERSION "0.3.1"
 #define USB_VID 0x1209
 #define USB_PID 0x0001
 
@@ -82,6 +82,27 @@ static int64_t real_us(void)
 }
 
 static int16_t le16(const uint8_t *p) { return (int16_t)(p[0] | (p[1] << 8)); }
+
+/* mkdir -p: every component, EEXIST is fine. Returns 0 or -1 with errno. */
+static int mkdir_p(const char *path, mode_t mode)
+{
+	char buf[PATH_MAX];
+	size_t len = strlen(path), i;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -1;
+	memcpy(buf, path, len + 1);
+	for (i = 1; i <= len; i++) {
+		if (buf[i] == '/' || buf[i] == 0) {
+			char c = buf[i];
+			buf[i] = 0;
+			if (mkdir(buf, mode) && errno != EEXIST)
+				return -1;
+			buf[i] = c;
+		}
+	}
+	return 0;
+}
 static uint16_t ule16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t ule32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 
@@ -476,12 +497,12 @@ int main(int argc, char **argv)
 		} else {
 			snprintf(dir, sizeof(dir), "%s", out);
 		}
-		if ((mkdir(out, 0755) && errno != EEXIST) || (mkdir(dir, 0755) && errno != EEXIST)) {
+		if (mkdir_p(dir, 0755)) {
 			perror(dir);
 			return 1;
 		}
 	}
-	if (live && mkdir(live, 0755) && errno != EEXIST) {
+	if (live && mkdir_p(live, 0755)) {
 		perror(live);
 		return 1;
 	}

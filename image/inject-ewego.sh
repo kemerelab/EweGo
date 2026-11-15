@@ -159,6 +159,9 @@ rsync -a --delete \
     "$REPO_ROOT/requirements.txt" "$REPO_ROOT/pyproject.toml" "$REPO_ROOT/LICENSE" \
     "$ROOT_MNT/opt/ewego/"
 
+# the recorders' output roots, so a unit started on a fresh card does not
+# fail on a missing parent (seen with ewego-imu-uart on v0.6.6)
+install -d "$ROOT_MNT/opt/ewego/recordings" "$ROOT_MNT/opt/ewego/gps-logs"
 log "Installing vendored Python packages to /opt/ewego/pylib"
 rm -rf "$ROOT_MNT/opt/ewego/pylib"
 install -d "$ROOT_MNT/opt/ewego/pylib"

@@ -58,7 +58,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.5.1"
+#define VERSION "0.5.2"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -150,6 +150,28 @@ static int xioctl(int fd, unsigned long req, void *arg)
 		r = ioctl(fd, req, arg);
 	} while (r == -1 && errno == EINTR);
 	return r;
+}
+
+
+/* mkdir -p: every component, EEXIST is fine. Returns 0 or -1 with errno. */
+static int mkdir_p(const char *path, mode_t mode)
+{
+	char buf[PATH_MAX];
+	size_t len = strlen(path), i;
+
+	if (len == 0 || len >= sizeof(buf))
+		return -1;
+	memcpy(buf, path, len + 1);
+	for (i = 1; i <= len; i++) {
+		if (buf[i] == '/' || buf[i] == 0) {
+			char c = buf[i];
+			buf[i] = 0;
+			if (mkdir(buf, mode) && errno != EEXIST)
+				return -1;
+			buf[i] = c;
+		}
+	}
+	return 0;
 }
 
 static int64_t now_mono_us(void)
@@ -747,16 +769,12 @@ int main(int argc, char **argv)
 		} else {
 			snprintf(dir, sizeof(dir), "%s", c.out);
 		}
-		if (mkdir(c.out, 0755) && errno != EEXIST) {
-			perror(c.out);
-			return 1;
-		}
-		if (mkdir(dir, 0755) && errno != EEXIST) {
+		if (mkdir_p(dir, 0755)) {
 			perror(dir);
 			return 1;
 		}
 	}
-	if (c.live && mkdir(c.live, 0755) && errno != EEXIST) {
+	if (c.live && mkdir_p(c.live, 0755)) {
 		perror(c.live);
 		return 1;
 	}

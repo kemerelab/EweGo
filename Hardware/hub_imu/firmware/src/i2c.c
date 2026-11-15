@@ -10,6 +10,8 @@ extern volatile uint32_t g_ms;
 
 #define I2C_TIMEOUT_MS 20
 
+extern void bno055_yield(void);
+
 static int wait_flag(uint32_t flag)
 {
 	uint32_t t0 = g_ms;
@@ -17,6 +19,12 @@ static int wait_flag(uint32_t flag)
 		uint32_t isr = I2C1->ISR;
 		if (isr & flag)
 			return 0;
+		/* The BNO055 stretches the clock for milliseconds at a time (a
+		 * 46-byte burst was measured at 9.5 ms, 2026-11-14). Keep servicing
+		 * USB meanwhile, or the host's fetch of the previous HID report is
+		 * only noticed after the burst and the next report finds the
+		 * endpoint "busy" (every other sample was dropped that way). */
+		bno055_yield();
 		if (isr & I2C_ISR_NACKF) {
 			I2C1->ICR = I2C_ICR_NACKCF | I2C_ICR_STOPCF;
 			return -1;

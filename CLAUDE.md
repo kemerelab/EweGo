@@ -175,6 +175,20 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   test refuses while the unit or preview owns the port. Bench next: the
   UART IMU under systemd (chip id retries at boot, 100 Hz with 0 read
   errors), then both IMUs side by side on the live page.
+- v0.6.7 (2026-11-14): the C recorders create their output path like
+  mkdir -p and the image ships /opt/ewego/recordings (ewego-imu-uart exited
+  1 on a fresh card). **hub_imu drops every other sample (hubimu-v0.3.0 on
+  the collar, 2026-11-14):** the BNO055 burst now takes 9.5 ms (console
+  `stats`: "i2c burst max 9762 us"; was 1-7 ms in earlier notes), the
+  firmware's I2C wait loop did not service USB, so the host's fetch of the
+  previous report was only noticed after the next burst and that report
+  found the endpoint busy and was dropped: 26% lost, all single-sample
+  gaps, every received report flagged "host not polling", with nothing
+  else on the bus. Fix hubimu-v0.3.1: `bno055_yield()` (tud_task) inside
+  `wait_flag`, a report that finds the endpoint busy is held and sent on
+  the next main-loop pass (`held` counter in `stats`), DROPPED only when
+  the held one is overwritten. Open question: why the burst grew to 9.5 ms
+  (BNO055 clock stretching; check I2C speed actually achieved).
 - After that (Phase C): C port of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown.
 - Known limits: NetworkManager still in use (SD corruption after power

@@ -33,8 +33,13 @@ static int g_sensor_err;     /* last bno055_init() result */
 static int g_stream = 1;          /* HID streaming enabled */
 static uint16_t g_seq;
 static uint32_t g_next_sample_us;
-static uint32_t g_sent, g_i2c_err, g_hid_busy, g_i2c_us_max;
+static uint32_t g_sent, g_i2c_err, g_hid_busy, g_i2c_us_max, g_held;
 static int g_last_dropped;
+/* A report that found the endpoint busy waits here and goes out from the
+ * main loop as soon as the previous one has been fetched, instead of being
+ * thrown away: the host polls every 1 ms, so a 10 ms sample period has room. */
+static struct imu_report g_pending;
+static int g_have_pending;
 
 extern void request_bootloader(void);
 
@@ -236,10 +241,10 @@ static void cmd_init(void)
 static void cmd_stats(void)
 {
 	con_printf("stream %s, %u Hz: sent %lu, i2c errors %lu, hid busy (host not polling) %lu, "
-		   "i2c burst max %lu us, seq %u, uptime %lu s\r\n",
+		   "held for the next loop %lu, i2c burst max %lu us, seq %u, uptime %lu s\r\n",
 		   g_stream ? "on" : "off", 1000000u / SAMPLE_PERIOD_US, (unsigned long)g_sent,
-		   (unsigned long)g_i2c_err, (unsigned long)g_hid_busy, (unsigned long)g_i2c_us_max,
-		   g_seq, (unsigned long)(g_ms / 1000u));
+		   (unsigned long)g_i2c_err, (unsigned long)g_hid_busy, (unsigned long)g_held,
+		   (unsigned long)g_i2c_us_max, g_seq, (unsigned long)(g_ms / 1000u));
 	g_i2c_us_max = 0;
 }
 
@@ -361,14 +366,32 @@ static void sample_task(void)
 			g_i2c_us_max = dt;
 	}
 
+	if (g_have_pending) {
+		/* the previous report never got out in a whole period: that one is lost */
+		g_hid_busy++;
+		g_last_dropped = 1;
+		g_have_pending = 0;
+	}
+	tud_task();                 /* pick up the completion of the previous report first */
 	if (tud_hid_ready()) {
 		tud_hid_report(0, &rpt, sizeof(rpt));
 		g_sent++;
 		g_last_dropped = 0;
 	} else {
-		/* previous report still in the endpoint: host is not polling */
-		g_hid_busy++;
-		g_last_dropped = 1;
+		g_pending = rpt;
+		g_have_pending = 1;
+		g_held++;
+	}
+}
+
+/* Send a held report once the endpoint is free (called every main-loop pass). */
+static void flush_pending(void)
+{
+	if (g_have_pending && tud_hid_ready()) {
+		tud_hid_report(0, &g_pending, sizeof(g_pending));
+		g_sent++;
+		g_last_dropped = 0;
+		g_have_pending = 0;
 	}
 }
 
@@ -392,6 +415,7 @@ int main(void)
 	int led_on = 1;
 	for (;;) {
 		tud_task();
+		flush_pending();
 		console_task();
 		sample_task();
 

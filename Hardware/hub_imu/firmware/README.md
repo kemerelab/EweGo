@@ -33,7 +33,12 @@ Composite device, VID:PID `1209:0001` (pid.codes test PID; lab use only):
 | 2 | HID (vendor page) | IMU data: one 64-byte input report per sample, 1 ms interrupt endpoint |
 
 Console commands: `help`, `version`, `id`, `cal`, `read`, `init`,
-`stats`, `stream` (toggle the HID stream), `dfu`.
+`stats`, `stream` (toggle the HID stream), `dfu`. In `stats`, "hid busy"
+counts reports lost because the host had not fetched the previous one
+within a whole period (it grows while nothing on the host reads the
+device: Linux only polls an open HID device); "held" counts reports that
+waited one main-loop pass for the endpoint, which is normal when the
+BNO055 stretches a burst to most of the 10 ms period (hubimu-v0.3.1).
 
 ## Status
 

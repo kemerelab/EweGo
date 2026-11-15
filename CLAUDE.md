@@ -159,10 +159,24 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   sync -> systemctl). `Firmware/tools/ewego-check.py` validates a run
   (console "Check last run"). Bench next: reflash v0.6.3, 10-minute run,
   ewego-check PASS with IMU 0 lost / 0 overruns, live page on a phone.
-- After that (Phase C): C ports of GPS (with NAV-PVT validity flags and a
-  configurable NTRIP host), fuel gauge with low-battery shutdown, IMU with
-  burst reads (the systemd target replacing sensor_test.py exists since
-  2026-11-12: `ewego-record.target`).
+- v0.6.4 (2026-11-14): ewego-cam 0.5.1, the live JPEG was never written
+  (first-frame check started at INT64_MIN and overflowed); live page
+  cameras are plain `<img>` multipart streams (a fetch() reader showed
+  nothing in the field browser) with the sent kB/s counted on the wearable.
+  Live page confirmed working on the collar.
+- v0.6.5 (2026-11-14): `ewego-imu-uart` (`Firmware/imuuart/`, C port of
+  log_imu_data.py: BNO055 UART protocol on ttyAMA5, NDOF, one 46-byte
+  burst per 100 Hz tick, 0x07 retried, reader/writer threads, `--rt`,
+  `--live`, `--preview`; CSV = the 28 UART-era columns + host_mono_us,
+  tick_mono_us, seq, xfer_us, flags; summary mirrors lost/gaps so
+  ewego-check treats both IMUs alike), unit `ewego-imu-uart` in the target
+  with `/etc/ewego/imu-uart.conf`. Live page: second IMU panel, "Swap
+  cameras" (camera2 left, remembered in the browser). Console's UART IMU
+  test refuses while the unit or preview owns the port. Bench next: the
+  UART IMU under systemd (chip id retries at boot, 100 Hz with 0 read
+  errors), then both IMUs side by side on the live page.
+- After that (Phase C): C port of GPS (with NAV-PVT validity flags and a
+  configurable NTRIP host), fuel gauge with low-battery shutdown.
 - Known limits: NetworkManager still in use (SD corruption after power
   loss, bug 001, until low-battery shutdown lands); no RTC on the CM4.
   (NTRIP is no longer hard-coded: `--ntrip HOST:PORT/MOUNT` with a 5 s

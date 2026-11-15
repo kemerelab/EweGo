@@ -72,12 +72,14 @@ jobs:
         run: |
           make -C Firmware/uvccam CC=gcc && ./Firmware/uvccam/ewego-cam --help | head -3 && make -C Firmware/uvccam clean
           make -C Firmware/usbimu CC=gcc && ./Firmware/usbimu/ewego-imu-usb --help | head -3 && make -C Firmware/usbimu clean
+          make -C Firmware/imuuart CC=gcc && ./Firmware/imuuart/ewego-imu-uart --help | head -3 && make -C Firmware/imuuart clean
       - name: Cross-compile C tools (static arm64)
         run: |
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
           mkdir -p build/bin
           make -C Firmware/uvccam CC=aarch64-linux-gnu-gcc && mv Firmware/uvccam/ewego-cam build/bin/
           make -C Firmware/usbimu CC=aarch64-linux-gnu-gcc && mv Firmware/usbimu/ewego-imu-usb build/bin/
+          make -C Firmware/imuuart CC=aarch64-linux-gnu-gcc && mv Firmware/imuuart/ewego-imu-uart build/bin/
           file build/bin/*
       - uses: actions/upload-artifact@v6
         with:

@@ -36,7 +36,7 @@ from urllib.parse import parse_qs, urlparse
 
 EWEGO = Path(os.environ.get("EWEGO_DIR", "/opt/ewego"))
 RUN_DIR = Path(os.environ.get("RUNTIME_DIRECTORY", "/run/ewego-webtest"))
-UNITS = ["ewego-record.target", "ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb",
+UNITS = ["ewego-record.target", "ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb", "ewego-imu-uart",
          "ewego-gps", "ewego-audio", "ewego-fuel"]
 GPS_PORT = "/dev/ttyAMA4"
 GPS_BAUD = 460800
@@ -434,6 +434,9 @@ def test_fuel(write, q):
 
 def test_imu(write, q):
     secs = int(q.get("seconds", ["10"])[0])
+    if unit_status("ewego-imu-uart")["active"] == "active" or PREVIEW.status()["running"]:
+        write(b"ewego-imu-uart (the recorder) or the live-view preview owns the port; stop it first.\n")
+        return
     cwd = RUN_DIR / "imu"
     cwd.mkdir(parents=True, exist_ok=True)
     write(f"BNO055 on {IMU_PORT}: logging for {secs}s (log goes to {cwd}/logs, not kept)\n".encode())
@@ -1062,7 +1065,7 @@ def test_config(write, q):
 # ---------------------------------------------------------------------------
 
 LIVE_DIR = Path(os.environ.get("EWEGO_LIVE_DIR", "/run/ewego"))
-RECORDERS = ["ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb"]
+RECORDERS = ["ewego-cam@camera1", "ewego-cam@camera2", "ewego-imu-usb", "ewego-imu-uart"]
 CAMERAS = ["camera1", "camera2"]
 FIX_NAMES = {0: "no fix", 1: "dead reckoning", 2: "2D", 3: "3D", 4: "GNSS+DR", 5: "time only"}
 
@@ -1087,7 +1090,7 @@ def tool(name):
     p = shutil.which(name)
     if p:
         return p
-    for sub in ("uvccam", "usbimu"):
+    for sub in ("uvccam", "usbimu", "imuuart"):
         c = EWEGO / "Firmware" / sub / name
         if c.exists():
             return str(c)
@@ -1144,6 +1147,11 @@ class Preview:
             argv = [tool("ewego-imu-usb"), "--preview", "--live", str(LIVE_DIR),
                     "--name", conf.get("NAME", "imu"), "--stats", "0"] + conf.get("DEVICE_ARG", "").split()
             self._spawn("imu", argv)
+            conf = read_conf("/etc/ewego/imu-uart.conf")
+            argv = [tool("ewego-imu-uart"), "--preview", "--live", str(LIVE_DIR),
+                    "--name", conf.get("NAME", "imu-uart"), "--port", conf.get("PORT", IMU_PORT),
+                    "--baud", conf.get("BAUD", "115200"), "--rate", conf.get("RATE", "100"), "--stats", "0"]
+            self._spawn("imu-uart", argv)
             if not self.procs:
                 msg = self.message
                 self._stop_locked()
@@ -1347,6 +1355,7 @@ def live_snapshot():
         "preview": PREVIEW.status(),
         "cam": cams,
         "imu": live_json("imu"),
+        "imu_uart": live_json("imu-uart"),
         "gps": cached("gps", 1.0, gps_live),
         "pps": cached("pps", 1.0, pps_status),
         "battery": cached("battery", 2.0, battery),
@@ -1556,17 +1565,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-        last_n = -1
+        last_n = {"imu": -1, "imu_uart": -1}
         try:
             while True:
                 PREVIEW.touch()
                 snap = live_snapshot()
-                imu = snap["imu"]
-                if imu:
-                    rows = [r for r in imu.pop("recent", []) if r[0] > last_n]
-                    if rows:
-                        last_n = rows[-1][0]
-                    imu["rows"] = rows
+                for key in last_n:
+                    imu = snap[key]
+                    if imu:
+                        rows = [r for r in imu.pop("recent", []) if r[0] > last_n[key]]
+                        if rows:
+                            last_n[key] = rows[-1][0]
+                        imu["rows"] = rows
                 self.write_flush(b"data: " + json.dumps(snap).encode() + b"\n\n")
                 time.sleep(interval)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1782,7 +1792,7 @@ PAGE = r"""<!doctype html>
   <h2>Units</h2>
   <table><thead><tr><th>unit</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody id="units"></tbody></table>
   <div class="row">
-    <select id="jr-unit"><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-gps</option><option>ewego-audio</option><option>ewego-fuel</option><option>ewego-record.target</option><option>ewego-webtest</option></select>
+    <select id="jr-unit"><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-imu-uart</option><option>ewego-gps</option><option>ewego-audio</option><option>ewego-fuel</option><option>ewego-record.target</option><option>ewego-webtest</option></select>
     <button onclick="journal()">Journal tail</button>
     <button onclick="listSessions()">Sessions</button>
   </div>
@@ -1879,12 +1889,13 @@ PAGE = r"""<!doctype html>
 </section>
 
 <section class="card wide">
-  <h2>Recorder (ewego-record.target: cameras, USB IMU, GPS, audio, fuel gauge)</h2>
+  <h2>Recorder (ewego-record.target: cameras, USB IMU, UART IMU, GPS, audio, fuel gauge)</h2>
   <div class="row">
     <button class="primary" onclick="unit('ewego-record.target','start')">Start all</button>
     <button onclick="unit('ewego-record.target','stop')">Stop all</button>
     <button onclick="journal('ewego-cam@camera1','out-rec')">camera1 journal</button>
-    <button onclick="journal('ewego-imu-usb','out-rec')">IMU journal</button>
+    <button onclick="journal('ewego-imu-usb','out-rec')">USB IMU journal</button>
+    <button onclick="journal('ewego-imu-uart','out-rec')">UART IMU journal</button>
     <button onclick="listSessions('out-rec')">Sessions</button>
     <button onclick="run('check','out-rec')">Check last run</button>
     <button onclick="run('check','out-rec','&list=1')">List runs</button>
@@ -2059,6 +2070,9 @@ LIVE_PAGE = r"""<!doctype html>
   .card h2 { font-size:14px; margin:0; display:flex; justify-content:space-between; align-items:center; gap:8px; }
   .card h2 small { color:var(--muted); font-weight:400; font-size:12px; }
   .wide { grid-column:1 / -1; }
+  main > section { order:10; }
+  #sec-camera1 { order:1; } #sec-camera2 { order:2; }
+  main.swapped #sec-camera1 { order:2; } main.swapped #sec-camera2 { order:1; }
   .camwrap { position:relative; background:#000; aspect-ratio:16/9; display:flex; align-items:center; justify-content:center; overflow:hidden; }
   .camwrap img { width:100%; height:100%; object-fit:contain; display:block; }
   .camwrap img.flip { transform:rotate(180deg); }
@@ -2095,6 +2109,7 @@ LIVE_PAGE = r"""<!doctype html>
 <div class="bar">
   view rate <select id="rate"><option value="0.5">0.5 fps</option><option value="1">1 fps</option><option value="2" selected>2 fps</option><option value="5">5 fps</option></select>
   <button id="pause" onclick="togglePause()">Pause views</button>
+  <button id="swap" onclick="swapCams()">Swap cameras</button>
   <span style="flex:1"></span>
   <button id="pv" onclick="preview()">Preview (no recording)</button>
   <button class="primary" onclick="rec('start')">Start recording</button>
@@ -2105,24 +2120,32 @@ LIVE_PAGE = r"""<!doctype html>
 </div>
 <main>
 
-<section class="card">
+<section class="card" id="sec-camera1">
   <h2>camera1 <small id="c1-tag"></small><button onclick="flip('camera1')" id="flip-camera1">Flip 180°</button></h2>
   <div class="camwrap" id="w-camera1"><img id="img-camera1" alt="camera1"><span class="msg" id="m-camera1">no frames</span></div>
   <div class="stats" id="s-camera1">–</div>
 </section>
 
-<section class="card">
+<section class="card" id="sec-camera2">
   <h2>camera2 <small id="c2-tag"></small><button onclick="flip('camera2')" id="flip-camera2">Flip 180°</button></h2>
   <div class="camwrap" id="w-camera2"><img id="img-camera2" alt="camera2"><span class="msg" id="m-camera2">no frames</span></div>
   <div class="stats" id="s-camera2">–</div>
 </section>
 
 <section class="card wide">
-  <h2>USB IMU (BNO055) <small>last 10 s · hover for values</small></h2>
+  <h2>USB IMU (hub_imu module on the camera hub) <small>last 10 s · hover for values</small></h2>
   <div class="stats" id="s-imu">–</div>
   <div class="chart"><div class="legend" id="lg-acc"></div><canvas id="ch-acc"></canvas></div>
   <div class="chart"><div class="legend" id="lg-gyr"></div><canvas id="ch-gyr"></canvas></div>
   <div class="chart"><div class="legend" id="lg-eul"></div><canvas id="ch-eul"></canvas></div>
+</section>
+
+<section class="card wide">
+  <h2>Wearable IMU (BNO055 on UART5) <small>last 10 s · hover for values</small></h2>
+  <div class="stats" id="s-imu-u">–</div>
+  <div class="chart"><div class="legend" id="lg-acc-u"></div><canvas id="ch-acc-u"></canvas></div>
+  <div class="chart"><div class="legend" id="lg-gyr-u"></div><canvas id="ch-gyr-u"></canvas></div>
+  <div class="chart"><div class="legend" id="lg-eul-u"></div><canvas id="ch-eul-u"></canvas></div>
 </section>
 
 <section class="card">
@@ -2169,78 +2192,102 @@ function flip(name) {
 }
 for (const n in cams) { try { if (localStorage.getItem('ewego.flip.' + n) === '1') { $('img-' + n).classList.add('flip'); $('flip-' + n).classList.add('on'); } } catch (e) {} }
 
-// ---- IMU traces ----
+// ---- IMU traces: one instance per IMU (USB module, wearable UART) ----
 const WIN_US = 10e6;
-const imu = {t: [], ch: {heading: [], roll: [], pitch: [], ax: [], ay: [], az: [], gx: [], gy: [], gz: []}};
-const CHARTS = [
+const CHART_DEFS = [
   {id: 'acc', title: 'acceleration m/s²', keys: ['ax', 'ay', 'az'], names: ['x', 'y', 'z']},
   {id: 'gyr', title: 'angular rate °/s', keys: ['gx', 'gy', 'gz'], names: ['x', 'y', 'z']},
   {id: 'eul', title: 'orientation °', keys: ['heading', 'roll', 'pitch'], names: ['heading', 'roll', 'pitch']},
 ];
-let hoverX = null;
-for (const ch of CHARTS) {
-  const cv = $('ch-' + ch.id);
-  cv.addEventListener('mousemove', e => { hoverX = e.offsetX / cv.clientWidth; draw(); });
-  cv.addEventListener('mouseleave', () => { hoverX = null; draw(); });
-}
-function addRows(rows) {
-  // cols: n, seq, dev_ts_us, host_mono_us, heading, roll, pitch, ax, ay, az, gx, gy, gz, lax, lay, laz, flags
-  for (const r of rows) {
-    if (r[4] === null) continue;
-    imu.t.push(r[3]);
-    imu.ch.heading.push(r[4]); imu.ch.roll.push(r[5]); imu.ch.pitch.push(r[6]);
-    imu.ch.ax.push(r[7]); imu.ch.ay.push(r[8]); imu.ch.az.push(r[9]);
-    imu.ch.gx.push(r[10]); imu.ch.gy.push(r[11]); imu.ch.gz.push(r[12]);
+function makeImu(sfx, what) {
+  const I = {t: [], ch: {heading: [], roll: [], pitch: [], ax: [], ay: [], az: [], gx: [], gy: [], gz: []}, hoverX: null, pending: false};
+  const el = id => $(id + sfx);
+  for (const ch of CHART_DEFS) {
+    const cv = el('ch-' + ch.id);
+    cv.addEventListener('mousemove', e => { I.hoverX = e.offsetX / cv.clientWidth; I.draw(); });
+    cv.addEventListener('mouseleave', () => { I.hoverX = null; I.draw(); });
   }
-  const tEnd = imu.t.length ? imu.t[imu.t.length - 1] : 0;
-  let cut = 0; while (cut < imu.t.length && imu.t[cut] < tEnd - WIN_US - 2e6) cut++;
-  if (cut) { imu.t.splice(0, cut); for (const k in imu.ch) imu.ch[k].splice(0, cut); }
-}
-let drawPending = false;
-function draw() { if (drawPending) return; drawPending = true; requestAnimationFrame(() => { drawPending = false; drawNow(); }); }
-function drawNow() {
-  const n = imu.t.length; if (!n) return;
-  const tEnd = imu.t[n - 1], t0 = tEnd - WIN_US;
-  const css = getComputedStyle(document.documentElement);
-  const grid = css.getPropertyValue('--grid').trim(), muted = css.getPropertyValue('--muted').trim(), ink = css.getPropertyValue('--ink').trim();
-  for (const ch of CHARTS) {
-    const cv = $('ch-' + ch.id), dpr = window.devicePixelRatio || 1;
-    const W = cv.clientWidth, H = cv.clientHeight;
-    if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
-    const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-    const padL = 44, padR = 8, padT = 6, padB = 16;
-    let lo = Infinity, hi = -Infinity, i0 = 0;
-    while (i0 < n && imu.t[i0] < t0) i0++;
-    for (const k of ch.keys) for (let i = i0; i < n; i++) { const v = imu.ch[k][i]; if (v < lo) lo = v; if (v > hi) hi = v; }
-    if (!isFinite(lo)) continue;
-    if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
-    const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
-    const X = t => padL + (t - t0) / WIN_US * (W - padL - padR), Y = v => padT + (hi - v) / (hi - lo) * (H - padT - padB);
-    // recessive grid: 3 horizontal lines with labels, 1-second ticks
-    g.strokeStyle = grid; g.lineWidth = 1; g.fillStyle = muted; g.font = '10px ui-monospace, Menlo, monospace'; g.textAlign = 'right';
-    for (let k = 0; k <= 2; k++) { const v = lo + (hi - lo) * k / 2, y = Y(v); g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(v.toFixed(Math.abs(hi - lo) < 5 ? 2 : 0), padL - 4, y + 3); }
-    g.textAlign = 'center';
-    for (let s = 0; s <= 10; s += 2) { const x = X(t0 + s * 1e6); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.fillText('-' + (10 - s) + ' s', x, H - 4); }
-    // the traces: 2 px, series colors in fixed order
-    ch.keys.forEach((k, si) => {
-      g.strokeStyle = SERIES[si]; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();
-      let first = true;
-      for (let i = i0; i < n; i++) { const x = X(imu.t[i]), y = Y(imu.ch[k][i]); if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y); }
-      g.stroke();
-    });
-    // hover crosshair: values at the pointer's time go into the legend
-    let hi_i = n - 1;
-    if (hoverX !== null) {
-      const th = t0 + Math.min(Math.max((hoverX * W - padL) / (W - padL - padR), 0), 1) * WIN_US;
-      hi_i = i0; while (hi_i < n - 1 && imu.t[hi_i] < th) hi_i++;
-      const x = X(imu.t[hi_i]); g.strokeStyle = ink; g.lineWidth = 1; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.setLineDash([]);
-      ch.keys.forEach((k, si) => { g.fillStyle = SERIES[si]; g.beginPath(); g.arc(x, Y(imu.ch[k][hi_i]), 4, 0, 7); g.fill(); });
+  I.addRows = rows => {
+    // cols: n, seq, dev/tick ts, host_mono_us, heading, roll, pitch, ax, ay, az, gx, gy, gz, lax, lay, laz, flags
+    for (const r of rows) {
+      if (r[4] === null) continue;
+      I.t.push(r[3]);
+      I.ch.heading.push(r[4]); I.ch.roll.push(r[5]); I.ch.pitch.push(r[6]);
+      I.ch.ax.push(r[7]); I.ch.ay.push(r[8]); I.ch.az.push(r[9]);
+      I.ch.gx.push(r[10]); I.ch.gy.push(r[11]); I.ch.gz.push(r[12]);
     }
-    $('lg-' + ch.id).innerHTML = '<span>' + ch.title + (hoverX !== null ? ' at -' + ((tEnd - imu.t[hi_i]) / 1e6).toFixed(2) + ' s' : '') + '</span>' +
-      ch.keys.map((k, si) => '<span><i style="background:' + SERIES[si] + '"></i>' + ch.names[si] + ' <b>' + imu.ch[k][hi_i].toFixed(2) + '</b></span>').join('');
-  }
+    const tEnd = I.t.length ? I.t[I.t.length - 1] : 0;
+    let cut = 0; while (cut < I.t.length && I.t[cut] < tEnd - WIN_US - 2e6) cut++;
+    if (cut) { I.t.splice(0, cut); for (const k in I.ch) I.ch[k].splice(0, cut); }
+  };
+  I.draw = () => { if (I.pending) return; I.pending = true; requestAnimationFrame(() => { I.pending = false; I.drawNow(); }); };
+  I.drawNow = () => {
+    const n = I.t.length; if (!n) return;
+    const tEnd = I.t[n - 1], t0 = tEnd - WIN_US;
+    const css = getComputedStyle(document.documentElement);
+    const grid = css.getPropertyValue('--grid').trim(), muted = css.getPropertyValue('--muted').trim(), ink = css.getPropertyValue('--ink').trim();
+    for (const ch of CHART_DEFS) {
+      const cv = el('ch-' + ch.id), dpr = window.devicePixelRatio || 1;
+      const W = cv.clientWidth, H = cv.clientHeight;
+      if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) { cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); }
+      const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+      const padL = 44, padR = 8, padT = 6, padB = 16;
+      let lo = Infinity, hi = -Infinity, i0 = 0;
+      while (i0 < n && I.t[i0] < t0) i0++;
+      for (const k of ch.keys) for (let i = i0; i < n; i++) { const v = I.ch[k][i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+      if (!isFinite(lo)) continue;
+      if (hi - lo < 1e-6) { lo -= 1; hi += 1; }
+      const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+      const X = t => padL + (t - t0) / WIN_US * (W - padL - padR), Y = v => padT + (hi - v) / (hi - lo) * (H - padT - padB);
+      // recessive grid: 3 horizontal lines with labels, 2-second ticks
+      g.strokeStyle = grid; g.lineWidth = 1; g.fillStyle = muted; g.font = '10px ui-monospace, Menlo, monospace'; g.textAlign = 'right';
+      for (let k = 0; k <= 2; k++) { const v = lo + (hi - lo) * k / 2, y = Y(v); g.beginPath(); g.moveTo(padL, y); g.lineTo(W - padR, y); g.stroke(); g.fillText(v.toFixed(Math.abs(hi - lo) < 5 ? 2 : 0), padL - 4, y + 3); }
+      g.textAlign = 'center';
+      for (let sec = 0; sec <= 10; sec += 2) { const x = X(t0 + sec * 1e6); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.fillText('-' + (10 - sec) + ' s', x, H - 4); }
+      // the traces: 2 px, series colors in fixed order
+      ch.keys.forEach((k, si) => {
+        g.strokeStyle = SERIES[si]; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath();
+        let first = true;
+        for (let i = i0; i < n; i++) { const x = X(I.t[i]), y = Y(I.ch[k][i]); if (first) { g.moveTo(x, y); first = false; } else g.lineTo(x, y); }
+        g.stroke();
+      });
+      // hover crosshair: values at the pointer's time go into the legend
+      let hi_i = n - 1;
+      if (I.hoverX !== null) {
+        const th = t0 + Math.min(Math.max((I.hoverX * W - padL) / (W - padL - padR), 0), 1) * WIN_US;
+        hi_i = i0; while (hi_i < n - 1 && I.t[hi_i] < th) hi_i++;
+        const x = X(I.t[hi_i]); g.strokeStyle = ink; g.lineWidth = 1; g.setLineDash([3, 3]); g.beginPath(); g.moveTo(x, padT); g.lineTo(x, H - padB); g.stroke(); g.setLineDash([]);
+        ch.keys.forEach((k, si) => { g.fillStyle = SERIES[si]; g.beginPath(); g.arc(x, Y(I.ch[k][hi_i]), 4, 0, 7); g.fill(); });
+      }
+      el('lg-' + ch.id).innerHTML = '<span>' + ch.title + (I.hoverX !== null ? ' at -' + ((tEnd - I.t[hi_i]) / 1e6).toFixed(2) + ' s' : '') + '</span>' +
+        ch.keys.map((k, si) => '<span><i style="background:' + SERIES[si] + '"></i>' + ch.names[si] + ' <b>' + I.ch[k][hi_i].toFixed(2) + '</b></span>').join('');
+    }
+  };
+  I.line = st => {
+    if (!st) { el('s-imu').textContent = 'no data: not recording and no preview' + what; return; }
+    const bad = st.lost || st.queue_overruns || st.flagged;
+    const timing = st.xfer_us_max !== undefined
+      ? ' · uart round trip max ' + (st.xfer_us_max / 1000).toFixed(1) + ' ms · jitter max ' + (st.jitter_us_max / 1000).toFixed(1) + ' ms'
+      : ' · drift ' + (st.drift_ppm >= 0 ? '+' : '') + st.drift_ppm + ' ppm';
+    el('s-imu').innerHTML = (st.preview ? 'preview' : 'recording') + ' · ' + st.hz.toFixed(1) + ' Hz · ' + st.samples + ' samples · ' + (bad ? '<span class="bad">' : '') +
+      (st.read_errors !== undefined ? st.read_errors + ' read errors, ' : st.lost + ' lost, ' + st.flagged + ' flagged, ') + st.queue_overruns + ' overruns' + (bad ? '</span>' : '') +
+      timing + ' · queue peak ' + st.queue_peak + ' · ' + fmtDur(st.elapsed_s) +
+      (st.cal ? ' · cal sys' + st.cal[0] + ' gyro' + st.cal[1] + ' acc' + st.cal[2] + ' mag' + st.cal[3] : '') + (st.temp_c != null ? ' · ' + st.temp_c + ' °C' : '') +
+      (st.age_s > 2 ? ' · <span class="warn">stale ' + st.age_s + ' s</span>' : '');
+  };
+  I.handle = st => { I.line(st); if (st && st.rows && st.rows.length) { I.addRows(st.rows); I.draw(); } };
+  return I;
 }
-window.addEventListener('resize', draw);
+const imus = {imu: makeImu('', ''), imu_uart: makeImu('-u', ' (ewego-imu-uart on ' + 'ttyAMA5)')};
+window.addEventListener('resize', () => { for (const k in imus) imus[k].draw(); });
+
+// ---- camera swap: put camera2 on the left for a wearable whose camera2 is the left eye ----
+function swapCams(set) {
+  const on = set === undefined ? !document.querySelector('main').classList.contains('swapped') : set;
+  document.querySelector('main').classList.toggle('swapped', on); $('swap').classList.toggle('on', on);
+  try { localStorage.setItem('ewego.swap', on ? '1' : '0'); } catch (e) {}
+}
+try { if (localStorage.getItem('ewego.swap') === '1') swapCams(true); } catch (e) {}
 
 // ---- status stream ----
 function camLine(name, c) {
@@ -2259,14 +2306,6 @@ function camLine(name, c) {
 function browserLine(name) {
   const c = cams[name];
   return paused ? ' · views paused' : c.shown ? ' · browser: ' + c.shown + ' frame(s) shown' : ' · browser: waiting for the first frame';
-}
-function imuLine(st) {
-  if (!st) { $('s-imu').textContent = 'no data: not recording and no preview'; return; }
-  const bad = st.lost || st.queue_overruns || st.flagged;
-  $('s-imu').innerHTML = (st.preview ? 'preview' : 'recording') + ' · ' + st.hz.toFixed(1) + ' Hz · ' + st.samples + ' samples · ' + (bad ? '<span class="bad">' : '') + st.lost + ' lost, ' + st.flagged + ' flagged, ' + st.queue_overruns + ' overruns' + (bad ? '</span>' : '') +
-    ' · drift ' + (st.drift_ppm >= 0 ? '+' : '') + st.drift_ppm + ' ppm · queue peak ' + st.queue_peak + ' · ' + fmtDur(st.elapsed_s) +
-    (st.cal ? ' · cal sys' + st.cal[0] + ' gyro' + st.cal[1] + ' acc' + st.cal[2] + ' mag' + st.cal[3] : '') + (st.temp_c != null ? ' · ' + st.temp_c + ' °C' : '') +
-    (st.age_s > 2 ? ' · <span class="warn">stale ' + st.age_s + ' s</span>' : '');
 }
 function gpsBlock(gp, pps) {
   const fixCls = f => /RTK|3D|GNSS/.test(f || '') ? 'ok' : (f === '2D' ? 'warn' : 'bad');
@@ -2296,8 +2335,7 @@ function update(s) {
   $('load').textContent = 'load ' + s.load.toFixed(2) + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
   $('link').textContent = 'views ' + (s.view_bytes_per_s / 1024).toFixed(0) + ' kB/s sent';
   for (const n in cams) camLine(n, s.cam[n]);
-  imuLine(s.imu);
-  if (s.imu && s.imu.rows && s.imu.rows.length) { addRows(s.imu.rows); draw(); }
+  imus.imu.handle(s.imu); imus.imu_uart.handle(s.imu_uart);
   gpsBlock(s.gps, s.pps);
   $('sys').innerHTML = '<b>preview</b><span>' + (s.preview.message || 'off') + '</span><b>clock</b><span>' + new Date(s.t * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC</span>';
   $('units').innerHTML = Object.entries(s.units).map(([u, a]) => '<tr><td style="padding:2px 8px 2px 0">' + u + '</td><td class="' + (a === 'active' ? 'ok' : a === 'failed' ? 'bad' : '') + '">' + a + '</td></tr>').join('');

@@ -20,7 +20,8 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
   `ewego-imu-usb`, `ewego-gps`, `ewego-audio`, `ewego-fuel`), with
   start/stop, journal tail, and a listing of recording directories.
 - **Fuel gauge**: read voltage, SOC, IC version.
-- **IMU**: run `log_imu_data.py` for N seconds and watch it.
+- **IMU**: run `log_imu_data.py` for N seconds and watch it (refused while
+  `ewego-imu-uart` or the live preview owns the port).
 - **GPS**: raw read of the port at a chosen baud rate (counts UBX sync
   words, NMEA sentences, RTCM headers), and start/stop/journal of the logger
   unit. The raw read refuses to run while the logger owns the port.
@@ -57,7 +58,8 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 A dashboard for the field, built for a phone on the wearable's Wi-Fi:
 
 - **Both cameras**, each with a *Flip 180°* button (remembered per camera
-  in the browser) for a wearable mounted upside down, and a stats line
+  in the browser) for a wearable mounted upside down, *Swap cameras* to
+  put camera2 on the left when that is the left eye, and a stats line
   (fps, frames, lost/overruns, write max, queue). The frames are the
   recorders' own: `ewego-cam --live /run/ewego` keeps the newest JPEG on
   tmpfs and the page shows it as a plain multipart image stream (the same
@@ -66,17 +68,18 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
   frame is 150–300 kB, so 2 fps for two cameras is roughly 1 MB/s and
   5 fps is about the most a weak Wi-Fi link will carry. *Pause views* stops
   the image streams and leaves the rest running.
-- **USB IMU**: scrolling 10 s traces of acceleration, angular rate and
-  orientation at the full 100 Hz (hover for values), with rate, lost,
-  drift, calibration status and temperature. Fed by
-  `ewego-imu-usb --live /run/ewego`, about 10 kB/s.
+- **Both IMUs**: scrolling 10 s traces of acceleration, angular rate and
+  orientation at the full 100 Hz (hover for values), with rate, lost or
+  failed reads, calibration status and temperature, for the USB module
+  (`ewego-imu-usb --live /run/ewego`) and the wearable's own BNO055 on
+  UART5 (`ewego-imu-uart --live /run/ewego`), about 10 kB/s each.
 - **GPS**: fix type, satellites, accuracy, position (with a map link),
   height, speed and GPS time from the newest NAV-PVT in the GPS logger's
   file, so it is live only while `ewego-gps` runs and a few seconds behind
   the receiver; PPS from the kernel directly.
 - **Wearable**: battery, free space, load and temperature, unit states.
 - **Controls**: *Preview (no recording)* starts `ewego-cam --preview` for
-  both cameras and `ewego-imu-usb --preview` so you can aim the cameras and
+  both cameras and both IMU recorders in `--preview` so you can aim the cameras and
   check the IMU before recording; it writes nothing to the card and stops
   itself after 90 s without a viewer. *Start recording* stops the preview
   first (the recorders need the cameras). *Shut down* and *Reboot* as on

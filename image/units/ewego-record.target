@@ -6,6 +6,7 @@ Documentation=https://github.com/kemerelab/EweGo/blob/phase-a-image/image/README
 # target does the same to all of them. Any unit can still be run alone.
 Wants=ewego-cam@camera1.service ewego-cam@camera2.service
 Wants=ewego-imu-usb.service
+Wants=ewego-imu-uart.service
 Wants=ewego-gps.service
 Wants=ewego-audio.service
 Wants=ewego-fuel.service

@@ -14,9 +14,9 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | `/opt/ewego/Firmware/` | the `Firmware/` tree from this repository |
 | `/opt/ewego/pylib/` | pyubx2 (+ pynmeagps, pyrtcm), vendored pure-Python wheels |
 | apt packages | `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc`, `ffmpeg`, `dfu-util`, `avahi-daemon` — installed inside the image at build time. No `python3-picamera2`: the cameras are USB. |
-| `/etc/systemd/system/ewego-*` | `ewego-record.target` = the default recording set: `ewego-cam@camera1`, `ewego-cam@camera2` (USB cameras, `ewego-cam`), `ewego-imu-usb` (hub_imu module), `ewego-gps`, `ewego-audio`, `ewego-fuel`. All **installed but not enabled**; each can also run alone. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
-| `/etc/ewego/*.conf` | per-unit settings: `cam-camera1.conf` / `cam-camera2.conf` (hub port, size, fps), `imu-usb.conf`, `gps.conf` (NTRIP, off by default), `audio.conf`, `fuel.conf` |
-| `/usr/local/bin/ewego-cam`, `ewego-imu-usb` | static C recorders, cross-compiled in CI |
+| `/etc/systemd/system/ewego-*` | `ewego-record.target` = the default recording set: `ewego-cam@camera1`, `ewego-cam@camera2` (USB cameras, `ewego-cam`), `ewego-imu-usb` (hub_imu module), `ewego-imu-uart` (the wearable's own BNO055 on UART5, `ewego-imu-uart`), `ewego-gps`, `ewego-audio`, `ewego-fuel`. All **installed but not enabled**; each can also run alone. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
+| `/etc/ewego/*.conf` | per-unit settings: `cam-camera1.conf` / `cam-camera2.conf` (hub port, size, fps), `imu-usb.conf`, `imu-uart.conf`, `gps.conf` (NTRIP, off by default), `audio.conf`, `fuel.conf` |
+| `/usr/local/bin/ewego-cam`, `ewego-imu-usb`, `ewego-imu-uart` | static C recorders, cross-compiled in CI |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
 | `/lib/modules/<ver>/updates/uvcvideo.ko`, `/etc/modprobe.d/ewego-uvc.conf` | patched UVC driver with a `max_payload=2048` cap so two MJPEG cameras fit on the CM4's single USB 2.0 bus; built in the chroot at image build time (see `uvcvideo/README.md`) |
 | `/etc/ewego-image-release` | version tag and build date |
@@ -39,8 +39,8 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
    Open `http://<hostname>.local:8080/` for the test console: device
    presence, battery, clock, and a button per sensor, plus a live camera
    view. `http://<hostname>.local:8080/live` is the field dashboard: both
-   cameras (with a flip button), IMU traces, GPS, battery, and the
-   recorder, preview and shutdown controls.
+   cameras (with flip and swap buttons), traces from both IMUs, GPS,
+   battery, and the recorder, preview and shutdown controls.
 3. The camera units pick the two USB cameras by hub-port order
    (`DEVICE=auto:1/2`, `auto:2/2`): camera1 is the camera on the lower hub
    port, on any hub. `ewego-cam --list` shows the order; set `DEVICE=port:...`
@@ -51,7 +51,7 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
        sudo systemctl enable --now ewego-record.target # every boot
        sudo systemctl stop ewego-record.target         # stops all of them
 
-   Any member (`ewego-cam@camera1`, `ewego-imu-usb`, `ewego-gps`,
+   Any member (`ewego-cam@camera1`, `ewego-imu-usb`, `ewego-imu-uart`, `ewego-gps`,
    `ewego-audio`, `ewego-fuel`) can be started on its own for
    single-sensor testing.
 5. Check a run (or press **Check last run** on the console's Recorder card):

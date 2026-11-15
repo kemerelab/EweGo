@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 STAMP_RE = re.compile(r"(\d{8}_\d{6})")
-UNITS = ["camera1", "camera2", "imu", "audio", "fuel"]
+UNITS = ["camera1", "camera2", "imu", "imu-uart", "audio", "fuel"]
 GROUP_WINDOW_S = 60
 
 
@@ -151,10 +151,12 @@ def check_camera(d, name):
     return verdict, line, notes, start_wall
 
 
-def check_imu(d):
+def check_imu(d, name="imu"):
+    """ewego-imu-usb (hub module, HID) and ewego-imu-uart (the wearable's own
+    BNO055) write the same summary keys where they mean the same thing."""
     notes = []
-    s = load_json(d / "imu_summary.json")
-    c = d / "imu.csv"
+    s = load_json(d / f"{name}_summary.json")
+    c = d / f"{name}.csv"
     if s is None:
         n = 0
         if c.exists():
@@ -167,17 +169,30 @@ def check_imu(d):
     if s["lost"]:
         pct = 100.0 * s["lost"] / max(1, s["samples"] + s["lost"])
         verdict = "WARN" if pct < 0.5 else "FAIL"
-        notes.append(f"{s['lost']} samples lost in {s['gaps']} gaps ({pct:.2f}%): host late polling the HID endpoint")
+        if "uart" in s.get("program", ""):
+            notes.append(f"{s['lost']} failed UART reads in {s['gaps']} runs ({pct:.2f}%)")
+        else:
+            notes.append(f"{s['lost']} samples lost in {s['gaps']} gaps ({pct:.2f}%): host late polling the HID endpoint")
     if s.get("i2c_errors"):
         notes.append(f"{s['i2c_errors']} I2C errors on the module")
+    if s.get("queue", {}).get("overruns"):
+        verdict = "FAIL"
+        notes.append(f"{s['queue']['overruns']} ring overruns: the writer thread fell behind")
     if abs(s.get("device_minus_host_drift_ppm", 0)) > 200:
         notes.append(f"device clock drift {s['device_minus_host_drift_ppm']:.0f} ppm vs host")
-    if abs(s["effective_hz"] - 100) > 1:
+    if s.get("late_ticks"):
+        notes.append(f"{s['late_ticks']} late ticks (reader fell a whole period behind)")
+    expected = s.get("rate_hz", 100)
+    if abs(s["effective_hz"] - expected) > 1:
         verdict = "WARN" if verdict == "PASS" else verdict
-        notes.append(f"rate {s['effective_hz']:.2f} Hz (expected 100)")
+        notes.append(f"rate {s['effective_hz']:.2f} Hz (expected {expected})")
     start_wall = s["first_host_mono_us"] + s["realtime_minus_monotonic_us"]
     line = (f"{s['samples']} samples, {fmt_dur(dur)}, {s['effective_hz']:.2f} Hz, lost {s['lost']}, "
-            f"interval {s['interval_us']['min']:.0f}-{s['interval_us']['max']:.0f} us, drift {s['device_minus_host_drift_ppm']:.1f} ppm")
+            f"interval {s['interval_us']['min']:.0f}-{s['interval_us']['max']:.0f} us")
+    if "device_minus_host_drift_ppm" in s:
+        line += f", drift {s['device_minus_host_drift_ppm']:.1f} ppm"
+    if "xfer_us_max" in s:
+        line += f", uart max {s['xfer_us_max'] / 1000:.1f} ms, jitter max {s.get('jitter_us_max', 0) / 1000:.1f} ms"
     return verdict, line, notes, start_wall
 
 
@@ -368,8 +383,8 @@ def report(run, root):
             try:
                 if unit in ("camera1", "camera2"):
                     v, line, notes, start = check_camera(p, unit)
-                elif unit == "imu":
-                    v, line, notes, start = check_imu(p)
+                elif unit in ("imu", "imu-uart"):
+                    v, line, notes, start = check_imu(p, unit)
                 elif unit == "audio":
                     v, line, notes, start = check_audio(p)
                 elif unit == "fuel":
@@ -379,7 +394,7 @@ def report(run, root):
             except Exception as e:  # a half-written file should not hide the other streams
                 v, line, notes, start = "FAIL", f"could not read: {type(e).__name__}: {e}", [], None
         if v == "MISSING":
-            if unit in ("camera1", "camera2", "imu"):
+            if unit in ("camera1", "camera2", "imu", "imu-uart"):
                 worst = "FAIL"
             elif worst == "PASS":
                 worst = "WARN"
@@ -431,7 +446,7 @@ def collect(run, dest):
     if a and (a / "audio.wav").exists():
         link(a / "audio.wav", dest / f"audio_{run['stamps']['audio']}.wav")
         n += 1
-    for unit in ("imu", "fuel"):
+    for unit in ("imu", "imu-uart", "fuel"):
         d = run["units"].get(unit)
         if d:
             for src in d.iterdir():

@@ -1141,16 +1141,16 @@ class Preview:
                 conf = read_conf(f"/etc/ewego/cam-{cam}.conf")
                 argv = [tool("ewego-cam"), "--device", conf.get("DEVICE", f"auto:{i}/{n}"),
                         "--size", conf.get("SIZE", "1920x1080"), "--fps", conf.get("FPS", "30"),
-                        "--name", cam, "--preview", "--live", str(LIVE_DIR), "--stats", "0", "--wait", "10"]
+                        "--name", cam, "--preview", "--live", str(LIVE_DIR), "--stats", "5", "--wait", "10"]
                 self._spawn(cam, argv)
             conf = read_conf("/etc/ewego/imu-usb.conf")
             argv = [tool("ewego-imu-usb"), "--preview", "--live", str(LIVE_DIR),
-                    "--name", conf.get("NAME", "imu"), "--stats", "0"] + conf.get("DEVICE_ARG", "").split()
+                    "--name", conf.get("NAME", "imu"), "--stats", "5", "--rt"] + conf.get("DEVICE_ARG", "").split()
             self._spawn("imu", argv)
             conf = read_conf("/etc/ewego/imu-uart.conf")
             argv = [tool("ewego-imu-uart"), "--preview", "--live", str(LIVE_DIR),
                     "--name", conf.get("NAME", "imu-uart"), "--port", conf.get("PORT", IMU_PORT),
-                    "--baud", conf.get("BAUD", "115200"), "--rate", conf.get("RATE", "100"), "--stats", "0"]
+                    "--baud", conf.get("BAUD", "115200"), "--rate", conf.get("RATE", "100"), "--stats", "5", "--rt"]
             self._spawn("imu-uart", argv)
             if not self.procs:
                 msg = self.message

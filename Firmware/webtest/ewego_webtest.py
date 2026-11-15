@@ -2246,8 +2246,9 @@ window.addEventListener('resize', draw);
 function camLine(name, c) {
   const st = c.stats, fr = c.frame, wrap = $('w-' + name), m = $('m-' + name);
   if (!st && !fr) { wrap.classList.add('stale'); m.textContent = 'no frames: not recording and no preview'; $('s-' + name).textContent = '–'; return; }
-  const stale = fr && fr.age_s > 4;
-  wrap.classList.toggle('stale', !!stale); if (stale) m.textContent = 'last frame ' + Math.round(fr.age_s) + ' s ago';
+  const stale = fr ? fr.age_s > 4 : !!st;
+  wrap.classList.toggle('stale', !!stale);
+  if (stale) m.textContent = fr ? 'last frame ' + Math.round(fr.age_s) + ' s ago' : 'recorder running but has published no frame file (ewego-cam 0.5.1 or later needed)';
   if (!st) { $('s-' + name).textContent = fr ? 'frame ' + (fr.bytes / 1024).toFixed(0) + ' kB, ' + fr.age_s + ' s old' : '–'; return; }
   $('c' + name.slice(-1) + '-tag').textContent = (st.preview ? 'preview' : 'recording') + ' · ' + st.width + '×' + st.height + ' @ ' + st.fps_requested;
   const bad = st.lost || st.overruns || st.errors;

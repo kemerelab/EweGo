@@ -58,7 +58,7 @@
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.5"
+#define VERSION "0.5.1"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -128,7 +128,7 @@ struct writer {
 	int vid_fd, ts_fd, idx_fd;   /* -1 in --preview: nothing is recorded */
 	size_t wb_chunk;
 	const char *live, *name;     /* live frame: <live>/<name>.jpg */
-	int64_t live_last_ts;
+	int64_t live_last_ts;        /* -1 until the first live frame is written */
 	/* results */
 	uint64_t written_frames, written_bytes;
 	double write_max_ms;
@@ -235,7 +235,7 @@ static void *writer_main(void *arg)
 			break;              /* done and drained */
 
 		/* newest frame for the live view: at most 5 a second, atomic replace */
-		if (w->live && f->ts_us - w->live_last_ts >= 200000) {
+		if (w->live && (w->live_last_ts < 0 || f->ts_us - w->live_last_ts >= 200000)) {
 			char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
 			int lfd;
 			snprintf(fin, sizeof(fin), "%s/%s.jpg", w->live, w->name);
@@ -875,7 +875,7 @@ int main(int argc, char **argv)
 	}
 	w.live = c.live;
 	w.name = c.name;
-	w.live_last_ts = INT64_MIN;
+	w.live_last_ts = -1;   /* not INT64_MIN: ts - INT64_MIN overflows and the frame is never written */
 	pthread_mutex_init(&q.m, NULL);
 	pthread_cond_init(&q.cv, NULL);
 	q.max_bytes = c.ring_bytes;

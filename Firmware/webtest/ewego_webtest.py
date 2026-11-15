@@ -1555,9 +1555,14 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def live_cam(self, q, name):
-        """multipart/x-mixed-replace of the recorder's (or preview's) newest
-        frame, at most `fps` a second and only when the frame changed. The
-        file is replaced atomically, so every read is a whole JPEG."""
+        """The recorder's (or preview's) newest frame as a stream of parts
+        (--frame / Content-Length / blank line / JPEG), at most `fps` a second
+        and only when the frame changed. The file is replaced atomically, so
+        every read is a whole JPEG. Sent as application/octet-stream for the
+        live page's fetch() reader: browsers run their own multipart splitter
+        on multipart/x-mixed-replace and a fetch reader may then see only the
+        first part. `native=1` labels it multipart/x-mixed-replace for a
+        plain <img src>, the fallback the page uses if its reader fails."""
         if name not in CAMERAS:
             self.send_json({"error": "unknown camera"}, 404)
             return
@@ -1567,8 +1572,10 @@ class Handler(BaseHTTPRequestHandler):
             fps = 2.0
         p = LIVE_DIR / f"{name}.jpg"
         self.send_response(200)
-        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame" if q.get("native")
+                         else "application/octet-stream")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         last_mtime, last_sent = None, 0.0
         try:
@@ -2157,19 +2164,31 @@ async function streamCam(name) {
         if (!m) { buf = buf.subarray(h + 4); continue; }
         const len = +m[1]; if (buf.length < h + 4 + len) break;
         const body = buf.slice(h + 4, h + 4 + len); buf = buf.subarray(h + 4 + len);
-        const url = URL.createObjectURL(new Blob([body], {type: 'image/jpeg'}));
-        const img = $('img-' + name); const old = img.src; img.src = url; if (old) URL.revokeObjectURL(old);
-        c.lastFrame = Date.now(); c.frameBytes = len;
+        showFrame(name, new Blob([body], {type: 'image/jpeg'}), len);
       }
     }
   } catch (e) { /* aborted or dropped */ }
   if (!ctl.signal.aborted) setTimeout(() => streamCam(name), 2000);
 }
-function restartCams() { for (const n in cams) streamCam(n); }
+function showFrame(name, blob, len) {
+  const c = cams[name], img = $('img-' + name), url = URL.createObjectURL(blob);
+  c.received = (c.received || 0) + 1;
+  img.onload = () => { if (c.shown) URL.revokeObjectURL(c.shown); c.shown = url; c.decoded = (c.decoded || 0) + 1; c.lastFrame = Date.now(); };
+  img.onerror = () => { URL.revokeObjectURL(url); c.decodeErrors = (c.decodeErrors || 0) + 1; };
+  img.src = url; c.frameBytes = len;
+  // frames arrive but the browser shows none: hand the stream to a plain <img>
+  if (!c.native && c.received >= 4 && !c.decoded) nativeCam(name);
+}
+function nativeCam(name) {
+  const c = cams[name]; if (c.ctl) c.ctl.abort(); c.native = true;
+  const img = $('img-' + name); img.onload = null; img.onerror = null;
+  img.src = '/api/live/cam/' + name + '?fps=' + $('rate').value + '&native=1&t=' + Date.now();
+}
+function restartCams() { for (const n in cams) { if (cams[n].native) nativeCam(n); else streamCam(n); } }
 $('rate').onchange = restartCams;
 function togglePause() {
   paused = !paused; $('pause').textContent = paused ? 'Resume views' : 'Pause views'; $('pause').classList.toggle('on', paused);
-  if (paused) { for (const n in cams) if (cams[n].ctl) cams[n].ctl.abort(); } else restartCams();
+  if (paused) { for (const n in cams) { if (cams[n].ctl) cams[n].ctl.abort(); if (cams[n].native) $('img-' + n).removeAttribute('src'); } } else restartCams();
 }
 function flip(name) {
   const img = $('img-' + name); img.classList.toggle('flip');
@@ -2262,7 +2281,13 @@ function camLine(name, c) {
   const bad = st.lost || st.overruns || st.errors;
   $('s-' + name).innerHTML = st.fps.toFixed(1) + ' fps · ' + st.frames + ' frames · ' + (bad ? '<span class="bad">' : '') + st.lost + ' lost, ' + st.overruns + ' overruns, ' + st.errors + ' err' + (bad ? '</span>' : '') +
     ' · ' + fmtDur(st.elapsed_s) + (st.preview ? '' : ' · ' + st.written_mb.toFixed(0) + ' MB · write max ' + st.write_max_ms + ' ms · queue ' + st.queue_mb + ' MB (peak ' + st.queue_peak_mb + ')') +
-    (fr ? ' · frame ' + (fr.bytes / 1024).toFixed(0) + ' kB' : '');
+    (fr ? ' · frame ' + (fr.bytes / 1024).toFixed(0) + ' kB' : '') + browserLine(name);
+}
+function browserLine(name) {
+  const c = cams[name];
+  if (c.native) return ' · browser: native image stream' + (kbps ? '' : ' (bytes not counted)');
+  if (c.decodeErrors) return ' · <span class="bad">browser could not decode ' + c.decodeErrors + ' frame(s)</span>';
+  return c.received ? ' · browser: ' + c.received + ' frames received, ' + (c.decoded || 0) + ' shown' : ' · browser: waiting for the first frame';
 }
 function imuLine(st) {
   if (!st) { $('s-imu').textContent = 'no data: not recording and no preview'; return; }

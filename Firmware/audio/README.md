@@ -2,7 +2,33 @@
 
 Simple utilities for testing audio capture on a Raspberry Pi using ALSA's `arecord`.
 
+## On the wearable: unit `ewego-audio`
+
+The recording unit runs `arecord` directly through
+`/usr/local/bin/ewego-audio-record` (source: `image/ewego/audio-record.sh`),
+not `record_audio.py`. arecord is the unit's main process, so the unit's
+SIGINT reaches it and it finishes the WAV header before exiting (the old
+Python wrapper let `subprocess.run` SIGKILL arecord 250 ms after the
+interrupt).
+
+- Output: `/opt/ewego/recordings/audio/<YYYYmmdd_HHMMSS>/audio.wav`, 48 kHz,
+  stereo, S32_LE (384 kB/s).
+- Rollover: a WAV file stops at 2 GiB (about 93 minutes at this format).
+  arecord then renames `audio.wav` to `audio-01.wav` and continues in
+  `audio-02.wav`, `audio-03.wav`, ... `ewego-check.py` treats all of them as
+  one recording, and `--collect` links each part.
+- Device: the voicehat card (the stereo PDM mics) is found by name in
+  `/proc/asound/cards` and used as `plughw:CARD=<id>,DEV=0`, the same way
+  the web console finds it; ALSA `default` is not guaranteed to be that card.
+  Set `DEVICE=` in `/etc/ewego/audio.conf` to pin another device;
+  `ewego-audio-record --print-device` shows the choice.
+
 ## Scripts
+
+### `record_audio.py`
+
+Bench recorder (`--output FILE`, `--duration S`, `--device DEV`) with the
+same format. Kept for bench use; the unit no longer uses it.
 
 ### `local_test.sh`
 

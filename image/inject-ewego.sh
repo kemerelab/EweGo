@@ -28,6 +28,7 @@
 #                                                latter starts ewego-record.target
 #                                                when /boot/firmware/ewego-record
 #                                                exists)
+#           /usr/local/bin/ewego-audio-record    helper scripts from image/ewego/*.sh
 #           /etc/modules-load.d/ewego.conf       i2c-dev
 #           /etc/systemd/journald.conf.d/ewego.conf  persistent journal capped at
 #                                                100M, rate-limited
@@ -187,6 +188,14 @@ install -d "$ROOT_MNT/etc/ewego"
 for f in "$IMAGE_DIR"/ewego/*.conf; do
     case $(basename "$f") in journald-*) continue ;; esac   # installed below
     install -m 644 "$f" "$ROOT_MNT/etc/ewego/$(basename "$f")"
+done
+
+# helper scripts used by the units: image/ewego/<name>.sh -> /usr/local/bin/ewego-<name>
+for f in "$IMAGE_DIR"/ewego/*.sh; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f" .sh)
+    log "Installing /usr/local/bin/ewego-$b"
+    install -m 755 "$f" "$ROOT_MNT/usr/local/bin/ewego-$b"
 done
 
 # --- rootfs: bounded, persistent journal ------------------------------------

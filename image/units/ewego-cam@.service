@@ -10,6 +10,12 @@ StartLimitIntervalSec=0
 Type=notify
 # One file per camera: /etc/ewego/cam-camera1.conf, /etc/ewego/cam-camera2.conf
 EnvironmentFile=/etc/ewego/cam-%i.conf
+# the live preview of this camera (started by the web console) must let go
+# of the device first; "-" ignores the failure when no preview is loaded
+ExecStartPre=-/bin/systemctl stop ewego-preview@%i.service
+# skip the start (inactive, not failed, no restart loop) when the card has
+# less than 500 MB free; writes /run/ewego/space.json for the console
+ExecCondition=/usr/local/bin/ewego-check-space ${OUT_DIR}
 ExecStart=/usr/local/bin/ewego-cam --device ${DEVICE} --size ${SIZE} --fps ${FPS} --out ${OUT_DIR} --name %i $EXTRA_ARGS
 # ewego-cam stops the stream, drains its RAM queue (up to --ring MB, default
 # 64) to the card, fdatasyncs and writes its summary on SIGINT/SIGTERM; it

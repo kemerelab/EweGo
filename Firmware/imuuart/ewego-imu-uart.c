@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,7 +90,8 @@ static int uart_open(const char *port, int baud)
 	}
 	fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) {
-		fprintf(stderr, "open %s: %s\n", port, strerror(errno));
+		fprintf(stderr, "open %s: %s%s\n", port, strerror(errno),
+			errno == EBUSY ? " (another process holds the port exclusively: a recorder or preview?)" : "");
 		return -1;
 	}
 	if (tcgetattr(fd, &t)) {
@@ -109,6 +111,11 @@ static int uart_open(const char *port, int baud)
 		return -1;
 	}
 	tcflush(fd, TCIOFLUSH);
+	/* exclusive: nobody else (the console's test scripts, a second
+	 * recorder) can open the port while we own it; they get EBUSY.
+	 * Processes with CAP_SYS_ADMIN are exempt (kernel rule). */
+	if (ioctl(fd, TIOCEXCL) && errno != ENOTTY)
+		fprintf(stderr, "note: TIOCEXCL on %s failed (%s)\n", port, strerror(errno));
 	return fd;
 }
 
@@ -139,14 +146,23 @@ static int read_exact(int fd, uint8_t *buf, int n, int64_t deadline)
 	return got;
 }
 
-static int write_all(int fd, const uint8_t *buf, int n)
+/* write n bytes by the deadline (the fd is non-blocking: wait for POLLOUT,
+ * never spin on EAGAIN, which on the SCHED_FIFO thread would starve the
+ * writer); -1 on error or timeout */
+static int write_all(int fd, const uint8_t *buf, int n, int64_t deadline)
 {
 	while (n > 0) {
 		ssize_t w = write(fd, buf, (size_t)n);
 		if (w < 0) {
-			if (errno == EINTR || errno == EAGAIN)
+			struct pollfd p = {.fd = fd, .events = POLLOUT};
+			int64_t left = deadline - rec_mono_us();
+			if (errno == EINTR)
 				continue;
-			return -1;
+			if (errno != EAGAIN || left <= 0)
+				return -1;
+			if (poll(&p, 1, (int)((left + 999) / 1000)) < 0 && errno != EINTR)
+				return -1;
+			continue;
 		}
 		buf += w;
 		n -= (int)w;
@@ -163,7 +179,7 @@ static int bno_read(int fd, uint8_t reg, int len, uint8_t *buf, int timeout_ms)
 	uint8_t cmd[4] = {0xAA, 0x01, reg, (uint8_t)len}, hdr[2];
 	int64_t deadline = rec_mono_us() + (int64_t)timeout_ms * 1000;
 
-	if (write_all(fd, cmd, 4))
+	if (write_all(fd, cmd, 4, deadline))
 		return -1;
 	if (read_exact(fd, hdr, 2, deadline) != 2)
 		return -1;
@@ -181,7 +197,7 @@ static int bno_write(int fd, uint8_t reg, uint8_t val)
 	uint8_t cmd[5] = {0xAA, 0x00, reg, 1, val}, rsp[2];
 	int64_t deadline = rec_mono_us() + 200000;
 
-	if (write_all(fd, cmd, 5))
+	if (write_all(fd, cmd, 5, deadline))
 		return -1;
 	if (read_exact(fd, rsp, 2, deadline) != 2)
 		return -1;
@@ -558,12 +574,15 @@ int main(int argc, char **argv)
 
 	/* leave the sensor in config mode, like the Python logger did */
 	bno_write(fd, REG_OPR_MODE, MODE_CONFIG);
+	ioctl(fd, TIOCNXCL);
 	close(fd);
-	rec_end(&rec);
 	{
+		int oc = rec_end(&rec);
 		struct rec_snap q = rec_snapshot(&rec);
 		uint64_t e0 = u.err_by_code[0], e7 = u.err_by_code[7], e10 = u.err_by_code[10];
-		if (exit_code == 0 && (u.read_errors || q.overruns))
+		if (oc)
+			exit_code = oc;              /* the recording itself is incomplete: trumps everything */
+		else if (exit_code == 0 && (u.read_errors || q.overruns))
 			exit_code = 2;
 		rec_write_summary(&rec, exit_code);
 		fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s) (timeout/garbage %" PRIu64

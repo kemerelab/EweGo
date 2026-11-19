@@ -28,8 +28,11 @@ jobs:
       - name: Shell scripts
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          bash -n image/*.sh image/uvcvideo/*.sh
-          shellcheck -S warning image/*.sh image/uvcvideo/*.sh
+          # one file per call: `bash -n a b` checks only a (b becomes $1)
+          for f in image/*.sh image/uvcvideo/*.sh; do bash -n "$f"; done
+          # the scripts installed on the wearable are POSIX sh (#!/bin/sh, dash on the image)
+          for f in image/ewego/*.sh; do sh -n "$f"; done
+          shellcheck -S warning image/*.sh image/uvcvideo/*.sh image/ewego/*.sh
       - name: Python firmware compiles
         run: git ls-files 'Firmware/*.py' 'Firmware/**/*.py' 'image/**/*.py' | xargs python3 -m py_compile
       - name: uvcvideo patch applies to the current Pi kernel source

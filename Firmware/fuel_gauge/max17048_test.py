@@ -40,6 +40,9 @@ class MAX17048:
         """
         self.bus_number = bus_number
         self.address = address
+        # False silences the per-register error prints (the unattended
+        # logger reports error state changes itself, once)
+        self.verbose = True
         try:
             self.bus = smbus2.SMBus(bus_number)
             print(f"✓ Connected to MAX17048 on I2C bus {bus_number} at address 0x{address:02X}")
@@ -54,7 +57,8 @@ class MAX17048:
             lsb = self.bus.read_byte_data(self.address, register + 1)
             return (msb << 8) | lsb
         except Exception as e:
-            print(f"✗ Error reading register 0x{register:02X}: {e}")
+            if self.verbose:
+                print(f"✗ Error reading register 0x{register:02X}: {e}")
             return None
 
     def write_register(self, register, value):
@@ -66,7 +70,8 @@ class MAX17048:
             self.bus.write_byte_data(self.address, register + 1, lsb)
             return True
         except Exception as e:
-            print(f"✗ Error writing register 0x{register:02X}: {e}")
+            if self.verbose:
+                print(f"✗ Error writing register 0x{register:02X}: {e}")
             return False
 
     def get_vcell(self):
@@ -263,7 +268,8 @@ def run_basic_test(fg):
     return True
 
 
-def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
+def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None,
+                              print_every=0, on_reading=None):
     """
     Run continuous monitoring test
 
@@ -272,6 +278,11 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
         duration: Total monitoring duration in seconds
         interval: Reading interval in seconds
         log_file: Optional path to CSV file for logging data
+        print_every: 0 prints every reading (interactive use); N > 0 prints
+            at most one reading per N seconds, plus the first reading and any
+            change of state (sensor error / recovered, alert on / off)
+        on_reading: optional callable(voltage, soc, alert) called after every
+            reading (None values on a read error); returning True stops the loop
     """
     print_separator()
     print(f"CONTINUOUS MONITORING TEST ({duration}s)")
@@ -305,6 +316,8 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
 
     start_time = time.time()
     reading_count = 0
+    last_print = None   # time of the last printed reading
+    last_state = None   # (ok, alert) of the previous reading
 
     try:
         while (time.time() - start_time) < duration:
@@ -313,9 +326,19 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
             soc = fg.get_soc()
             alert = fg.is_alert_active()
 
-            if voltage is not None and soc is not None:
+            ok = voltage is not None and soc is not None
+            state = (ok, bool(alert))
+            now = time.time()
+            show = (print_every <= 0 or last_print is None or state != last_state
+                    or now - last_print >= print_every)
+            last_state = state
+            if show:
+                last_print = now
+
+            if ok:
                 alert_str = "YES" if alert else "NO"
-                print(f"{elapsed:6.1f}   {voltage:6.3f}      {soc:5.2f}    {alert_str}")
+                if show:
+                    print(f"{elapsed:6.1f}   {voltage:6.3f}      {soc:5.2f}    {alert_str}")
                 reading_count += 1
 
                 # Log to file if enabled
@@ -329,7 +352,8 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
                     except Exception as e:
                         print(f"✗ Error writing to log: {e}")
             else:
-                print(f"{elapsed:6.1f}   ERROR reading sensor")
+                if show:
+                    print(f"{elapsed:6.1f}   ERROR reading sensor")
                 if csv_writer:
                     try:
                         timestamp = time.time()
@@ -339,6 +363,9 @@ def run_continuous_monitoring(fg, duration=30, interval=2, log_file=None):
                         file_handle.flush()
                     except Exception as e:
                         print(f"✗ Error writing to log: {e}")
+
+            if on_reading is not None and on_reading(voltage, soc, alert):
+                break
 
             time.sleep(interval)
 

@@ -70,6 +70,43 @@ python3 max17048_test.py --bus 3
 - Real-time alert status monitoring
 - Graceful keyboard interrupt handling
 
+### 3. `log_fuel_gauge.py` (unit `ewego-fuel`)
+**Purpose**: the wearable's unattended battery logger and low-battery guard.
+
+Writes `/opt/ewego/recordings/fuel/<YYYYmmdd_HHMMSS>/fuel_gauge.csv`
+(columns `Timestamp, Datetime, Elapsed_Seconds, Voltage_V, SOC_Percent,
+Alert`, one row per `--interval`, default 2 s) through
+`max17048_test.run_continuous_monitoring`.
+
+**Low-battery shutdown**: when the charge is below `--shutdown-soc`
+(default 8 %) **and** the cell voltage is below `--shutdown-voltage`
+(default 3.5 V) for `--shutdown-samples` consecutive readings (default 30,
+one minute at 2 s), it appends a line to `events.log` in the run directory
+(next to the CSV; the CSV columns do not change), prints it to the journal,
+and runs `systemctl poweroff`. Poweroff stops `ewego-record.target` through
+the normal shutdown ordering, so every recorder closes its files and the
+card is synced before the battery dies mid-write (the cause of
+`Firmware/bugs/001_sd_power_loss_corruption.md`). One reading above either
+threshold resets the count; failed readings (`ERROR` rows) neither count nor
+reset it. Both conditions are required because SOC alone is unreliable after
+a deep discharge (this gauge once read 1 % at 3.53 V while recharging).
+
+The unit takes the settings from `/etc/ewego/fuel.conf`:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SHUTDOWN` | `1` | `0` = only log the event (bench, USB power, no battery) |
+| `SHUTDOWN_SOC` | `8` | percent |
+| `SHUTDOWN_VOLTAGE` | `3.5` | volts |
+| `SHUTDOWN_SAMPLES` | `30` | consecutive readings |
+
+The logger prints one reading per minute (`--print-every 60`) plus any change
+of sensor or alert state, not one line per reading. On the bench:
+
+```bash
+python3 log_fuel_gauge.py --out /tmp/fuel --no-shutdown --print-every 0
+```
+
 ---
 
 ## Issue Resolution Log

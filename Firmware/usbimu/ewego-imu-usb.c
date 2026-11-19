@@ -15,11 +15,12 @@
  *
  * Two threads, like ewego-cam: the reader (the main thread, optionally
  * SCHED_FIFO with --rt) only polls the hidraw node, timestamps each report
- * and pushes it into a RAM ring; the writer thread does the accounting, the
- * CSV and the live file. The kernel keeps just 64 reports (0.6 s at 100 Hz)
- * per open hidraw node, and with a single thread a CSV write that blocked on
- * the SD card while the cameras were streaming to it lost up to 150 samples
- * at a time (seen 2026-11-12). Now a slow write only grows the ring.
+ * and pushes it into a RAM ring; the writer thread (Firmware/common/ewego-rec.c)
+ * does the accounting, the CSV and the live file. The kernel keeps just 64
+ * reports (0.6 s at 100 Hz) per open hidraw node, and with a single thread a
+ * CSV write that blocked on the SD card while the cameras were streaming to
+ * it lost up to 150 samples at a time (seen 2026-11-12). Now a slow write
+ * only grows the ring.
  *
  * --live DIR writes <name>.json there (meant for tmpfs, /run/ewego) ten
  * times a second: counters plus the most recent samples, for the web
@@ -29,7 +30,7 @@
  * Exit: 0 clean and nothing lost; 2 lost or flagged samples or ring
  * overruns; 3 no reports for --stall seconds; 1 usage/device error.
  *
- * Build: gcc -O2 -Wall -Wextra -pthread -static -o ewego-imu-usb ewego-imu-usb.c
+ * Build: make (compiles ../common/ewego-rec.c in)
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -39,17 +40,13 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
-#include <pthread.h>
-#include <sched.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
+
+#include "../common/ewego-rec.h"
 
 #define VERSION "0.3.1"
 #define USB_VID 0x1209
@@ -60,49 +57,6 @@
 #define RPT_FLAG_NO_SENSOR 0x02
 #define RPT_FLAG_DROPPED   0x04
 
-#define RING_N 8192      /* samples between reader and writer: ~80 s at 100 Hz */
-#define LIVE_N 64        /* most recent samples kept for the live file */
-#define LIVE_INTERVAL_US 100000
-
-static volatile sig_atomic_t g_stop;
-static void on_signal(int s) { (void)s; g_stop = 1; }
-
-static int64_t mono_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-static int64_t real_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-static int16_t le16(const uint8_t *p) { return (int16_t)(p[0] | (p[1] << 8)); }
-
-/* mkdir -p: every component, EEXIST is fine. Returns 0 or -1 with errno. */
-static int mkdir_p(const char *path, mode_t mode)
-{
-	char buf[PATH_MAX];
-	size_t len = strlen(path), i;
-
-	if (len == 0 || len >= sizeof(buf))
-		return -1;
-	memcpy(buf, path, len + 1);
-	for (i = 1; i <= len; i++) {
-		if (buf[i] == '/' || buf[i] == 0) {
-			char c = buf[i];
-			buf[i] = 0;
-			if (mkdir(buf, mode) && errno != EEXIST)
-				return -1;
-			buf[i] = c;
-		}
-	}
-	return 0;
-}
 static uint16_t ule16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t ule32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 
@@ -138,32 +92,14 @@ static int find_device(char *out, size_t outlen)
 	return found == 1 ? 0 : (found ? -2 : -1);
 }
 
-/* ---- reader -> writer ring ---------------------------------------------- */
-
 struct sample {
 	int64_t host_mono, host_real;
 	uint8_t rpt[RPT_LEN];
 };
 
-struct ring {
-	pthread_mutex_t m;
-	pthread_cond_t cv;
-	struct sample s[RING_N];
-	unsigned head, tail, count, peak;
-	uint64_t overruns;
-	int done;
-};
-
-/* ---- writer state ------------------------------------------------------- */
-
-struct writer {
-	struct ring *r;
-	FILE *csv;                 /* NULL in --preview */
-	const char *name, *devpath, *live_dir, *session;
-	int quiet, stats_interval, preview;
-	int64_t t_start;
-	/* accounting */
-	uint64_t n, lost, gaps, flagged, i2c_err, dropped;
+/* writer-thread accounting, plus reader counters (atomic) */
+struct usb {
+	uint64_t lost, gaps, flagged, i2c_err, dropped;
 	uint16_t last_seq;
 	int have_seq;
 	uint32_t last_dev;
@@ -172,122 +108,93 @@ struct writer {
 	double dt_min, dt_max, dt_sum;
 	uint64_t dt_n;
 	uint32_t i2c_us_max;
-	/* live file */
-	struct sample live[LIVE_N];
-	uint64_t live_n[LIVE_N];    /* running sample index of each live entry */
-	unsigned live_head, live_count;
-	pthread_t thread;
+	uint64_t bad_reports;       /* reader */
 };
 
-static double drift_ppm(const struct writer *w)
+#define A_LOAD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define A_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
+
+static double drift_ppm(const struct usb *u)
 {
-	if (!w->have_seq || w->last_host <= w->first_host)
+	if (!u->have_seq || u->last_host <= u->first_host)
 		return 0;
-	return ((double)w->dev_total - (double)(w->last_host - w->first_host)) / (double)(w->last_host - w->first_host) * 1e6;
+	return ((double)u->dev_total - (double)(u->last_host - u->first_host)) / (double)(u->last_host - u->first_host) * 1e6;
 }
 
-static double rate_hz(const struct writer *w)
+static double rate_hz(const struct usb *u)
 {
-	return w->dt_n ? 1e6 / (w->dt_sum / (double)w->dt_n) : 0;
+	return u->dt_n ? 1e6 / (u->dt_sum / (double)u->dt_n) : 0;
 }
 
-static void csv_row(FILE *csv, const struct sample *s)
+static int bad_data(const uint8_t *rpt) { return rpt[1] & (RPT_FLAG_I2C_ERROR | RPT_FLAG_NO_SENSOR); }
+
+static void csv_row(FILE *csv, const void *p)
 {
+	const struct sample *s = p;
 	const uint8_t *b = s->rpt;
-	uint8_t flags = b[1];
-	uint16_t seq = ule16(b + 2);
-	uint32_t dev = ule32(b + 4);
-	const uint8_t *bu = b + 8;
-	uint16_t i2c_us = ule16(b + 54);
-	time_t secs = (time_t)(s->host_real / 1000000);
-	struct tm tm;
-	char ts[40];
 
-	localtime_r(&secs, &tm);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm);
-	fprintf(csv, "%s.%06" PRId64, ts, s->host_real % 1000000);
-	if (flags & (RPT_FLAG_I2C_ERROR | RPT_FLAG_NO_SENSOR)) {
-		for (int i = 0; i < 27; i++)
-			fputs(",", csv);
-	} else {
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 18) / 16.0, le16(bu + 20) / 16.0, le16(bu + 22) / 16.0);
-		fprintf(csv, ",%.6f,%.6f,%.6f,%.6f", le16(bu + 24) / 16384.0, le16(bu + 26) / 16384.0,
-			le16(bu + 28) / 16384.0, le16(bu + 30) / 16384.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 32) / 100.0, le16(bu + 34) / 100.0, le16(bu + 36) / 100.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 38) / 100.0, le16(bu + 40) / 100.0, le16(bu + 42) / 100.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 0) / 100.0, le16(bu + 2) / 100.0, le16(bu + 4) / 100.0);
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 12) / 16.0, le16(bu + 14) / 16.0, le16(bu + 16) / 16.0);
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 6) / 16.0, le16(bu + 8) / 16.0, le16(bu + 10) / 16.0);
-		fprintf(csv, ",%d,%u,%u,%u,%u", (int8_t)bu[44], (bu[45] >> 6) & 3, (bu[45] >> 4) & 3,
-			(bu[45] >> 2) & 3, bu[45] & 3);
-	}
-	fprintf(csv, ",%" PRId64 ",%" PRIu32 ",%u,%u,%u\n", s->host_mono, dev, seq, i2c_us, flags);
+	rec_bno_csv(csv, s->host_real, bad_data(b) ? NULL : b + 8);
+	fprintf(csv, ",%" PRId64 ",%" PRIu32 ",%u,%u,%u\n", s->host_mono, ule32(b + 4), ule16(b + 2), ule16(b + 54), b[1]);
 }
 
-/* The live file: counters and the last LIVE_N samples, written atomically. */
-static void write_live(struct writer *w, int64_t now)
+static const uint8_t *valid_burst(const void *p)
 {
-	char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
-	FILE *f;
-	unsigned i;
-	const uint8_t *latest = NULL;
+	const struct sample *s = p;
+	return bad_data(s->rpt) ? NULL : s->rpt + 8;
+}
 
-	snprintf(fin, sizeof(fin), "%s/%s.json", w->live_dir, w->name);
-	snprintf(tmp, sizeof(tmp), "%s/.%s.json.tmp", w->live_dir, w->name);
-	f = fopen(tmp, "w");
-	if (!f)
-		return;
-	/* latest sample with valid sensor data, for temperature and calibration */
-	for (i = 0; i < w->live_count; i++) {
-		const struct sample *s = &w->live[(w->live_head + LIVE_N - 1 - i) % LIVE_N];
-		if (!(s->rpt[1] & (RPT_FLAG_I2C_ERROR | RPT_FLAG_NO_SENSOR))) {
-			latest = s->rpt + 8;
-			break;
-		}
-	}
-	fprintf(f, "{\"program\":\"ewego-imu-usb %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
-		VERSION, w->name, w->devpath, w->preview);
-	if (w->session)
-		fprintf(f, "\"session\":\"%s\",", w->session);
-	else
-		fputs("\"session\":null,", f);
-	fprintf(f, "\"elapsed_s\":%.1f,\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
-		   ",\"flagged\":%" PRIu64 ",\"i2c_errors\":%" PRIu64 ",\"queue_overruns\":%" PRIu64
+static void live_row(FILE *f, uint64_t n, const void *p)
+{
+	const struct sample *s = p;
+
+	fprintf(f, "[%" PRIu64 ",%u,%" PRIu32 ",%" PRId64, n, ule16(s->rpt + 2), ule32(s->rpt + 4), s->host_mono);
+	rec_bno_live(f, valid_burst(s));
+	fprintf(f, ",%u]", s->rpt[1]);
+}
+
+static void live_counters(FILE *f, struct rec *r, const struct rec_snap *q)
+{
+	struct usb *u = r->app;
+
+	fprintf(f, "\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64 ",\"flagged\":%" PRIu64
+		   ",\"i2c_errors\":%" PRIu64 ",\"queue_overruns\":%" PRIu64
 		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":%.0f,\"i2c_us_max\":%u,",
-		(double)(now - w->t_start) / 1e6, w->n, w->lost, w->gaps, w->flagged, w->i2c_err,
-		w->r->overruns, w->r->peak, rate_hz(w), drift_ppm(w), w->i2c_us_max);
-	if (latest)
-		fprintf(f, "\"temp_c\":%d,\"cal\":[%u,%u,%u,%u],", (int8_t)latest[44], (latest[45] >> 6) & 3,
-			(latest[45] >> 4) & 3, (latest[45] >> 2) & 3, latest[45] & 3);
-	else
-		fputs("\"temp_c\":null,\"cal\":null,", f);
-	fprintf(f, "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 ",", now, real_us());
-	fputs("\"cols\":[\"n\",\"seq\",\"dev_ts_us\",\"host_mono_us\",\"heading\",\"roll\",\"pitch\","
-	      "\"ax\",\"ay\",\"az\",\"gx\",\"gy\",\"gz\",\"lax\",\"lay\",\"laz\",\"flags\"],\"recent\":[", f);
-	for (i = 0; i < w->live_count; i++) {
-		unsigned k = (w->live_head + LIVE_N - w->live_count + i) % LIVE_N;
-		const struct sample *s = &w->live[k];
-		const uint8_t *bu = s->rpt + 8;
-		uint8_t flags = s->rpt[1];
-		fprintf(f, "%s[%" PRIu64 ",%u,%" PRIu32 ",%" PRId64, i ? "," : "", w->live_n[k],
-			ule16(s->rpt + 2), ule32(s->rpt + 4), s->host_mono);
-		if (flags & (RPT_FLAG_I2C_ERROR | RPT_FLAG_NO_SENSOR))
-			fputs(",null,null,null,null,null,null,null,null,null,null,null,null", f);
-		else
-			fprintf(f, ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f",
-				le16(bu + 18) / 16.0, le16(bu + 20) / 16.0, le16(bu + 22) / 16.0,
-				le16(bu + 0) / 100.0, le16(bu + 2) / 100.0, le16(bu + 4) / 100.0,
-				le16(bu + 12) / 16.0, le16(bu + 14) / 16.0, le16(bu + 16) / 16.0,
-				le16(bu + 32) / 100.0, le16(bu + 34) / 100.0, le16(bu + 36) / 100.0);
-		fprintf(f, ",%u]", flags);
-	}
-	fputs("]}\n", f);
-	fclose(f);
-	rename(tmp, fin);
+		r->n, u->lost, u->gaps, u->flagged, u->i2c_err, q->overruns, q->peak, rate_hz(u), drift_ppm(u), u->i2c_us_max);
 }
 
-static void process_sample(struct writer *w, const struct sample *s)
+static void stats(char *buf, size_t len, struct rec *r, const struct rec_snap *q)
 {
+	struct usb *u = r->app;
+
+	snprintf(buf, len, "%s: %" PRIu64 " samples, %" PRIu64 " lost, %" PRIu64 " flagged | %.2f Hz (device clock), "
+		 "interval %.0f/%.0f us, i2c max %u us, drift %+.0f ppm | queue peak %u, overruns %" PRIu64,
+		 r->name, r->n, u->lost, u->flagged, rate_hz(u), u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_max : 0.0,
+		 u->i2c_us_max, drift_ppm(u), q->peak, q->overruns);
+}
+
+static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
+{
+	struct usb *u = r->app;
+
+	fprintf(js, "  \"samples\": %" PRIu64 ",\n"
+		    "  \"lost\": %" PRIu64 ",\n  \"gaps\": %" PRIu64 ",\n  \"flagged\": %" PRIu64 ",\n"
+		    "  \"i2c_errors\": %" PRIu64 ",\n  \"host_not_polling\": %" PRIu64 ",\n"
+		    "  \"bad_reports\": %" PRIu64 ",\n"
+		    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
+		    "  \"realtime\": %d,\n"
+		    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
+		    "  \"effective_hz\": %.3f,\n  \"i2c_us_max\": %u,\n  \"device_minus_host_drift_ppm\": %.1f,\n"
+		    "  \"first_dev_ts_us\": %" PRId64 ",\n  \"first_host_mono_us\": %" PRId64 ",\n",
+		r->n, u->lost, u->gaps, u->flagged, u->i2c_err, u->dropped, A_LOAD(u->bad_reports),
+		q->overruns, q->peak, REC_RING_N, r->realtime,
+		u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_sum / (double)u->dt_n : 0.0, u->dt_n ? u->dt_max : 0.0, u->dt_n,
+		rate_hz(u), u->i2c_us_max, drift_ppm(u), u->first_dev, u->first_host);
+}
+
+static void account(struct rec *r, const void *p)
+{
+	struct usb *w = r->app;
+	const struct sample *s = p;
 	const uint8_t *b = s->rpt;
 	uint8_t flags = b[1];
 	uint16_t seq = ule16(b + 2);
@@ -306,7 +213,7 @@ static void process_sample(struct writer *w, const struct sample *s)
 			uint16_t missing = (uint16_t)(seq - expect);
 			w->gaps++;
 			w->lost += missing;
-			if (!w->quiet)
+			if (!r->quiet)
 				fprintf(stderr, "gap: seq %u -> %u (%u lost)\n", w->last_seq, seq, missing);
 		}
 		w->dev_total += ddt;
@@ -328,86 +235,24 @@ static void process_sample(struct writer *w, const struct sample *s)
 	}
 	if (i2c_us > w->i2c_us_max)
 		w->i2c_us_max = i2c_us;
-	if (w->csv)
-		csv_row(w->csv, s);
-	if (w->live_dir) {
-		w->live[w->live_head] = *s;
-		w->live_n[w->live_head] = w->n;
-		w->live_head = (w->live_head + 1) % LIVE_N;
-		if (w->live_count < LIVE_N)
-			w->live_count++;
-	}
-	w->n++;
 }
 
-static void print_stats(struct writer *w, int64_t now)
-{
-	uint64_t ovr;
-	unsigned peak;
-
-	pthread_mutex_lock(&w->r->m);
-	ovr = w->r->overruns;
-	peak = w->r->peak;
-	pthread_mutex_unlock(&w->r->m);
-	printf("[%7.1fs] %s: %" PRIu64 " samples, %" PRIu64 " lost, %" PRIu64 " flagged | %.2f Hz (device clock), "
-	       "interval %.0f/%.0f us, i2c max %u us, drift %+.0f ppm | queue peak %u, overruns %" PRIu64 "\n",
-	       (double)(now - w->t_start) / 1e6, w->name, w->n, w->lost, w->flagged, rate_hz(w),
-	       w->dt_n ? w->dt_min : 0.0, w->dt_n ? w->dt_max : 0.0, w->i2c_us_max, drift_ppm(w), peak, ovr);
-	fflush(stdout);
-}
-
-static void *writer_main(void *arg)
-{
-	struct writer *w = arg;
-	struct ring *r = w->r;
-	int64_t t_last_stats = w->t_start, t_last_flush = w->t_start, t_last_live = w->t_start;
-
-	for (;;) {
-		struct sample s;
-		int got = 0, done;
-		int64_t now;
-
-		pthread_mutex_lock(&r->m);
-		if (r->count == 0 && !r->done) {
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			ts.tv_nsec += 100000000;
-			if (ts.tv_nsec >= 1000000000) {
-				ts.tv_sec++;
-				ts.tv_nsec -= 1000000000;
-			}
-			pthread_cond_timedwait(&r->cv, &r->m, &ts);
-		}
-		if (r->count) {
-			s = r->s[r->tail];
-			r->tail = (r->tail + 1) % RING_N;
-			r->count--;
-			got = 1;
-		}
-		done = r->done;
-		pthread_mutex_unlock(&r->m);
-
-		if (got)
-			process_sample(w, &s);
-		else if (done)
-			break;
-
-		now = mono_us();
-		if (w->stats_interval > 0 && !w->quiet && now - t_last_stats >= (int64_t)w->stats_interval * 1000000) {
-			print_stats(w, now);
-			t_last_stats = now;
-		}
-		if (w->csv && now - t_last_flush >= 1000000) {
-			fflush(w->csv);
-			t_last_flush = now;
-		}
-		if (w->live_dir && now - t_last_live >= LIVE_INTERVAL_US) {
-			write_live(w, now);
-			t_last_live = now;
-		}
-	}
-	return NULL;
-}
+static const struct rec_ops ops = {
+	.sample_size = sizeof(struct sample),
+	.csv_header = "timestamp,heading_deg,roll_deg,pitch_deg,quat_w,quat_x,quat_y,quat_z,"
+		      "lin_accel_x,lin_accel_y,lin_accel_z,gravity_x,gravity_y,gravity_z,"
+		      "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z,temp_c,"
+		      "cal_sys,cal_gyro,cal_accel,cal_mag,host_mono_us,dev_ts_us,seq,i2c_us,flags\n",
+	.live_cols = "[\"n\",\"seq\",\"dev_ts_us\",\"host_mono_us\",\"heading\",\"roll\",\"pitch\","
+		     "\"ax\",\"ay\",\"az\",\"gx\",\"gy\",\"gz\",\"lax\",\"lay\",\"laz\",\"flags\"]",
+	.account = account,
+	.csv_row = csv_row,
+	.valid_burst = valid_burst,
+	.live_counters = live_counters,
+	.live_row = live_row,
+	.stats = stats,
+	.summary = summary,
+};
 
 static void usage(FILE *f)
 {
@@ -432,13 +277,11 @@ int main(int argc, char **argv)
 		{"quiet", 0, 0, 'q'}, {"list", 0, 0, 'l'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0},
 	};
 	int opt;
-	char devpath[PATH_MAX], dir[PATH_MAX], path[PATH_MAX + 64];
-	static struct ring ring;    /* static: RING_N samples is too big for the stack */
-	static struct writer w;
-	FILE *csv = NULL;
+	char devpath[PATH_MAX];
+	static struct rec rec;
+	static struct usb u;
 	int fd, exit_code = 0;
-	uint64_t bad_reports = 0;
-	int64_t t_start, t_last_rpt, real0;
+	int64_t t_last_rpt;
 
 	while ((opt = getopt_long(argc, argv, "d:o:n:t:S:x:NrL:Pqlh", lo, NULL)) != -1) {
 		switch (opt) {
@@ -486,23 +329,20 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!preview) {
-		if (session_dir) {
-			time_t t = time(NULL);
-			struct tm tm;
-			char stamp[32];
-			localtime_r(&t, &tm);
-			strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
-			snprintf(dir, sizeof(dir), "%s/%s", out, stamp);
-		} else {
-			snprintf(dir, sizeof(dir), "%s", out);
-		}
-		if (mkdir_p(dir, 0755)) {
-			perror(dir);
-			return 1;
-		}
-	}
-	if (live && mkdir_p(live, 0755)) {
+	rec.ops = &ops;
+	rec.app = &u;
+	rec.program = "ewego-imu-usb " VERSION;
+	rec.name = name;
+	rec.device = devpath;
+	rec.live_dir = live;
+	rec.quiet = quiet;
+	rec.stats_interval = stats_interval;
+	rec.preview = preview;
+	rec.realtime = realtime;
+
+	if (!preview && rec_open_output(&rec, out, session_dir))
+		return 1;
+	if (live && rec_mkdir_p(live, 0755)) {
 		perror(live);
 		return 1;
 	}
@@ -513,71 +353,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!preview) {
-		snprintf(path, sizeof(path), "%s/%s.csv", dir, name);
-		csv = fopen(path, "w");
-		if (!csv) {
-			perror(path);
-			return 1;
-		}
-		setvbuf(csv, NULL, _IOFBF, 64 * 1024);
-		fputs("timestamp,heading_deg,roll_deg,pitch_deg,quat_w,quat_x,quat_y,quat_z,"
-		      "lin_accel_x,lin_accel_y,lin_accel_z,gravity_x,gravity_y,gravity_z,"
-		      "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z,temp_c,"
-		      "cal_sys,cal_gyro,cal_accel,cal_mag,host_mono_us,dev_ts_us,seq,i2c_us,flags\n", csv);
-	}
-
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-
-	t_start = t_last_rpt = mono_us();
-	real0 = real_us();
-
-	pthread_mutex_init(&ring.m, NULL);
-	{
-		/* the writer's timed wait uses CLOCK_MONOTONIC deadlines */
-		pthread_condattr_t ca;
-		pthread_condattr_init(&ca);
-		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-		pthread_cond_init(&ring.cv, &ca);
-		pthread_condattr_destroy(&ca);
-	}
-	w.r = &ring;
-	w.csv = csv;
-	w.name = name;
-	w.devpath = devpath;
-	w.live_dir = live;
-	w.session = preview ? NULL : dir;
-	w.quiet = quiet;
-	w.stats_interval = stats_interval;
-	w.preview = preview;
-	w.t_start = t_start;
-	if (pthread_create(&w.thread, NULL, writer_main, &w)) {
-		perror("pthread_create");
+	rec_signals();
+	if (rec_start(&rec))
 		return 1;
-	}
-
-	/* after the writer exists, so it keeps the normal scheduling class */
-	if (realtime) {
-		struct sched_param sp = {.sched_priority = 10};
-		if (sched_setscheduler(0, SCHED_FIFO, &sp))
-			fprintf(stderr, "note: SCHED_FIFO not granted (%s)\n", strerror(errno));
-		if (mlockall(MCL_CURRENT | MCL_FUTURE))
-			fprintf(stderr, "note: mlockall failed (%s)\n", strerror(errno));
-	}
+	t_last_rpt = rec.t_start;
 
 	if (preview)
 		fprintf(stderr, "ewego-imu-usb %s: %s -> live file %s/%s.json only (preview)\n", VERSION, devpath, live, name);
 	else
-		fprintf(stderr, "ewego-imu-usb %s: %s -> %s/%s.csv%s%s\n", VERSION, devpath, dir, name,
+		fprintf(stderr, "ewego-imu-usb %s: %s -> %s/%s.csv%s%s\n", VERSION, devpath, rec.dir, name,
 			live ? ", live file in " : "", live ? live : "");
 
 	/* reader loop: poll, read, timestamp, push. Nothing else. */
-	while (!g_stop) {
+	while (!rec_stop) {
 		struct pollfd pfd = {.fd = fd, .events = POLLIN};
 		struct sample s;
 		int r = poll(&pfd, 1, 500);
-		int64_t now = mono_us();
+		int64_t now = rec_mono_us();
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
@@ -601,71 +393,30 @@ int main(int argc, char **argv)
 				break;
 			}
 			s.host_mono = now;
-			s.host_real = real_us();
+			s.host_real = rec_real_us();
 			t_last_rpt = now;
 			if (len != RPT_LEN || s.rpt[0] != 1) {
-				bad_reports++;
+				A_INC(u.bad_reports);
 				if (!quiet)
 					fprintf(stderr, "unexpected report: %zd bytes, version %u\n", len, s.rpt[0]);
 				continue;
 			}
-			pthread_mutex_lock(&ring.m);
-			if (ring.count == RING_N) {
-				ring.overruns++;
-			} else {
-				ring.s[ring.head] = s;
-				ring.head = (ring.head + 1) % RING_N;
-				ring.count++;
-				if (ring.count > ring.peak)
-					ring.peak = ring.count;
-			}
-			pthread_cond_signal(&ring.cv);
-			pthread_mutex_unlock(&ring.m);
+			rec_push(&rec, &s);
 		}
-		if (seconds > 0 && now - t_start >= (int64_t)seconds * 1000000)
+		if (seconds > 0 && now - rec.t_start >= (int64_t)seconds * 1000000)
 			break;
 	}
 
 	close(fd);
-	pthread_mutex_lock(&ring.m);
-	ring.done = 1;
-	pthread_cond_signal(&ring.cv);
-	pthread_mutex_unlock(&ring.m);
-	pthread_join(w.thread, NULL);
-	if (csv)
-		fclose(csv);
-	if (live) {
-		snprintf(path, sizeof(path), "%s/%s.json", live, name);
-		unlink(path);
+	rec_end(&rec);
+	{
+		struct rec_snap q = rec_snapshot(&rec);
+		if (exit_code == 0 && (u.lost || u.flagged || q.overruns))
+			exit_code = 2;
+		rec_write_summary(&rec, exit_code);
+		fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " flagged, "
+			"queue peak %u, %" PRIu64 " overruns -> exit %d\n",
+			name, rec.n, u.lost, u.gaps, u.flagged, q.peak, q.overruns, exit_code);
 	}
-	if (exit_code == 0 && (w.lost || w.flagged || ring.overruns))
-		exit_code = 2;
-
-	if (!preview) {
-		FILE *js;
-		snprintf(path, sizeof(path), "%s/%s_summary.json", dir, name);
-		js = fopen(path, "w");
-		if (js) {
-			fprintf(js, "{\n  \"program\": \"ewego-imu-usb %s\",\n  \"device\": \"%s\",\n  \"samples\": %" PRIu64 ",\n"
-				    "  \"lost\": %" PRIu64 ",\n  \"gaps\": %" PRIu64 ",\n  \"flagged\": %" PRIu64 ",\n"
-				    "  \"i2c_errors\": %" PRIu64 ",\n  \"host_not_polling\": %" PRIu64 ",\n"
-				    "  \"bad_reports\": %" PRIu64 ",\n"
-				    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
-				    "  \"realtime\": %d,\n"
-				    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
-				    "  \"effective_hz\": %.3f,\n  \"i2c_us_max\": %u,\n  \"device_minus_host_drift_ppm\": %.1f,\n"
-				    "  \"first_dev_ts_us\": %" PRId64 ",\n  \"first_host_mono_us\": %" PRId64 ",\n"
-				    "  \"realtime_minus_monotonic_us\": %" PRId64 ",\n  \"exit_code\": %d\n}\n",
-				VERSION, devpath, w.n, w.lost, w.gaps, w.flagged, w.i2c_err, w.dropped, bad_reports,
-				ring.overruns, ring.peak, RING_N, realtime,
-				w.dt_n ? w.dt_min : 0.0, w.dt_n ? w.dt_sum / (double)w.dt_n : 0.0, w.dt_n ? w.dt_max : 0.0, w.dt_n,
-				rate_hz(&w), w.i2c_us_max, drift_ppm(&w),
-				w.first_dev, w.first_host, real0 - t_start, exit_code);
-			fclose(js);
-		}
-	}
-	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " flagged, "
-		"queue peak %u, %" PRIu64 " overruns -> exit %d\n",
-		name, w.n, w.lost, w.gaps, w.flagged, ring.peak, ring.overruns, exit_code);
 	return exit_code;
 }

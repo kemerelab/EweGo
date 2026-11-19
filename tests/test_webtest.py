@@ -35,11 +35,17 @@ class FakeSystemd:
         self.states = dict(states or {})
         self.calls = []
         self.start_fails = set()     # units whose start fails (ExecStartPre refusal etc.)
+        self.exit_status = {}        # unit -> ExecMainStatus for systemctl show
 
     def __call__(self, argv, timeout=15, merge=True):
         self.calls.append(list(argv))
         if argv[0] == "systemctl":
-            verb, units = argv[1], argv[2:]
+            verb, units = argv[1], [a for a in argv[2:] if not a.startswith("-")]
+            if verb == "show":
+                # systemctl show -p Id -p ExecMainStatus UNIT...: one block per unit
+                units = [a for a in units if a not in ("Id", "ExecMainStatus")]
+                return 0, "\n".join(f"Id={u}.service\nExecMainStatus={self.exit_status.get(u, 0)}\n"
+                                     for u in units)
             if verb == "is-active":
                 return 0, "".join(self.states.get(u, "inactive") + "\n" for u in units)
             if verb == "is-enabled":
@@ -146,7 +152,8 @@ class PreviewUnits(Base):
         h = make_handler("POST", "/api/unit/ewego-record.target/start", {"X-EweGo": "1"})
         h.do_POST()
         stops = [i for i, c in enumerate(self.fake.calls) if c[:2] == ["systemctl", "stop"]]
-        start = [i for i, c in enumerate(self.fake.calls) if c == ["systemctl", "start", "ewego-record.target"]]
+        start = [i for i, c in enumerate(self.fake.calls)
+                 if c == ["systemctl", "start", "--no-block", "ewego-record.target"]]
         self.assertTrue(stops and start and stops[0] < start[0], self.fake.calls)
 
     def test_preview_units_ship_with_asymmetric_exclusion(self):
@@ -369,6 +376,119 @@ class Badge(Base):
         s = self.snap()
         self.assertTrue(s["recording"])
         self.assertFalse(s["recording_ok"])
+
+
+class Lane39(Base):
+    """R39: recorder exit 4, space.json, writer_error / free_mb / fusion_stalls
+    on the live page, start --no-block."""
+
+    write_live, all_fresh, snap = Badge.write_live, Badge.all_fresh, Badge.snap
+
+    def test_exit_codes_have_meanings(self):
+        self.assertEqual(W.exit_meaning(4), "output error (card full / I/O)")
+        self.assertEqual(W.exit_meaning(3), "stalled or device gone")
+        self.assertEqual(W.exit_meaning(None), "no exit code")
+        self.assertEqual(W.exit_meaning(-9), "killed by a signal")
+
+    def test_failed_recorder_names_its_exit_code(self):
+        self.fake.states = dict(ALL_UP, **{"ewego-imu-uart": "failed"})
+        self.fake.exit_status = {"ewego-imu-uart": 4}
+        self.all_fresh()
+        s = self.snap()
+        self.assertEqual(s["recorders"]["imu-uart"]["problem"], "failed (exit 4: output error (card full / I/O))")
+        self.assertEqual(s["recording_label"], "RECORDING (imu-uart down)")
+        shows = self.fake.ran("systemctl", "show")
+        self.assertEqual(len(shows), 1)
+        self.assertEqual(shows[0][-1], "ewego-imu-uart")
+        # nothing failed: no systemctl show at all
+        self.fake.calls.clear()
+        self.fake.states = dict(ALL_UP)
+        self.snap()
+        self.assertEqual(self.fake.ran("systemctl", "show"), [])
+
+    def test_skipped_for_free_space(self):
+        """An ExecCondition skip leaves the unit inactive (not failed); space.json says why."""
+        self.fake.states = dict(ALL_UP, **{"ewego-cam@camera1": "inactive", "ewego-cam@camera2": "inactive"})
+        self.all_fresh()
+        (self.live / "space.json").write_text(json.dumps(
+            {"dir": "/opt/ewego/recordings", "free_mb": 312, "min_mb": 500, "ok": False,
+             "checked": "2026-11-18T12:00:00Z"}))
+        s = self.snap()
+        self.assertEqual(s["recorders"]["camera1"]["problem"], "skipped: 312 MB free (min 500)")
+        self.assertEqual(s["recording_label"], "RECORDING (camera1 skipped, camera2 skipped)")
+        self.assertEqual(s["space"]["min_mb"], 500)
+        # space fine again: plain "inactive"
+        (self.live / "space.json").write_text(json.dumps({"free_mb": 9000, "min_mb": 500, "ok": True}))
+        self.assertEqual(self.snap()["recorders"]["camera1"]["problem"], "inactive")
+
+    def test_lock_and_space_files_are_ignored(self):
+        """port-*.lock (ewego-cam port claims) and space.json sit in /run/ewego
+        next to the live files; they are not live files and change nothing."""
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        before = self.snap()
+        (self.live / "port-1.1.lock").write_text("1234\n")
+        (self.live / "port-1.2.lock").write_text("")
+        (self.live / "space.json").write_text(json.dumps({"free_mb": 9000, "min_mb": 500, "ok": True}))
+        after = self.snap()
+        self.assertEqual(after["recording_label"], "RECORDING")
+        self.assertEqual(sorted(after["cam"]), sorted(before["cam"]))
+        self.assertEqual(after["recorders"], before["recorders"])
+        json.dumps(after)
+
+    def test_writer_error_msg_in_problem(self):
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        self.write_live("imu", writer_error=2, writer_error_msg="write imu.csv: No space left on device")
+        s = self.snap()
+        self.assertEqual(s["recorders"]["imu-usb"]["problem"],
+                         "writer error: 2 (write imu.csv: No space left on device)")
+
+    def test_live_page_shows_health_bits(self):
+        page = W.LIVE_PAGE
+        for key in ("writer_error_msg", "free_mb", "fusion_stalls", "discarded", "function healthBits"):
+            self.assertIn(key, page)
+        self.assertEqual(page.count("healthBits(st) +"), 2)   # camera line and IMU line
+
+    def test_record_start_is_no_block(self):
+        for unit in ["ewego-record.target"] + W.RECORDERS:
+            for action in ("start", "restart"):
+                self.fake.calls.clear()
+                h = make_handler("POST", f"/api/unit/{unit}/{action}", {"X-EweGo": "1"})
+                h.do_POST()
+                code, body = reply(h)
+                self.assertEqual(code, 200)
+                self.assertTrue(body["queued"])
+                self.assertIn("queued", body["message"])
+                self.assertEqual(self.fake.ran("systemctl", action), [["systemctl", action, "--no-block", unit]])
+        # stop stays synchronous (the summaries are written when it returns), other units too
+        self.fake.calls.clear()
+        h = make_handler("POST", "/api/unit/ewego-record.target/stop", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(self.fake.ran("systemctl", "stop"), [["systemctl", "stop", "ewego-record.target"]])
+        h = make_handler("POST", "/api/unit/ewego-gps/start", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(self.fake.ran("systemctl", "start"), [["systemctl", "start", "ewego-gps"]])
+
+    def test_refusal_stays_synchronous(self):
+        """A console test holding a device refuses the start with 409 at once; nothing is queued."""
+        W.LOCKS["camera"].acquire()
+        h = make_handler("POST", "/api/unit/ewego-cam@camera1/start", {"X-EweGo": "1"})
+        h.do_POST()
+        code, body = reply(h)
+        self.assertEqual(code, 409)
+        self.assertFalse(body["ok"])
+        self.assertEqual(self.fake.ran("systemctl", "start"), [])
+
+    def test_check_reports_its_exit_meaning(self):
+        tools = W.EWEGO / "Firmware" / "tools"
+        tools.mkdir(parents=True)
+        (tools / "ewego-check.py").symlink_to(ROOT / "Firmware/tools/ewego-check.py")
+        out = []
+        W.test_check(out.append, {})
+        text = b"".join(out).decode()
+        self.assertIn("no recordings", text)
+        self.assertIn("(ewego-check exit 3: no recordings / no such run)", text)
 
 
 class Streams(Base):

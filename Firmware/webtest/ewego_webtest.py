@@ -54,6 +54,19 @@ SERIAL_PORTS = {"gps": GPS_PORT, "imu": IMU_PORT}
 # recorder for the serial port.
 LOCKS = {k: threading.Lock() for k in ("imu", "gps", "camera", "audio")}
 
+# Exit codes of the C recorders (ewego-cam, ewego-imu-usb, ewego-imu-uart).
+RECORDER_EXIT = {0: "ok", 1: "setup or device error", 2: "frames/samples lost, flagged or overrun",
+                 3: "stalled or device gone", 4: "output error (card full / I/O)"}
+# Exit codes of Firmware/tools/ewego-check.py.
+CHECK_EXIT = {0: "PASS", 1: "WARN", 2: "FAIL", 3: "no recordings / no such run"}
+
+
+def exit_meaning(rc):
+    """Readable meaning of a recorder exit code (None and unknown codes too)."""
+    if rc is None:
+        return "no exit code"
+    return RECORDER_EXIT.get(rc, "killed by a signal" if rc < 0 else "unknown")
+
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -553,6 +566,7 @@ def stream_process(argv, write, cwd=None, lock_name=None):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        proc.stdout.close()
 
 
 def test_fuel(write, q):
@@ -939,7 +953,7 @@ def test_camrec(write, q):
     for name, p in procs.items():
         rc = p.wait()
         summ = out_root / stamp / f"{name}_summary.json"
-        write(f"  {name}: exit {rc} ({'no loss' if rc == 0 else 'frames lost/error-flagged' if rc == 2 else 'stalled' if rc == 3 else 'error'})\n".encode())
+        write(f"  {name}: exit {rc} ({'no loss' if rc == 0 else exit_meaning(rc)})\n".encode())
         if summ.exists():
             try:
                 s = json.loads(summ.read_text())
@@ -1360,21 +1374,57 @@ RECORDER_LIVE = {"ewego-cam@camera1": ("camera1", "camera1"), "ewego-cam@camera2
 LIVE_FRESH_S = 2.0   # cameras rewrite their JSON once a second, the IMUs ten times
 
 
-def recorder_health(units, lives):
+def space_info():
+    """/run/ewego/space.json from ewego-check-space (the recorder units'
+    ExecCondition): {"dir", "free_mb", "min_mb", "ok", "checked"}, or None."""
+    try:
+        d = json.loads((LIVE_DIR / "space.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def recorder_exits(units):
+    """{unit: main process exit status} for units (systemctl show; one call)."""
+    units = list(units)
+    if not units:
+        return {}
+    rc, out = sh(["systemctl", "show", "-p", "Id", "-p", "ExecMainStatus", *units], merge=False)
+    res, cur = {}, None
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        if k == "Id":
+            cur = v.strip().removesuffix(".service")
+        elif k == "ExecMainStatus" and cur:
+            try:
+                res[cur] = int(v)
+            except ValueError:
+                pass
+    return res
+
+
+def recorder_health(units, lives, space=None, exits=None):
     """Per recorder: is it really recording? The target uses Wants=, so it
     stays active while members fail; a unit can be active while its writer
-    has given up. units: {unit: is-active}; lives: {live name: live_json()}.
-    A missing writer_error key (older recorders) counts as no error."""
+    has given up. units: {unit: is-active}; lives: {live name: live_json()};
+    space: space_info() (an inactive unit was skipped by its free-space
+    ExecCondition when it says ok: false); exits: {unit: exit status} of the
+    failed ones. A missing writer_error key (older recorders) counts as no error."""
     out = {}
+    exits = exits or {}
     for unit, (short, live) in RECORDER_LIVE.items():
         state = units.get(unit, "unknown")
         d = lives.get(live)
-        if state != "active":
+        if state == "inactive" and space and space.get("ok") is False:
+            problem = f"skipped: {space.get('free_mb')} MB free (min {space.get('min_mb')})"
+        elif state == "failed" and exits.get(unit) not in (None, 0):
+            problem = f"failed (exit {exits[unit]}: {exit_meaning(exits[unit])})"
+        elif state != "active":
             problem = "starting" if state in ("activating", "reloading") else state
         elif not d:
             problem = "no live data"
         elif d.get("writer_error"):
-            problem = f"writer error: {d['writer_error']}"
+            problem = f"writer error: {d['writer_error']}" + (f" ({d['writer_error_msg']})" if d.get("writer_error_msg") else "")
         elif d.get("age_s") is None or d["age_s"] >= LIVE_FRESH_S:
             problem = f"live data {d.get('age_s')} s old"
         elif d.get("preview"):
@@ -1392,8 +1442,10 @@ def recording_summary(units, health):
     recording = is_busy(units.get("ewego-record.target")) or any(is_busy(h["state"]) for h in health.values())
     if not recording:
         return False, False, "IDLE"
-    bad = [f"{n} {'starting' if h['problem'] == 'starting' else 'down'}"
-           for n, h in health.items() if not h["ok"]]
+    def word(h):
+        p = h["problem"] or ""
+        return "starting" if p == "starting" else "skipped" if p.startswith("skipped") else "down"
+    bad = [f"{n} {word(h)}" for n, h in health.items() if not h["ok"]]
     if not bad:
         return True, True, "RECORDING"
     return True, False, "RECORDING (" + ", ".join(bad) + ")"
@@ -1510,8 +1562,11 @@ def live_snapshot():
     for cam in CAMERAS:
         cams[cam] = {"stats": live_json(cam), "frame": live_frame_info(cam)}
     imu, imu_uart = live_json("imu"), live_json("imu-uart")
+    space = space_info()
+    failed = tuple(u for u in RECORDER_LIVE if units.get(u) == "failed")
+    exits = cached(("exits", failed), 2.0, lambda: recorder_exits(failed)) if failed else {}
     health = recorder_health(units, {"camera1": cams["camera1"]["stats"], "camera2": cams["camera2"]["stats"],
-                                     "imu": imu, "imu-uart": imu_uart})
+                                     "imu": imu, "imu-uart": imu_uart}, space, exits)
     recording, recording_ok, label = recording_summary(units, health)
     return {
         "t": time.time(),
@@ -1521,6 +1576,7 @@ def live_snapshot():
         "recording_ok": recording_ok,      # every recorder active, live data fresh, no writer error
         "recording_label": label,          # "RECORDING", "RECORDING (camera2 down)", "IDLE"
         "recorders": health,               # per recorder: unit, state, ok, problem, live_age_s
+        "space": space,                    # ewego-check-space's last verdict (space.json) or None
         "preview": PREVIEW.status(),
         "cam": cams,
         "imu": imu,
@@ -1541,7 +1597,9 @@ def test_check(write, q):
         argv.append("--list")
     if q.get("run"):
         argv += ["--run", q["run"][0]]
-    stream_process(argv, write)
+    rc = stream_process(argv, write)
+    if not q.get("list"):
+        write(f"(ewego-check exit {rc}: {CHECK_EXIT.get(rc, 'error')})\n".encode())
 
 
 TESTS = {
@@ -1778,6 +1836,14 @@ class Handler(BaseHTTPRequestHandler):
                     # synchronous: the preview units have released the devices on return
                     # (the recorder units also stop their preview in ExecStartPre)
                     PREVIEW.stop("stopped for the recorder")
+                    # --no-block: the recorders are Type=notify and READY can take up
+                    # to 30 s (device wait); the page follows them through the
+                    # snapshot's recorders{} instead of holding the request open
+                    rc, out = systemctl(action, "--no-block", unit, timeout=45)
+                    self.send_json({"rc": rc, "output": out, "queued": True, "status": unit_status(unit),
+                                    "message": f"{action} of {unit} queued" if rc == 0 else
+                                               f"{action} of {unit} refused: " + (out.strip() or f"rc {rc}")})
+                    return
                 rc, out = systemctl(action, unit, timeout=45)
                 self.send_json({"rc": rc, "output": out, "status": unit_status(unit)})
             elif u.path in ("/api/preview/start", "/api/preview/stop"):
@@ -2240,7 +2306,7 @@ async function run(name, paneId, extra) {
 
 async function unit(name, action) {
   const r = await (await fetch('/api/unit/' + name + '/' + action, {method: 'POST', headers: TOKEN})).json();
-  $('out-units').textContent = (r.ok === false ? 'refused: ' + r.message : 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output) + '\n' + JSON.stringify(r.status);
+  $('out-units').textContent = (r.ok === false ? 'refused: ' + r.message : (r.queued ? r.message + ' (the Units table follows it; a recorder can take up to 30 s to report ready) · ' : '') + 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output) + '\n' + JSON.stringify(r.status);
   refresh();
 }
 
@@ -2552,7 +2618,7 @@ function makeImu(sfx, what) {
       (st.read_errors !== undefined ? st.read_errors + ' read errors, ' : st.lost + ' lost, ' + st.flagged + ' flagged, ') + st.queue_overruns + ' overruns' + (bad ? '</span>' : '') +
       timing + ' · queue peak ' + st.queue_peak + ' · ' + fmtDur(st.elapsed_s) +
       (st.cal ? ' · cal sys' + st.cal[0] + ' gyro' + st.cal[1] + ' acc' + st.cal[2] + ' mag' + st.cal[3] : '') + (st.temp_c != null ? ' · ' + st.temp_c + ' °C' : '') +
-      (st.age_s > 2 ? ' · <span class="warn">stale ' + st.age_s + ' s</span>' : '');
+      healthBits(st) + (st.age_s > 2 ? ' · <span class="warn">stale ' + st.age_s + ' s</span>' : '');
   };
   I.handle = st => { I.line(st); if (st && st.rows && st.rows.length) { I.addRows(st.rows); I.draw(); } };
   return I;
@@ -2580,7 +2646,18 @@ function camLine(name, c) {
   const bad = st.lost || st.overruns || st.errors;
   $('s-' + name).innerHTML = st.fps.toFixed(1) + ' fps · ' + st.frames + ' frames · ' + (bad ? '<span class="bad">' : '') + st.lost + ' lost, ' + st.overruns + ' overruns, ' + st.errors + ' err' + (bad ? '</span>' : '') +
     ' · ' + fmtDur(st.elapsed_s) + (st.preview ? '' : ' · ' + st.written_mb.toFixed(0) + ' MB · write max ' + st.write_max_ms + ' ms · queue ' + st.queue_mb + ' MB (peak ' + st.queue_peak_mb + ')') +
-    (fr ? ' · frame ' + (fr.bytes / 1024).toFixed(0) + ' kB' : '') + browserLine(name);
+    (fr ? ' · frame ' + (fr.bytes / 1024).toFixed(0) + ' kB' : '') + healthBits(st) + browserLine(name);
+}
+// writer error, frames discarded after it, UART fusion stalls, free space: small, red when bad
+let minFreeMb = 500;
+function healthBits(st) {
+  const red = (bad, t) => bad ? '<span class="bad">' + t + '</span>' : t;
+  const b = [];
+  if (st.writer_error !== undefined) b.push(red(st.writer_error, 'writer error ' + st.writer_error + (st.writer_error && st.writer_error_msg ? ': ' + esc(st.writer_error_msg) : '')));
+  if (st.discarded) b.push(red(true, st.discarded + ' frames discarded'));
+  if (st.fusion_stalls !== undefined) b.push(red(st.fusion_stalls, 'fusion stalls ' + st.fusion_stalls));
+  if (st.free_mb != null) b.push(red(st.free_mb < minFreeMb, 'free ' + (st.free_mb >= 10000 ? (st.free_mb / 1000).toFixed(0) + ' GB' : st.free_mb + ' MB')));
+  return b.length ? ' · <small>' + b.join(' · ') + '</small>' : '';
 }
 function browserLine(name) {
   const c = cams[name];
@@ -2616,6 +2693,7 @@ function update(s) {
   $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
   $('load').textContent = 'load ' + s.load.toFixed(2) + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
   $('link').textContent = 'views ' + (s.view_bytes_per_s / 1024).toFixed(0) + ' kB/s sent';
+  if (s.space && s.space.min_mb) minFreeMb = s.space.min_mb;
   for (const n in cams) camLine(n, s.cam[n]);
   imus.imu.handle(s.imu); imus.imu_uart.handle(s.imu_uart);
   gpsBlock(s.gps, s.pps);
@@ -2642,7 +2720,8 @@ async function preview() {
 async function rec(action) {
   $('msg').textContent = action + 'ing recorder…';
   const r = await post('/api/unit/ewego-record.target/' + action);
-  $('msg').textContent = r.ok === false ? r.message : 'systemctl ' + action + ' ewego-record.target → rc ' + r.rc + (r.output ? ' ' + r.output.trim() : '');
+  // start is queued (--no-block): the badge and the Wearable card follow the recorders as they come up (up to 30 s)
+  $('msg').textContent = r.ok === false ? r.message : r.queued ? r.message + (r.rc === 0 ? ': the badge shows progress (a recorder can take up to 30 s to report ready)' : '') : 'systemctl ' + action + ' ewego-record.target → rc ' + r.rc + (r.output ? ' ' + r.output.trim() : '');
   setTimeout(restartCams, 3000);
 }
 async function power(action) {

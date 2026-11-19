@@ -52,7 +52,18 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 - **Recorder**: start/stop `ewego-record.target` (all recorders at once),
   camera and IMU journals, recording directories, **Check last run** (runs
   `Firmware/tools/ewego-check.py`: a PASS/WARN/FAIL line per stream of the
-  latest run, and how far apart the streams started) and **List runs**.
+  latest run, and how far apart the streams started; the last line names
+  the tool's exit status: 0 PASS, 1 WARN, 2 FAIL, 3 no recordings) and
+  **List runs**. Starting or restarting `ewego-record.target` or a recorder
+  unit is queued (`systemctl start --no-block`): the recorders are
+  `Type=notify` and can take up to 30 s (camera / hub_imu device wait) to
+  report ready, so the request answers at once and the Units table (and
+  the live page's badge) follow them up. A refusal (a console test or the
+  serial bridge holds the device) still answers 409 at once. Stop stays
+  synchronous, so every summary is written when it returns. Recorder exit
+  codes are shown with their meaning wherever they appear: 1 setup or
+  device error, 2 frames/samples lost, flagged or overrun, 3 stalled or
+  device gone, 4 output error (card full / I/O).
   Check last run and the ewego-cam record test are refused while
   `ewego-record.target` is up: they read or write a lot on the SD card the
   recorders are writing to. Stop recording first, or use SSH. Journal
@@ -71,7 +82,10 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
 - **Both cameras**, each with a *Flip 180°* button (remembered per camera
   in the browser) for a wearable mounted upside down, *Swap cameras* to
   put camera2 on the left when that is the left eye, and a stats line
-  (fps, frames, lost/overruns, write max, queue). The frames are the
+  (fps, frames, lost/overruns, write max, queue, then in small text the
+  writer error count and message, frames discarded after an output error,
+  and the free space the recorder last measured, red when non-zero or
+  below the free-space minimum). The frames are the
   recorders' own: `ewego-cam --live /run/ewego` keeps the newest JPEG on
   tmpfs and the page shows it as a plain multipart image stream (the same
   mechanism as the test console's camera view) at the **view rate** you
@@ -81,7 +95,9 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
   the image streams and leaves the rest running.
 - **Both IMUs**: scrolling 10 s traces of acceleration, angular rate and
   orientation at the full 100 Hz (hover for values), with rate, lost or
-  failed reads, calibration status and temperature, for the USB module
+  failed reads, calibration status and temperature (and in small text the
+  writer error, free space and, for the UART IMU, BNO055 fusion stalls,
+  red when non-zero), for the USB module
   (`ewego-imu-usb --live /run/ewego`) and the wearable's own BNO055 on
   UART5 (`ewego-imu-uart --live /run/ewego`), about 10 kB/s each.
 - **GPS**: fix type, satellites, accuracy, position (with a map link),
@@ -94,9 +110,17 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
   its live file in `/run/ewego` is less than 2 s old, and it reports no
   `writer_error`. Otherwise the badge has a red outline and names the
   ones that are not, e.g. *RECORDING (camera2 down, imu-uart starting)*,
-  and the Wearable card says why for each (failed, no live data, stale,
-  writer error). `ewego-record.target` alone is not enough: it stays
-  active while its members fail. *PREVIEW*, *IDLE* and *NO LINK* as before.
+  and the Wearable card says why for each (failed, with the exit code and
+  its meaning, e.g. *failed (exit 4: output error (card full / I/O))*; no
+  live data; stale; writer error with its message). A recorder that is
+  inactive because its free-space check (`ewego-check-space`, the units'
+  `ExecCondition=`) skipped it reads *skipped: 312 MB free (min 500)*, from
+  `/run/ewego/space.json`, and the badge says *camera1 skipped*.
+  `ewego-record.target` alone is not enough: it stays active while its
+  members fail. *PREVIEW*, *IDLE* and *NO LINK* as before. Only the named
+  live files are read from `/run/ewego`; the `port-*.lock` files (ewego-cam
+  port claims) and `space.json` that also live there are never listed or
+  removed by the console.
 - **Controls**: *Preview (no recording)* starts the preview units
   `ewego-preview@camera1`, `ewego-preview@camera2`,
   `ewego-preview-imu-usb` and `ewego-preview-imu-uart` (the recorders in

@@ -44,6 +44,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -124,6 +125,9 @@ struct queue {
 	size_t bytes, max_bytes, high_water;
 	uint64_t frames, overruns;
 	int done;
+	/* written by the capture thread, read by the writer, both under m */
+	struct stats st;
+	uint32_t tstamp_flags;
 };
 
 /*
@@ -155,6 +159,14 @@ struct writer {
 	double write_max_ms;
 	int error;                   /* errno of the first output error, 0 = none */
 	char error_what[96];         /* which call failed */
+	/* periodic work (stats line, STATUS=, live JSON, in-progress summary) */
+	const struct cfg *c;
+	const char *devpath;
+	const char *dir;             /* session directory, NULL in --preview */
+	int64_t t_start, mono0, real0;
+	int64_t t_last_stats, t_last_live, t_last_summary;
+	uint64_t live_frames0;
+	int summary_written, summary_failed;
 };
 
 #define WB_MAX_INTERVAL_US 2000000   /* writeback step at least this often */
@@ -366,6 +378,241 @@ static int writer_put(struct writer *w, const struct frame *f)
 	return -1;
 }
 
+static void stats_add_interval(struct stats *st, double dt)
+{
+	if (st->dt_n == 0 || dt < st->dt_min)
+		st->dt_min = dt;
+	if (dt > st->dt_max)
+		st->dt_max = dt;
+	st->dt_sum += dt;
+	st->dt_n++;
+	if (st->i_dt_n == 0 || dt < st->i_dt_min)
+		st->i_dt_min = dt;
+	if (dt > st->i_dt_max)
+		st->i_dt_max = dt;
+	st->i_dt_sum += dt;
+	st->i_dt_n++;
+}
+
+/* Everything the stats line, the live JSON and the summary report, copied
+ * under the queue mutex so the writer thread never reads a half-updated set. */
+struct snapshot {
+	struct stats st;
+	size_t qbytes, qhw, qmax;
+	uint64_t qovr;
+	uint32_t tstamp_flags;
+};
+
+static void take_snapshot(struct queue *q, struct snapshot *s, int reset_interval)
+{
+	pthread_mutex_lock(&q->m);
+	s->st = q->st;
+	s->qbytes = q->bytes;
+	s->qhw = q->high_water;
+	s->qmax = q->max_bytes;
+	s->qovr = q->overruns;
+	s->tstamp_flags = q->tstamp_flags;
+	if (reset_interval) {
+		q->st.i_bytes = 0;
+		q->st.i_dt_n = 0;
+		q->st.i_dt_sum = 0;
+	}
+	pthread_mutex_unlock(&q->m);
+}
+
+static void print_stats(const struct cfg *c, const struct snapshot *s, const struct writer *w,
+			const char *dir, double elapsed)
+{
+	const struct stats *st = &s->st;
+	char line[400];
+	double fmb = free_mb(dir);
+	double fps = st->i_dt_n ? 1e6 / (st->i_dt_sum / (double)st->i_dt_n) : 0.0;
+
+	snprintf(line, sizeof(line),
+		 "%s: %" PRIu64 " frames, %" PRIu64 " lost, %" PRIu64 " err | %.2f fps, interval %.1f/%.1f/%.1f ms, "
+		 "%.1f MB/s | queue %.1f MB (peak %.1f), overruns %" PRIu64 ", write max %.0f ms | free %.0f MB%s%s",
+		 c->name, st->frames, st->lost, st->errors, fps,
+		 st->i_dt_n ? st->i_dt_min / 1000.0 : 0.0,
+		 st->i_dt_n ? st->i_dt_sum / (double)st->i_dt_n / 1000.0 : 0.0,
+		 st->i_dt_n ? st->i_dt_max / 1000.0 : 0.0,
+		 c->stats_interval > 0 ? (double)st->i_bytes / 1e6 / (double)c->stats_interval : 0.0,
+		 (double)s->qbytes / 1e6, (double)s->qhw / 1e6, s->qovr, w->write_max_ms, fmb < 0 ? 0.0 : fmb,
+		 w->error ? " | OUTPUT ERROR: " : "", w->error ? w->error_what : "");
+	if (!c->quiet)
+		printf("[%7.1fs] %s\n", elapsed, line);
+	{
+		char msg[420];
+		snprintf(msg, sizeof(msg), "STATUS=%s", line);
+		sd_notify(msg);
+	}
+}
+
+/* Live counters for the console: rewritten once a second, atomic replace. */
+static void write_live_json(const struct cfg *c, const struct snapshot *s, const struct writer *w,
+			    int64_t now, double fps_recent)
+{
+	const struct stats *st = &s->st;
+	char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
+	FILE *f;
+
+	snprintf(fin, sizeof(fin), "%s/%s.json", c->live, c->name);
+	snprintf(tmp, sizeof(tmp), "%s/.%s.json.tmp", c->live, c->name);
+	f = fopen(tmp, "w");
+	if (!f)
+		return;
+	fprintf(f, "{\"program\":\"ewego-cam %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
+		VERSION, c->name, w->devpath, c->preview);
+	if (w->dir)
+		fprintf(f, "\"session\":\"%s\",", w->dir);
+	else
+		fputs("\"session\":null,", f);
+	fprintf(f, "\"width\":%d,\"height\":%d,\"fps_requested\":%d,\"elapsed_s\":%.1f,"
+		   "\"frames\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
+		   ",\"errors\":%" PRIu64 ",\"fps\":%.2f,\"queue_mb\":%.1f,\"queue_peak_mb\":%.1f,"
+		   "\"overruns\":%" PRIu64 ",\"write_max_ms\":%.0f,\"written_mb\":%.1f,"
+		   "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 ",",
+		c->width, c->height, c->fps, (double)(now - w->t_start) / 1e6,
+		st->frames, st->bytes, st->lost, st->gaps, st->errors, fps_recent,
+		(double)s->qbytes / 1e6, (double)s->qhw / 1e6, s->qovr, w->write_max_ms,
+		(double)w->written_bytes / 1e6, now, now_real_us());
+	{
+		double fmb = free_mb(w->dir);
+		if (fmb < 0)
+			fputs("\"free_mb\":null,", f);
+		else
+			fprintf(f, "\"free_mb\":%.0f,", fmb);
+	}
+	fprintf(f, "\"writer_error\":%d,\"writer_error_msg\":\"", w->error ? 1 : 0);
+	if (w->error)
+		fprintf(f, "%s: %s", w->error_what, strerror(w->error));
+	fprintf(f, "\",\"discarded\":%" PRIu64 "}\n", w->discarded);
+	fclose(f);
+	rename(tmp, fin);
+}
+
+/*
+ * <dir>/<name>_summary.json, replaced atomically (tmp + fdatasync + rename).
+ * The writer thread rewrites it every stats interval with "in_progress": true
+ * and "exit_code": null, so the wall-clock mapping and the counters survive a
+ * power cut or SIGKILL; the final write at exit has "in_progress": false.
+ */
+static int write_summary(const struct cfg *c, const struct snapshot *s, const struct writer *w,
+			 int64_t mono1, int64_t real1, int exit_code, int in_progress)
+{
+	const struct stats *st = &s->st;
+	uint32_t tstamp_flags = s->tstamp_flags;
+	char path[PATH_MAX + 64], tmp[PATH_MAX + 64], code[16];
+	double fmb = free_mb(w->dir);
+	FILE *f;
+	int bad;
+
+	snprintf(path, sizeof(path), "%s/%s_summary.json", w->dir, c->name);
+	snprintf(tmp, sizeof(tmp), "%s/.%s_summary.json.tmp", w->dir, c->name);
+	if (in_progress)
+		snprintf(code, sizeof(code), "null");
+	else
+		snprintf(code, sizeof(code), "%d", exit_code);
+	f = fopen(tmp, "w");
+	if (!f)
+		return -1;
+	fprintf(f,
+		"{\n"
+		"  \"program\": \"ewego-cam %s\",\n"
+		"  \"name\": \"%s\",\n"
+		"  \"device\": \"%s\",\n"
+		"  \"requested\": {\"width\": %d, \"height\": %d, \"fps\": %d, \"format\": \"MJPG\"},\n"
+		"  \"in_progress\": %s,\n"
+		"  \"frames\": %" PRIu64 ",\n"
+		"  \"bytes\": %" PRIu64 ",\n"
+		"  \"lost\": %" PRIu64 ",\n"
+		"  \"gaps\": %" PRIu64 ",\n"
+		"  \"gap_list\": \"%s\",\n"
+		"  \"error_frames\": %" PRIu64 ",\n"
+		"  \"stalls\": %" PRIu64 ",\n"
+		"  \"writer\": {\"frames\": %" PRIu64 ", \"bytes\": %" PRIu64 ", \"overruns\": %" PRIu64
+		", \"queue_peak_bytes\": %zu, \"queue_budget_bytes\": %zu, \"write_max_ms\": %.1f, \"error\": %d"
+		", \"error_msg\": \"%s%s%s\", \"discarded\": %" PRIu64 "},\n"
+		"  \"free_mb\": %.0f,\n"
+		"  \"first_seq\": %u,\n"
+		"  \"last_seq\": %u,\n"
+		"  \"first_ts_us\": %" PRId64 ",\n"
+		"  \"last_ts_us\": %" PRId64 ",\n"
+		"  \"interval_us\": {\"min\": %.1f, \"mean\": %.1f, \"max\": %.1f, \"n\": %" PRIu64 "},\n"
+		"  \"effective_fps\": %.3f,\n"
+		"  \"timestamp_clock\": \"%s\",\n"
+		"  \"timestamp_source\": \"%s\",\n"
+		"  \"clock_at_start\": {\"monotonic_us\": %" PRId64 ", \"realtime_us\": %" PRId64 "},\n"
+		"  \"clock_at_end\": {\"monotonic_us\": %" PRId64 ", \"realtime_us\": %" PRId64 "},\n"
+		"  \"realtime_minus_monotonic_us\": %" PRId64 ",\n"
+		"  \"exit_code\": %s\n"
+		"}\n",
+		VERSION, c->name, w->devpath, c->width, c->height, c->fps,
+		in_progress ? "true" : "false",
+		st->frames, st->bytes, st->lost, st->gaps, st->gap_list, st->errors, st->stalls,
+		w->written_frames, w->written_bytes, s->qovr, s->qhw, s->qmax,
+		w->write_max_ms, w->error ? 1 : 0, w->error ? w->error_what : "", w->error ? ": " : "",
+		w->error ? strerror(w->error) : "", w->discarded,
+		fmb,
+		st->have_seq ? st->first_seq : 0, st->have_seq ? st->last_seq : 0,
+		st->first_ts, st->last_ts,
+		st->dt_n ? st->dt_min : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n : 0.0,
+		st->dt_n ? st->dt_max : 0.0, st->dt_n,
+		(st->frames > 1 && st->last_ts > st->first_ts)
+			? (double)(st->frames - 1) * 1e6 / (double)(st->last_ts - st->first_ts) : 0.0,
+		(tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC ? "monotonic"
+			: (tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_COPY ? "copy" : "unknown",
+		(tstamp_flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE
+			? "start-of-exposure (as flagged by uvcvideo; arrival time unless hwtimestamps=1)"
+			: "end-of-frame/arrival",
+		w->mono0, w->real0, mono1, real1, w->real0 - w->mono0, code);
+	bad = fflush(f) != 0 || ferror(f) || fdatasync(fileno(f)) != 0;
+	if (fclose(f) != 0)
+		bad = 1;
+	if (bad || rename(tmp, path)) {
+		unlink(tmp);
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * Periodic work, all on the writer thread so the capture thread never
+ * blocks on the journal, the notify socket or a filesystem: the stats line
+ * and STATUS=, the live JSON (1/s) and the in-progress summary.
+ */
+static void writer_housekeeping(struct writer *w, int64_t now)
+{
+	const struct cfg *c = w->c;
+	int64_t sum_every = (int64_t)(c->stats_interval > 0 ? c->stats_interval : 5) * 1000000;
+	int do_stats = c->stats_interval > 0 && now - w->t_last_stats >= (int64_t)c->stats_interval * 1000000;
+	int do_live = c->live && now - w->t_last_live >= 1000000;
+	int do_sum = w->dir && (!w->summary_written || now - w->t_last_summary >= sum_every);
+	struct snapshot s;
+
+	if (!do_stats && !do_live && !do_sum)
+		return;
+	take_snapshot(w->q, &s, do_stats);
+	if (do_stats) {
+		print_stats(c, &s, w, w->dir, (double)(now - w->t_start) / 1e6);
+		w->t_last_stats = now;
+	}
+	if (do_live) {
+		write_live_json(c, &s, w, now, (double)(s.st.frames - w->live_frames0) * 1e6 /
+				(double)(now - w->t_last_live));
+		w->live_frames0 = s.st.frames;
+		w->t_last_live = now;
+	}
+	if (do_sum) {
+		if (write_summary(c, &s, w, now, now_real_us(), 0, 1) && !w->summary_failed) {
+			fprintf(stderr, "ewego-cam: could not write the in-progress summary in %s: %s\n",
+				w->dir, strerror(errno));
+			w->summary_failed = 1;
+		}
+		w->summary_written = 1;
+		w->t_last_summary = now;
+	}
+}
+
 static void *writer_main(void *arg)
 {
 	struct writer *w = arg;
@@ -374,11 +621,23 @@ static void *writer_main(void *arg)
 
 	for (;;) {
 		struct frame *f;
-		int64_t t0, t1;
+		int64_t t0, t1, now;
+		int done;
 
 		pthread_mutex_lock(&q->m);
-		while (!q->head && !q->done)
-			pthread_cond_wait(&q->cv, &q->m);
+		if (!q->head && !q->done) {
+			/* wake at least every 250 ms for the periodic work */
+			struct timespec dl;
+			clock_gettime(CLOCK_MONOTONIC, &dl);
+			dl.tv_nsec += 250000000;
+			if (dl.tv_nsec >= 1000000000) {
+				dl.tv_sec++;
+				dl.tv_nsec -= 1000000000;
+			}
+			while (!q->head && !q->done)
+				if (pthread_cond_timedwait(&q->cv, &q->m, &dl) == ETIMEDOUT)
+					break;
+		}
 		f = q->head;
 		if (f) {
 			q->head = f->next;
@@ -387,9 +646,17 @@ static void *writer_main(void *arg)
 			q->bytes -= f->len;
 			q->frames--;
 		}
+		done = q->done;
 		pthread_mutex_unlock(&q->m);
-		if (!f)
-			break;              /* done and drained */
+		if (!f) {
+			if (done)
+				break;          /* done and drained */
+			now = now_mono_us();
+			if (w->vid_fd >= 0 && !w->error && now - w->wb_last_us >= WB_MAX_INTERVAL_US)
+				writer_writeback(w, now);   /* idle: finish the last chunk too */
+			writer_housekeeping(w, now);
+			continue;
+		}
 
 		/* newest frame for the live view: at most 5 a second, atomic replace */
 		if (w->live && (w->live_last_ts < 0 || f->ts_us - w->live_last_ts >= 200000)) {
@@ -430,12 +697,11 @@ static void *writer_main(void *arg)
 		 * is complete, check the one before it, and drop that from the page
 		 * cache, so dirty data never piles up into a multi-hundred-ms flush
 		 * and a failing card is noticed within one chunk. */
-		if (w->vid_fd >= 0 && !w->error) {
-			int64_t now = now_mono_us();
-			if (w->wb[0].size - w->wb[0].kicked >= w->wb_chunk ||
-			    now - w->wb_last_us >= WB_MAX_INTERVAL_US)
-				writer_writeback(w, now);
-		}
+		now = now_mono_us();
+		if (w->vid_fd >= 0 && !w->error &&
+		    (w->wb[0].size - w->wb[0].kicked >= w->wb_chunk || now - w->wb_last_us >= WB_MAX_INTERVAL_US))
+			writer_writeback(w, now);
+		writer_housekeeping(w, now);
 	}
 	if (w->vid_fd >= 0 && !w->error) {
 		static const char *const what[3] = {"fdatasync .mjpeg", "fdatasync _timestamps.bin",
@@ -445,6 +711,147 @@ static void *writer_main(void *arg)
 				writer_fail(w, errno, what[i]);
 	}
 	return NULL;
+}
+
+/* ---- capture side ------------------------------------------------------- */
+
+struct capture {
+	const struct cfg *c;
+	struct queue *q;
+	int64_t msg_last_us;         /* rate limit for per-frame messages */
+	unsigned int msg_suppressed;
+};
+
+/*
+ * Per-frame messages (gaps, queue full, timestamp going backwards) from the
+ * capture thread: at most one a second, so a burst of gaps cannot block the
+ * capture thread on the journal socket. Every gap is still in gap_list.
+ */
+static void capture_msg(struct capture *cp, int64_t now, const char *fmt, ...)
+	__attribute__((format(printf, 3, 4)));
+static void capture_msg(struct capture *cp, int64_t now, const char *fmt, ...)
+{
+	va_list ap;
+
+	if (cp->c->quiet)
+		return;
+	if (cp->msg_last_us && now - cp->msg_last_us < 1000000) {
+		cp->msg_suppressed++;
+		return;
+	}
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	if (cp->msg_suppressed)
+		fprintf(stderr, " (+%u more messages in the last second)", cp->msg_suppressed);
+	fputc('\n', stderr);
+	cp->msg_suppressed = 0;
+	cp->msg_last_us = now;
+}
+
+/*
+ * Account for one frame and hand a copy to the writer. data/len is the frame
+ * (len 0 = an empty or invalid buffer: counted for sequence and timing only).
+ * Statistics live in the queue and are updated under its mutex, so the writer
+ * thread can snapshot them; no I/O here apart from rate-limited messages.
+ */
+static void capture_frame(struct capture *cp, const void *data, size_t len, int64_t ts_us,
+			  uint32_t seq, uint32_t flags, int64_t now)
+{
+	struct queue *q = cp->q;
+	struct stats *st = &q->st;
+	struct frame *f = NULL;
+	uint32_t prev_seq = 0, missing = 0;
+	int64_t prev_ts = 0;
+	int gap = 0, backwards = 0, overrun = 0;
+
+	pthread_mutex_lock(&q->m);
+	q->tstamp_flags = flags;
+	if (!st->have_seq) {
+		st->first_seq = seq;
+		st->first_ts = ts_us;
+		st->have_seq = 1;
+	} else {
+		if (seq != st->last_seq + 1) {
+			missing = seq - st->last_seq - 1;
+			prev_seq = st->last_seq;
+			gap = 1;
+			st->gaps++;
+			st->lost += missing;
+			if (strlen(st->gap_list) < sizeof(st->gap_list) - 32) {
+				char g[32];
+				snprintf(g, sizeof(g), "%s%u->%u", st->gap_list[0] ? "," : "", st->last_seq, seq);
+				strncat(st->gap_list, g, sizeof(st->gap_list) - strlen(st->gap_list) - 1);
+			}
+		}
+		if (ts_us > st->last_ts) {
+			stats_add_interval(st, (double)(ts_us - st->last_ts));
+		} else {
+			backwards = 1;
+			prev_ts = st->last_ts;
+		}
+	}
+	st->last_seq = seq;
+	st->last_ts = ts_us;
+	if (flags & V4L2_BUF_FLAG_ERROR)
+		st->errors++;
+	if (len > 0) {
+		st->frames++;
+		st->bytes += len;
+		st->i_bytes += len;
+		if (q->bytes + len > q->max_bytes) {
+			q->overruns++;
+			overrun = 1;
+		}
+	}
+	pthread_mutex_unlock(&q->m);
+
+	if (gap)
+		capture_msg(cp, now, "gap: seq %u -> %u (%u lost)", prev_seq, seq, missing);
+	if (backwards)
+		capture_msg(cp, now, "warning: timestamp went backwards (%" PRId64 " -> %" PRId64 " us)",
+			    prev_ts, ts_us);
+	if (len == 0)
+		return;
+
+	if (!overrun) {
+		f = malloc(sizeof(*f));
+		if (f) {
+			f->data = malloc(len);
+			if (!f->data) {
+				free(f);
+				f = NULL;
+			}
+		}
+		if (!f) {
+			overrun = 1;
+			pthread_mutex_lock(&q->m);
+			q->overruns++;
+			pthread_mutex_unlock(&q->m);
+		}
+	}
+	if (!f) {
+		capture_msg(cp, now, "writer queue full: frame seq %u not written", seq);
+		return;
+	}
+	memcpy(f->data, data, len);
+	f->len = len;
+	f->ts_us = ts_us;
+	f->seq = seq;
+	f->flags = flags;
+	f->next = NULL;
+	pthread_mutex_lock(&q->m);
+	if (q->tail)
+		q->tail->next = f;
+	else
+		q->head = f;
+	q->tail = f;
+	q->bytes += f->len;
+	q->frames++;
+	if (q->bytes > q->high_water)
+		q->high_water = q->bytes;
+	pthread_cond_signal(&q->cv);
+	pthread_mutex_unlock(&q->m);
 }
 
 /* A USB camera as seen in /dev/v4l/by-path: its hub port spec and the link. */
@@ -617,167 +1024,6 @@ static int parse_size(const char *s, int *w, int *h)
 	return sscanf(s, "%dx%d", w, h) == 2 && *w > 0 && *h > 0 ? 0 : -1;
 }
 
-static void stats_add_interval(struct stats *st, double dt)
-{
-	if (st->dt_n == 0 || dt < st->dt_min)
-		st->dt_min = dt;
-	if (dt > st->dt_max)
-		st->dt_max = dt;
-	st->dt_sum += dt;
-	st->dt_n++;
-	if (st->i_dt_n == 0 || dt < st->i_dt_min)
-		st->i_dt_min = dt;
-	if (dt > st->i_dt_max)
-		st->i_dt_max = dt;
-	st->i_dt_sum += dt;
-	st->i_dt_n++;
-}
-
-static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, struct writer *w,
-			const char *dir, double elapsed)
-{
-	char line[400];
-	double fmb = free_mb(dir);
-	double fps = st->i_dt_n ? 1e6 / (st->i_dt_sum / (double)st->i_dt_n) : 0.0;
-	size_t qbytes, qhw;
-	uint64_t qovr;
-
-	pthread_mutex_lock(&q->m);
-	qbytes = q->bytes;
-	qhw = q->high_water;
-	qovr = q->overruns;
-	pthread_mutex_unlock(&q->m);
-
-	snprintf(line, sizeof(line),
-		 "%s: %" PRIu64 " frames, %" PRIu64 " lost, %" PRIu64 " err | %.2f fps, interval %.1f/%.1f/%.1f ms, "
-		 "%.1f MB/s | queue %.1f MB (peak %.1f), overruns %" PRIu64 ", write max %.0f ms | free %.0f MB%s%s",
-		 c->name, st->frames, st->lost, st->errors, fps,
-		 st->i_dt_n ? st->i_dt_min / 1000.0 : 0.0,
-		 st->i_dt_n ? st->i_dt_sum / (double)st->i_dt_n / 1000.0 : 0.0,
-		 st->i_dt_n ? st->i_dt_max / 1000.0 : 0.0,
-		 c->stats_interval > 0 ? (double)st->i_bytes / 1e6 / (double)c->stats_interval : 0.0,
-		 (double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms, fmb < 0 ? 0.0 : fmb,
-		 w->error ? " | OUTPUT ERROR: " : "", w->error ? w->error_what : "");
-	if (!c->quiet)
-		printf("[%7.1fs] %s\n", elapsed, line);
-	{
-		char msg[420];
-		snprintf(msg, sizeof(msg), "STATUS=%s", line);
-		sd_notify(msg);
-	}
-	st->i_bytes = 0;
-	st->i_dt_n = 0;
-	st->i_dt_sum = 0;
-}
-
-/* Live counters for the console: rewritten once a second, atomic replace. */
-static void write_live_json(const struct cfg *c, const struct stats *st, struct queue *q,
-			    const struct writer *w, const char *devpath, const char *session,
-			    int64_t now, int64_t t_start, double fps_recent)
-{
-	char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
-	FILE *f;
-	size_t qbytes, qhw;
-	uint64_t qovr;
-
-	snprintf(fin, sizeof(fin), "%s/%s.json", c->live, c->name);
-	snprintf(tmp, sizeof(tmp), "%s/.%s.json.tmp", c->live, c->name);
-	f = fopen(tmp, "w");
-	if (!f)
-		return;
-	pthread_mutex_lock(&q->m);
-	qbytes = q->bytes;
-	qhw = q->high_water;
-	qovr = q->overruns;
-	pthread_mutex_unlock(&q->m);
-	fprintf(f, "{\"program\":\"ewego-cam %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
-		VERSION, c->name, devpath, c->preview);
-	if (session)
-		fprintf(f, "\"session\":\"%s\",", session);
-	else
-		fputs("\"session\":null,", f);
-	fprintf(f, "\"width\":%d,\"height\":%d,\"fps_requested\":%d,\"elapsed_s\":%.1f,"
-		   "\"frames\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
-		   ",\"errors\":%" PRIu64 ",\"fps\":%.2f,\"queue_mb\":%.1f,\"queue_peak_mb\":%.1f,"
-		   "\"overruns\":%" PRIu64 ",\"write_max_ms\":%.0f,\"written_mb\":%.1f,"
-		   "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 ",",
-		c->width, c->height, c->fps, (double)(now - t_start) / 1e6,
-		st->frames, st->bytes, st->lost, st->gaps, st->errors, fps_recent,
-		(double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms, (double)w->written_bytes / 1e6,
-		now, now_real_us());
-	{
-		double fmb = free_mb(session);
-		if (fmb < 0)
-			fputs("\"free_mb\":null,", f);
-		else
-			fprintf(f, "\"free_mb\":%.0f,", fmb);
-	}
-	fprintf(f, "\"writer_error\":%d,\"writer_error_msg\":\"", w->error ? 1 : 0);
-	if (w->error)
-		fprintf(f, "%s: %s", w->error_what, strerror(w->error));
-	fprintf(f, "\",\"discarded\":%" PRIu64 "}\n", w->discarded);
-	fclose(f);
-	rename(tmp, fin);
-}
-
-static int write_summary(const char *path, const struct cfg *c, const struct stats *st,
-			 const struct queue *q, const struct writer *w,
-			 const char *devpath, int64_t mono0, int64_t real0, int64_t mono1, int64_t real1,
-			 int exit_code, uint32_t tstamp_flags)
-{
-	FILE *f = fopen(path, "w");
-	if (!f)
-		return -1;
-	fprintf(f,
-		"{\n"
-		"  \"program\": \"ewego-cam %s\",\n"
-		"  \"name\": \"%s\",\n"
-		"  \"device\": \"%s\",\n"
-		"  \"requested\": {\"width\": %d, \"height\": %d, \"fps\": %d, \"format\": \"MJPG\"},\n"
-		"  \"frames\": %" PRIu64 ",\n"
-		"  \"bytes\": %" PRIu64 ",\n"
-		"  \"lost\": %" PRIu64 ",\n"
-		"  \"gaps\": %" PRIu64 ",\n"
-		"  \"gap_list\": \"%s\",\n"
-		"  \"error_frames\": %" PRIu64 ",\n"
-		"  \"stalls\": %" PRIu64 ",\n"
-		"  \"writer\": {\"frames\": %" PRIu64 ", \"bytes\": %" PRIu64 ", \"overruns\": %" PRIu64
-		", \"queue_peak_bytes\": %zu, \"queue_budget_bytes\": %zu, \"write_max_ms\": %.1f, \"error\": %d"
-		", \"error_msg\": \"%s%s%s\", \"discarded\": %" PRIu64 "},\n"
-		"  \"first_seq\": %u,\n"
-		"  \"last_seq\": %u,\n"
-		"  \"first_ts_us\": %" PRId64 ",\n"
-		"  \"last_ts_us\": %" PRId64 ",\n"
-		"  \"interval_us\": {\"min\": %.1f, \"mean\": %.1f, \"max\": %.1f, \"n\": %" PRIu64 "},\n"
-		"  \"effective_fps\": %.3f,\n"
-		"  \"timestamp_clock\": \"%s\",\n"
-		"  \"timestamp_source\": \"%s\",\n"
-		"  \"clock_at_start\": {\"monotonic_us\": %" PRId64 ", \"realtime_us\": %" PRId64 "},\n"
-		"  \"clock_at_end\": {\"monotonic_us\": %" PRId64 ", \"realtime_us\": %" PRId64 "},\n"
-		"  \"realtime_minus_monotonic_us\": %" PRId64 ",\n"
-		"  \"exit_code\": %d\n"
-		"}\n",
-		VERSION, c->name, devpath, c->width, c->height, c->fps,
-		st->frames, st->bytes, st->lost, st->gaps, st->gap_list, st->errors, st->stalls,
-		w->written_frames, w->written_bytes, q->overruns, q->high_water, q->max_bytes,
-		w->write_max_ms, w->error ? 1 : 0, w->error ? w->error_what : "", w->error ? ": " : "",
-		w->error ? strerror(w->error) : "", w->discarded,
-		st->have_seq ? st->first_seq : 0, st->have_seq ? st->last_seq : 0,
-		st->first_ts, st->last_ts,
-		st->dt_n ? st->dt_min : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n : 0.0,
-		st->dt_n ? st->dt_max : 0.0, st->dt_n,
-		(st->frames > 1 && st->last_ts > st->first_ts)
-			? (double)(st->frames - 1) * 1e6 / (double)(st->last_ts - st->first_ts) : 0.0,
-		(tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC ? "monotonic"
-			: (tstamp_flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_COPY ? "copy" : "unknown",
-		(tstamp_flags & V4L2_BUF_FLAG_TSTAMP_SRC_MASK) == V4L2_BUF_FLAG_TSTAMP_SRC_SOE
-			? "start-of-exposure (as flagged by uvcvideo; arrival time unless hwtimestamps=1)"
-			: "end-of-frame/arrival",
-		mono0, real0, mono1, real1, real0 - mono0, exit_code);
-	fclose(f);
-	return 0;
-}
-
 static int open_out(const char *dir, const char *name, const char *suffix)
 {
 	char path[PATH_MAX + 64];
@@ -818,19 +1064,19 @@ int main(int argc, char **argv)
 	int fd = -1;
 	void *bufs[MAX_BUFFERS] = {0};
 	size_t buflen[MAX_BUFFERS] = {0};
-	struct stats st;
 	struct queue q;
 	struct writer w;
+	struct capture cp;
 	pthread_t writer_thread;
-	int64_t mono0, real0, t_start, t_last_stats, t_last_frame, t_last_live;
-	uint64_t live_frames0 = 0;
-	uint32_t tstamp_flags = 0;
+	pthread_condattr_t ca;
+	int64_t mono0, real0, t_start, t_last_frame;
 	int exit_code = 0;
 	unsigned int i;
 
-	memset(&st, 0, sizeof(st));
 	memset(&q, 0, sizeof(q));
 	memset(&w, 0, sizeof(w));
+	memset(&cp, 0, sizeof(cp));
+	setvbuf(stdout, NULL, _IOLBF, 0);   /* the stats line reaches the journal as it is printed */
 
 	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:Pqlh", longopts, NULL)) != -1) {
 		switch (opt) {
@@ -1047,10 +1293,24 @@ int main(int argc, char **argv)
 	w.name = c.name;
 	w.live_last_ts = -1;   /* not INT64_MIN: ts - INT64_MIN overflows and the frame is never written */
 	pthread_mutex_init(&q.m, NULL);
-	pthread_cond_init(&q.cv, NULL);
+	pthread_condattr_init(&ca);
+	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+	pthread_cond_init(&q.cv, &ca);
 	q.max_bytes = c.ring_bytes;
 	w.q = &q;
 	w.wb_chunk = c.wb_chunk;
+	w.c = &c;
+	w.devpath = devpath;
+	w.dir = c.preview ? NULL : dir;
+	cp.c = &c;
+	cp.q = &q;
+	/* the wall-clock mapping, taken just before the stream starts */
+	mono0 = now_mono_us();
+	real0 = now_real_us();
+	w.t_start = w.t_last_stats = w.t_last_live = mono0;
+	w.mono0 = mono0;
+	w.real0 = real0;
+	/* before --rt: the writer must not inherit SCHED_FIFO */
 	if (pthread_create(&writer_thread, NULL, writer_main, &w)) {
 		perror("pthread_create");
 		return 1;
@@ -1075,9 +1335,7 @@ int main(int argc, char **argv)
 			return 1;
 		}
 	}
-	mono0 = now_mono_us();
-	real0 = now_real_us();
-	t_start = t_last_stats = t_last_frame = t_last_live = mono0;
+	t_start = t_last_frame = now_mono_us();
 	if (c.preview)
 		fprintf(stderr, "preview %dx%d MJPG @ %d fps -> %s/%s.jpg (nothing recorded)\n",
 			c.width, c.height, c.fps, c.live, c.name);
@@ -1111,7 +1369,9 @@ int main(int argc, char **argv)
 			}
 			if (now - t_last_frame > (int64_t)c.stall_timeout * 1000000) {
 				fprintf(stderr, "no frame for %d s: camera stalled\n", c.stall_timeout);
-				st.stalls++;
+				pthread_mutex_lock(&q.m);
+				q.st.stalls++;
+				pthread_mutex_unlock(&q.m);
 				exit_code = 3;
 				break;
 			}
@@ -1127,90 +1387,11 @@ int main(int argc, char **argv)
 				break;
 			}
 			ts_us = (int64_t)b.timestamp.tv_sec * 1000000 + b.timestamp.tv_usec;
-			tstamp_flags = b.flags;
 			t_last_frame = now;
-
-			if (!st.have_seq) {
-				st.first_seq = b.sequence;
-				st.first_ts = ts_us;
-				st.have_seq = 1;
-			} else {
-				if (b.sequence != st.last_seq + 1) {
-					uint32_t missing = b.sequence - st.last_seq - 1;
-					st.gaps++;
-					st.lost += missing;
-					if (strlen(st.gap_list) < sizeof(st.gap_list) - 32) {
-						char g[32];
-						snprintf(g, sizeof(g), "%s%u->%u", st.gap_list[0] ? "," : "", st.last_seq, b.sequence);
-						strncat(st.gap_list, g, sizeof(st.gap_list) - strlen(st.gap_list) - 1);
-					}
-					if (!c.quiet)
-						fprintf(stderr, "gap: seq %u -> %u (%u lost)\n", st.last_seq, b.sequence, missing);
-				}
-				if (ts_us > st.last_ts)
-					stats_add_interval(&st, (double)(ts_us - st.last_ts));
-				else if (!c.quiet)
-					fprintf(stderr, "warning: timestamp went backwards (%" PRId64 " -> %" PRId64 " us)\n",
-						st.last_ts, ts_us);
-			}
-			st.last_seq = b.sequence;
-			st.last_ts = ts_us;
-			if (b.flags & V4L2_BUF_FLAG_ERROR)
-				st.errors++;
-
-			if (b.bytesused > 0 && b.bytesused <= buflen[b.index]) {
-				struct frame *f = NULL;
-				int overrun = 0;
-
-				pthread_mutex_lock(&q.m);
-				if (q.bytes + b.bytesused > q.max_bytes) {
-					q.overruns++;
-					overrun = 1;
-				}
-				pthread_mutex_unlock(&q.m);
-
-				if (!overrun) {
-					f = malloc(sizeof(*f));
-					if (f) {
-						f->data = malloc(b.bytesused);
-						if (!f->data) {
-							free(f);
-							f = NULL;
-						}
-					}
-					if (!f) {
-						overrun = 1;
-						pthread_mutex_lock(&q.m);
-						q.overruns++;
-						pthread_mutex_unlock(&q.m);
-					}
-				}
-				if (f) {
-					memcpy(f->data, bufs[b.index], b.bytesused);
-					f->len = b.bytesused;
-					f->ts_us = ts_us;
-					f->seq = b.sequence;
-					f->flags = b.flags;
-					f->next = NULL;
-					pthread_mutex_lock(&q.m);
-					if (q.tail)
-						q.tail->next = f;
-					else
-						q.head = f;
-					q.tail = f;
-					q.bytes += f->len;
-					q.frames++;
-					if (q.bytes > q.high_water)
-						q.high_water = q.bytes;
-					pthread_cond_signal(&q.cv);
-					pthread_mutex_unlock(&q.m);
-				} else if (!c.quiet) {
-					fprintf(stderr, "writer queue full: frame seq %u not written\n", b.sequence);
-				}
-				st.frames++;
-				st.bytes += b.bytesused;
-				st.i_bytes += b.bytesused;
-			}
+			if (b.bytesused > 0 && b.bytesused <= buflen[b.index])
+				capture_frame(&cp, bufs[b.index], b.bytesused, ts_us, b.sequence, b.flags, now);
+			else
+				capture_frame(&cp, NULL, 0, ts_us, b.sequence, b.flags, now);
 			if (xioctl(fd, VIDIOC_QBUF, &b)) {
 				perror("VIDIOC_QBUF");
 				exit_code = 1;
@@ -1218,16 +1399,6 @@ int main(int argc, char **argv)
 			}
 		}
 
-		if (c.stats_interval > 0 && now - t_last_stats >= (int64_t)c.stats_interval * 1000000) {
-			print_stats(&c, &st, &q, &w, c.preview ? NULL : dir, (double)(now - t_start) / 1e6);
-			t_last_stats = now;
-		}
-		if (c.live && now - t_last_live >= 1000000) {
-			write_live_json(&c, &st, &q, &w, devpath, c.preview ? NULL : dir, now, t_start,
-					(double)(st.frames - live_frames0) * 1e6 / (double)(now - t_last_live));
-			live_frames0 = st.frames;
-			t_last_live = now;
-		}
 		if (c.seconds > 0 && now - t_start >= (int64_t)c.seconds * 1000000)
 			break;
 	}
@@ -1260,20 +1431,23 @@ int main(int argc, char **argv)
 		unlink(path);
 	}
 
-	if (w.error)
-		exit_code = 4;
-	else if (exit_code == 0 && (st.lost || st.errors || q.overruns))
-		exit_code = 2;
-	if (!c.preview) {
-		int64_t mono1 = now_mono_us(), real1 = now_real_us();
-		snprintf(path, sizeof(path), "%s/%s_summary.json", dir, c.name);
-		write_summary(path, &c, &st, &q, &w, devpath, mono0, real0, mono1, real1, exit_code, tstamp_flags);
-	}
-	fprintf(stderr, "%s: %" PRIu64 " frames, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " error-flagged, "
+	{
+		struct snapshot s;
+		const struct stats *st = &s.st;
+
+		take_snapshot(&q, &s, 0);
+		if (w.error)
+			exit_code = 4;
+		else if (exit_code == 0 && (st->lost || st->errors || s.qovr))
+			exit_code = 2;
+		if (!c.preview && write_summary(&c, &s, &w, now_mono_us(), now_real_us(), exit_code, 0))
+			fprintf(stderr, "ewego-cam: could not write %s/%s_summary.json: %s\n", dir, c.name, strerror(errno));
+		fprintf(stderr, "%s: %" PRIu64 " frames, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " error-flagged, "
 		"%" PRIu64 " queue overruns, %.1f MB, interval min/mean/max %.1f/%.1f/%.1f ms, "
 		"queue peak %.1f MB, write max %.0f ms -> exit %d\n",
-		c.name, st.frames, st.lost, st.gaps, st.errors, q.overruns, (double)w.written_bytes / 1e6,
-		st.dt_n ? st.dt_min / 1000.0 : 0.0, st.dt_n ? st.dt_sum / (double)st.dt_n / 1000.0 : 0.0,
-		st.dt_n ? st.dt_max / 1000.0 : 0.0, (double)q.high_water / 1e6, w.write_max_ms, exit_code);
+		c.name, st->frames, st->lost, st->gaps, st->errors, s.qovr, (double)w.written_bytes / 1e6,
+		st->dt_n ? st->dt_min / 1000.0 : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n / 1000.0 : 0.0,
+		st->dt_n ? st->dt_max / 1000.0 : 0.0, (double)s.qhw / 1e6, w.write_max_ms, exit_code);
+	}
 	return exit_code;
 }

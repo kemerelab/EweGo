@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -161,7 +162,7 @@ struct writer {
 	char error_what[96];         /* which call failed */
 	/* periodic work (stats line, STATUS=, live JSON, in-progress summary) */
 	const struct cfg *c;
-	const char *devpath;
+	const char *devpath, *port;
 	const char *dir;             /* session directory, NULL in --preview */
 	int64_t t_start, mono0, real0;
 	int64_t t_last_stats, t_last_live, t_last_summary;
@@ -460,8 +461,8 @@ static void write_live_json(const struct cfg *c, const struct snapshot *s, const
 	f = fopen(tmp, "w");
 	if (!f)
 		return;
-	fprintf(f, "{\"program\":\"ewego-cam %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
-		VERSION, c->name, w->devpath, c->preview);
+	fprintf(f, "{\"program\":\"ewego-cam %s\",\"name\":\"%s\",\"device\":\"%s\",\"port\":\"%s\",\"preview\":%d,",
+		VERSION, c->name, w->devpath, w->port, c->preview);
 	if (w->dir)
 		fprintf(f, "\"session\":\"%s\",", w->dir);
 	else
@@ -520,6 +521,7 @@ static int write_summary(const struct cfg *c, const struct snapshot *s, const st
 		"  \"program\": \"ewego-cam %s\",\n"
 		"  \"name\": \"%s\",\n"
 		"  \"device\": \"%s\",\n"
+		"  \"port\": \"%s\",\n"
 		"  \"requested\": {\"width\": %d, \"height\": %d, \"fps\": %d, \"format\": \"MJPG\"},\n"
 		"  \"in_progress\": %s,\n"
 		"  \"frames\": %" PRIu64 ",\n"
@@ -546,7 +548,7 @@ static int write_summary(const struct cfg *c, const struct snapshot *s, const st
 		"  \"realtime_minus_monotonic_us\": %" PRId64 ",\n"
 		"  \"exit_code\": %s\n"
 		"}\n",
-		VERSION, c->name, w->devpath, c->width, c->height, c->fps,
+		VERSION, c->name, w->devpath, w->port, c->width, c->height, c->fps,
 		in_progress ? "true" : "false",
 		st->frames, st->bytes, st->lost, st->gaps, st->gap_list, st->errors, st->stalls,
 		w->written_frames, w->written_bytes, s->qovr, s->qhw, s->qmax,
@@ -907,6 +909,57 @@ static int enumerate_cameras(struct cam_entry *cams, int max)
 	return n;
 }
 
+/* strlcpy */
+static void copy_str(char *dst, size_t len, const char *src)
+{
+	size_t n = strlen(src);
+	if (n >= len)
+		n = len - 1;
+	memcpy(dst, src, n);
+	dst[n] = 0;
+}
+
+/*
+ * Port claims: every instance takes an flock on <lock dir>/port-<port>.lock
+ * for the camera it records (released by the kernel when the process exits,
+ * however it exits), and auto: never picks a port another instance holds.
+ * Without this, camera1's fallback after --wait could take the camera that
+ * camera2 resolves a moment later, and one of them would loop on EBUSY.
+ */
+static const char *g_lock_dir = "/run/ewego";
+static int g_lock_fd = -1;
+
+/* 0 = claimed (or locking unavailable), -1 = another process holds the port */
+static int claim_port(const char *port)
+{
+	static int warned;
+	char path[PATH_MAX];
+	int fd;
+
+	if (!g_lock_dir || !g_lock_dir[0] || !port[0] || strcmp(port, "?") == 0)
+		return 0;
+	if (mkdir_p(g_lock_dir, 0755) == 0) {
+		snprintf(path, sizeof(path), "%s/port-%s.lock", g_lock_dir, port);
+		fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+		if (fd >= 0) {
+			if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+				if (g_lock_fd >= 0)
+					close(g_lock_fd);
+				g_lock_fd = fd;
+				return 0;
+			}
+			close(fd);
+			if (errno == EWOULDBLOCK)
+				return -1;
+		}
+	}
+	if (!warned)
+		fprintf(stderr, "note: cannot use port locks in %s (%s); not guarding against another instance\n",
+			g_lock_dir, strerror(errno));
+	warned = 1;
+	return 0;
+}
+
 /*
  * Resolve --device:
  *   /dev/videoN, a by-path link   used as is
@@ -921,18 +974,23 @@ static int enumerate_cameras(struct cam_entry *cams, int max)
  *                                 hub reset the cameras come back one at a
  *                                 time and the order must not be decided
  *                                 while one is still missing.
- * Returns 0 resolved, -1 not (yet) present, -2 bad spec, -3 for auto: when
- * at least N cameras are present but fewer than M or the set is still
- * changing (out holds the candidate, so the caller can use it after the
- * wait rather than record nothing).
+ * final = the last try of the --wait loop: auto: then takes the Nth camera
+ * even if fewer than M are present or the set is still changing, and if
+ * another instance holds that one, any camera that no instance holds (a
+ * camera recorded under the other name beats an EBUSY restart loop; the
+ * summary's "port" says which physical camera it was).
+ * The chosen port is claimed (see claim_port) before returning 0.
+ * Returns 0 resolved, -1 not (yet) present, -2 bad spec, -3 auto: set
+ * incomplete or still changing, -4 claimed by another instance.
  */
-static int resolve_device(const char *spec, char *out, size_t outlen)
+static int resolve_device(const char *spec, char *out, size_t outlen, char *port, size_t portlen, int final)
 {
 	struct cam_entry cams[MAX_CAMS];
 	static struct cam_entry last[MAX_CAMS];
 	static int last_n = -1, stable_polls;
-	int n, i, found = 0;
+	int n, i, k, found = 0;
 
+	port[0] = 0;
 	if (strncmp(spec, "auto:", 5) == 0) {
 		char *end;
 		int want = (int)strtol(spec + 5, &end, 10), expect = want;
@@ -952,17 +1010,50 @@ static int resolve_device(const char *spec, char *out, size_t outlen)
 		last_n = n;
 		if (n < want)
 			return -1;
-		snprintf(out, outlen, "%s", cams[want - 1].path);
-		return (n < expect || stable_polls < 3) ? -3 : 0;
-	}
-	if (strncmp(spec, "port:", 5) != 0) {
-		snprintf(out, outlen, "%s", spec);
-		return access(spec, F_OK) == 0 ? 0 : -1;
+		if (!final && (n < expect || stable_polls < 3))
+			return -3;
+		/* the Nth first; after the wait, then any other camera in port order */
+		for (k = -1; k < n; k++) {
+			i = k < 0 ? want - 1 : k;
+			if (k == want - 1)
+				continue;
+			if (k >= 0 && !final)
+				break;
+			if (claim_port(cams[i].port) == 0) {
+				snprintf(out, outlen, "%s", cams[i].path);
+				copy_str(port, portlen, cams[i].port);
+				if (k >= 0)
+					fprintf(stderr, "ewego-cam: %s: port %s is held by another ewego-cam; "
+						"recording the free camera on port %s instead\n",
+						spec, cams[want - 1].port, cams[i].port);
+				else if (n < expect || stable_polls < 3)
+					fprintf(stderr, "ewego-cam: %s: %d of %d cameras present after the wait, using port %s\n",
+						spec, n, expect, cams[i].port);
+				return 0;
+			}
+		}
+		return -4;
 	}
 	n = enumerate_cameras(cams, MAX_CAMS);
+	if (strncmp(spec, "port:", 5) != 0) {
+		char want_real[PATH_MAX], real[PATH_MAX];
+
+		snprintf(out, outlen, "%s", spec);
+		if (access(spec, F_OK) != 0)
+			return -1;
+		/* a node given by name: claim its port too, if it is a USB camera */
+		if (realpath(spec, want_real))
+			for (i = 0; i < n; i++)
+				if (realpath(cams[i].path, real) && strcmp(real, want_real) == 0) {
+					copy_str(port, portlen, cams[i].port);
+					break;
+				}
+		return claim_port(port) == 0 ? 0 : -4;
+	}
 	for (i = 0; i < n; i++) {
 		if (strcmp(cams[i].port, spec + 5) == 0) {
 			snprintf(out, outlen, "%s", cams[i].path);
+			copy_str(port, portlen, cams[i].port);
 			found++;
 		}
 	}
@@ -970,7 +1061,9 @@ static int resolve_device(const char *spec, char *out, size_t outlen)
 		fprintf(stderr, "ewego-cam: %s matched %d cameras (want exactly 1); use --list\n", spec, found);
 		return -2;
 	}
-	return found == 1 ? 0 : -1;
+	if (found == 0)
+		return -1;
+	return claim_port(port) == 0 ? 0 : -4;
 }
 
 static void list_cameras(void)
@@ -1014,6 +1107,8 @@ static void usage(FILE *f)
 		"  --wait N            wait up to N seconds for the camera to appear (default 30)\n"
 		"  --live DIR          keep DIR/NAME.jpg (newest frame, <= 5/s) and DIR/NAME.json (counters, 1/s)\n"
 		"  --preview           stream into the --live files only; nothing is recorded\n"
+		"  --lock-dir DIR      port claims (port-<port>.lock) so two instances never take one camera\n"
+		"                      (default /run/ewego; \"\" = off)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n",
 		VERSION, MAX_BUFFERS);
@@ -1024,15 +1119,78 @@ static int parse_size(const char *s, int *w, int *h)
 	return sscanf(s, "%dx%d", w, h) == 2 && *w > 0 && *h > 0 ? 0 : -1;
 }
 
+/* O_EXCL: never truncate an existing recording. Returns fd, or -1 with errno. */
 static int open_out(const char *dir, const char *name, const char *suffix)
 {
 	char path[PATH_MAX + 64];
-	int fd;
 	snprintf(path, sizeof(path), "%s/%s%s", dir, name, suffix);
-	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-	if (fd < 0)
-		perror(path);
-	return fd;
+	return open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+}
+
+/*
+ * Create the session directory and the three output files, as late as
+ * possible (after the camera is open and configured, so a failed start
+ * leaves nothing behind). The stamp is local time to the second, so a
+ * restart within the same second or after a clock step can land on an
+ * existing session: the files are opened O_EXCL and, if they exist, the
+ * session becomes <stamp>-2, <stamp>-3, ... With --no-session-dir an
+ * existing recording is an error. Returns 0, or -1 (message printed).
+ */
+static int open_outputs(const struct cfg *c, char *dir, size_t dirlen, struct writer *w)
+{
+	static const char *const suffix[3] = {".mjpeg", "_timestamps.bin", "_index.bin"};
+	char base[PATH_MAX];
+	int k, i, fds[3];
+
+	if (c->session_dir) {
+		time_t t = time(NULL);
+		struct tm tm;
+		char stamp[32];
+		localtime_r(&t, &tm);
+		strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+		snprintf(base, sizeof(base), "%s/%s", c->out, stamp);
+	} else {
+		snprintf(base, sizeof(base), "%s", c->out);
+	}
+	for (k = 1; k <= 99; k++) {
+		if ((k == 1 ? snprintf(dir, dirlen, "%s", base)
+			    : snprintf(dir, dirlen, "%s-%d", base, k)) >= (int)dirlen) {
+			fprintf(stderr, "ewego-cam: %s: path too long\n", base);
+			return -1;
+		}
+		if (mkdir_p(dir, 0755)) {
+			fprintf(stderr, "ewego-cam: %s: %s\n", dir, strerror(errno));
+			return -1;
+		}
+		for (i = 0; i < 3; i++) {
+			fds[i] = open_out(dir, c->name, suffix[i]);
+			if (fds[i] < 0)
+				break;
+		}
+		if (i == 3) {
+			w->vid_fd = fds[0];
+			w->ts_fd = fds[1];
+			w->idx_fd = fds[2];
+			return 0;
+		}
+		{
+			int err = errno;
+			char path[PATH_MAX + 64];
+
+			while (--i >= 0) {         /* undo the ones this attempt created */
+				close(fds[i]);
+				snprintf(path, sizeof(path), "%s/%s%s", dir, c->name, suffix[i]);
+				unlink(path);
+			}
+			if (err != EEXIST || !c->session_dir) {
+				fprintf(stderr, "ewego-cam: %s/%s.*: %s%s\n", dir, c->name, strerror(err),
+					err == EEXIST ? " (not overwriting an earlier recording)" : "");
+				return -1;
+			}
+		}
+	}
+	fprintf(stderr, "ewego-cam: %s: no free session name\n", base);
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -1056,10 +1214,11 @@ int main(int argc, char **argv)
 		{"auto-fps", no_argument, 0, 'A'}, {"wait", required_argument, 0, 'w'},
 		{"live", required_argument, 0, 'L'}, {"preview", no_argument, 0, 'P'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
+		{"lock-dir", required_argument, 0, 'K'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
 	int opt;
-	char devpath[PATH_MAX];
+	char devpath[PATH_MAX], port[64] = "";
 	char dir[PATH_MAX], path[PATH_MAX + 64];
 	int fd = -1;
 	void *bufs[MAX_BUFFERS] = {0};
@@ -1078,7 +1237,7 @@ int main(int argc, char **argv)
 	memset(&cp, 0, sizeof(cp));
 	setvbuf(stdout, NULL, _IOLBF, 0);   /* the stats line reaches the journal as it is printed */
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:Pqlh", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:PqlhK:", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -1104,6 +1263,7 @@ int main(int argc, char **argv)
 		case 'L': c.live = optarg; break;
 		case 'P': c.preview = 1; break;
 		case 'q': c.quiet = 1; break;
+		case 'K': g_lock_dir = optarg; break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 1;
@@ -1122,52 +1282,52 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	/* Signals first: a stop during the device wait or the setup below must
+	 * end the process cleanly (no SA_RESTART, so the waits return EINTR). */
+	{
+		struct sigaction sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = on_signal;
+		sigemptyset(&sa.sa_mask);
+		sigaction(SIGINT, &sa, NULL);
+		sigaction(SIGTERM, &sa, NULL);
+		signal(SIGPIPE, SIG_IGN);
+	}
+
 	/* After a hub reset the camera re-enumerates a few seconds later; wait
 	 * for it rather than failing the unit (systemd would retry anyway, but
 	 * this keeps the gap and the log cleaner). */
 	{
-		int tries = 0, rc;
+		int tries = 0, rc, limit = c.wait_secs * 2 > 1 ? c.wait_secs * 2 : 1;
 		for (;;) {
-			rc = resolve_device(c.device, devpath, sizeof(devpath));
+			int final = tries + 1 >= limit;
+
+			if (g_stop) {
+				fprintf(stderr, "ewego-cam: stopped while waiting for %s; nothing recorded\n", c.device);
+				return 0;
+			}
+			rc = resolve_device(c.device, devpath, sizeof(devpath), port, sizeof(port), final);
 			if (rc == 0)
 				break;
 			if (rc == -2)
 				return 1;
-			if (++tries >= c.wait_secs * 2) {
-				if (rc == -3) {
-					fprintf(stderr, "ewego-cam: %s: fewer cameras than expected after %d s, using %s\n",
-						c.device, c.wait_secs, devpath);
-					break;
-				}
-				fprintf(stderr, "ewego-cam: no camera for %s after %d s\n", c.device, c.wait_secs);
+			if (final) {
+				if (rc == -4)
+					fprintf(stderr, "ewego-cam: camera for %s is held by another ewego-cam (port lock in %s)\n",
+						c.device, g_lock_dir);
+				else
+					fprintf(stderr, "ewego-cam: no camera for %s after %d s\n", c.device, c.wait_secs);
 				return 1;
 			}
-			if (tries == 1)
+			if (++tries == 1)
 				fprintf(stderr, "ewego-cam: waiting up to %d s for %s ...\n", c.wait_secs, c.device);
 			usleep(500000);
 		}
 		if (strncmp(c.device, "auto:", 5) == 0)
-			fprintf(stderr, "ewego-cam: %s -> %s\n", c.device, devpath);
+			fprintf(stderr, "ewego-cam: %s -> %s (port %s)\n", c.device, devpath, port[0] ? port : "?");
 	}
 
-	/* output directory */
 	dir[0] = 0;
-	if (!c.preview) {
-		if (c.session_dir) {
-			time_t t = time(NULL);
-			struct tm tm;
-			char stamp[32];
-			localtime_r(&t, &tm);
-			strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
-			snprintf(dir, sizeof(dir), "%s/%s", c.out, stamp);
-		} else {
-			snprintf(dir, sizeof(dir), "%s", c.out);
-		}
-		if (mkdir_p(dir, 0755)) {
-			perror(dir);
-			return 1;
-		}
-	}
 	if (c.live && mkdir_p(c.live, 0755)) {
 		perror(c.live);
 		return 1;
@@ -1276,15 +1436,24 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* output files and writer thread */
-	w.vid_fd = w.ts_fd = w.idx_fd = -1;
-	if (!c.preview) {
-		w.vid_fd = open_out(dir, c.name, ".mjpeg");
-		w.ts_fd = open_out(dir, c.name, "_timestamps.bin");
-		w.idx_fd = open_out(dir, c.name, "_index.bin");
-		if (w.vid_fd < 0 || w.ts_fd < 0 || w.idx_fd < 0)
-			return 4;
+	{
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		if (xioctl(fd, VIDIOC_STREAMON, &type)) {
+			perror("VIDIOC_STREAMON");
+			return 1;
+		}
 	}
+
+	/* output files and writer thread: only now, with the camera streaming
+	 * (the queued buffers hold the first frames meanwhile), so a start that
+	 * fails or is stopped earlier leaves no empty session behind */
+	if (g_stop) {
+		fprintf(stderr, "ewego-cam: stopped during setup; nothing recorded\n");
+		return 0;
+	}
+	w.vid_fd = w.ts_fd = w.idx_fd = -1;
+	if (!c.preview && open_outputs(&c, dir, sizeof(dir), &w))
+		return 4;
 	w.wb[0].fd = w.vid_fd;
 	w.wb[1].fd = w.ts_fd;
 	w.wb[2].fd = w.idx_fd;
@@ -1304,16 +1473,28 @@ int main(int argc, char **argv)
 	w.dir = c.preview ? NULL : dir;
 	cp.c = &c;
 	cp.q = &q;
-	/* the wall-clock mapping, taken just before the stream starts */
+	w.port = port;
+	/* the wall-clock mapping, taken as the stream starts */
 	mono0 = now_mono_us();
 	real0 = now_real_us();
 	w.t_start = w.t_last_stats = w.t_last_live = mono0;
 	w.mono0 = mono0;
 	w.real0 = real0;
-	/* before --rt: the writer must not inherit SCHED_FIFO */
-	if (pthread_create(&writer_thread, NULL, writer_main, &w)) {
-		perror("pthread_create");
-		return 1;
+	/* before --rt: the writer must not inherit SCHED_FIFO; and signals are
+	 * left to the main thread */
+	{
+		sigset_t ss, old;
+		int rc;
+		sigemptyset(&ss);
+		sigaddset(&ss, SIGINT);
+		sigaddset(&ss, SIGTERM);
+		pthread_sigmask(SIG_BLOCK, &ss, &old);
+		rc = pthread_create(&writer_thread, NULL, writer_main, &w);
+		pthread_sigmask(SIG_SETMASK, &old, NULL);
+		if (rc) {
+			fprintf(stderr, "pthread_create: %s\n", strerror(rc));
+			return 1;
+		}
 	}
 
 	if (c.realtime) {
@@ -1324,17 +1505,6 @@ int main(int argc, char **argv)
 			fprintf(stderr, "note: mlockall failed (%s)\n", strerror(errno));
 	}
 
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-	signal(SIGPIPE, SIG_IGN);
-
-	{
-		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		if (xioctl(fd, VIDIOC_STREAMON, &type)) {
-			perror("VIDIOC_STREAMON");
-			return 1;
-		}
-	}
 	t_start = t_last_frame = now_mono_us();
 	if (c.preview)
 		fprintf(stderr, "preview %dx%d MJPG @ %d fps -> %s/%s.jpg (nothing recorded)\n",

@@ -3,15 +3,22 @@ Description=EweGo UART IMU logger (BNO055 on ttyAMA5)
 Documentation=file:///opt/ewego/Firmware/imuuart/README.md
 After=local-fs.target
 PartOf=ewego-record.target
+# never stop restarting a recorder in the field
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# READY=1 once the sensor answered and the CSV is open; WATCHDOG=1 from the
+# writer thread only while fdatasync of new rows keeps completing, so a
+# recorder that hangs or stops writing is killed and restarted.
+Type=notify
+WatchdogSec=30
 EnvironmentFile=-/etc/ewego/imu-uart.conf
 ExecStart=/usr/local/bin/ewego-imu-uart --port ${PORT} --baud ${BAUD} --rate ${RATE} --out ${OUT_DIR} --name ${NAME} $EXTRA_ARGS
 KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=3
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,19 @@
+[Unit]
+Description=EweGo: start ewego-record.target at boot when /boot/firmware/ewego-record exists
+Documentation=https://github.com/kemerelab/EweGo/blob/phase-a-image/image/README.md
+# Field cards: `touch /boot/firmware/ewego-record` (the FAT boot partition,
+# so it can be created or deleted from any laptop). Bench cards leave it
+# absent and come up idle. The flag gates this unit, not the target: a
+# Condition on the target would not stop the units it Wants= (systemd still
+# pulls them in), and the target must stay startable by hand on the bench.
+ConditionPathExists=/boot/firmware/ewego-record
+After=local-fs.target boot-firmware.mount
+
+[Service]
+Type=oneshot
+# --no-block: queue the start and return, so boot does not wait on the
+# recorders (the cameras wait for their devices for a while).
+ExecStart=/bin/systemctl start --no-block ewego-record.target
+
+[Install]
+WantedBy=multi-user.target

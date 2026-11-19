@@ -23,7 +23,11 @@
 # What it does to the target:
 #   rootfs: /opt/ewego/                          Firmware tree from this repo
 #           /opt/ewego/pylib/                    vendored pure-Python packages
-#           /etc/systemd/system/ewego-*.service  installed, NOT enabled
+#           /etc/systemd/system/ewego-*.service  installed; only ewego-webtest and
+#                                                ewego-autostart are enabled (the
+#                                                latter starts ewego-record.target
+#                                                when /boot/firmware/ewego-record
+#                                                exists)
 #           /etc/modules-load.d/ewego.conf       i2c-dev
 #           /etc/ewego-image-release             version + build date
 #           apt packages from apt-packages.txt   installed inside the image
@@ -183,7 +187,7 @@ for f in "$IMAGE_DIR"/ewego/*.conf; do
 done
 
 # --- rootfs: units (installed, deliberately not enabled) ------------------
-log "Installing systemd units (not enabled)"
+log "Installing systemd units"
 for u in "$IMAGE_DIR"/units/*.service "$IMAGE_DIR"/units/*.target; do
     install -m 644 "$u" "$ROOT_MNT/etc/systemd/system/$(basename "$u")"
 done
@@ -191,10 +195,15 @@ done
 rm -f "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.service \
       "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.target
 
-# The only unit enabled by default is the web test console (port 8080,
-# no authentication), so a freshly flashed collar can be exercised from a
-# browser. Recording units stay disabled until started deliberately.
-ENABLE_UNITS="ewego-webtest.service"
+# Enabled by default:
+#  - the web test console (port 8080, no authentication), so a freshly
+#    flashed wearable can be exercised from a browser;
+#  - ewego-autostart, which starts ewego-record.target at boot only when the
+#    flag file /boot/firmware/ewego-record exists (field cards: touch it on
+#    the FAT partition from any laptop; bench cards leave it absent and come
+#    up idle). A field reboot then resumes recording with no operator.
+# The recorders themselves stay disabled; the target pulls them in.
+ENABLE_UNITS="ewego-webtest.service ewego-autostart.service"
 install -d "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
 for u in $ENABLE_UNITS; do
     log "Enabling $u"
@@ -361,3 +370,4 @@ log "done: EweGo $EWEGO_VERSION injected into $TARGET"
 echo "    units installed: $(ls "$IMAGE_DIR"/units | tr '\n' ' ')"
 echo "    enabled by default: $ENABLE_UNITS (web console at http://<host>:8080)"
 echo "    start recording on the wearable with: sudo systemctl start ewego-record.target"
+echo "    record at every boot (field cards): touch /boot/firmware/ewego-record"

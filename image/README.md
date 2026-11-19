@@ -14,7 +14,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | `/opt/ewego/Firmware/` | the `Firmware/` tree from this repository |
 | `/opt/ewego/pylib/` | pyubx2 (+ pynmeagps, pyrtcm), vendored pure-Python wheels |
 | apt packages | `python3-smbus2`, `python3-serial`, `i2c-tools`, `psmisc`, `ffmpeg`, `dfu-util`, `avahi-daemon` — installed inside the image at build time. No `python3-picamera2`: the cameras are USB. |
-| `/etc/systemd/system/ewego-*` | `ewego-record.target` = the default recording set: `ewego-cam@camera1`, `ewego-cam@camera2` (USB cameras, `ewego-cam`), `ewego-imu-usb` (hub_imu module), `ewego-imu-uart` (the wearable's own BNO055 on UART5, `ewego-imu-uart`), `ewego-gps`, `ewego-audio`, `ewego-fuel`. All **installed but not enabled**; each can also run alone. `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
+| `/etc/systemd/system/ewego-*` | `ewego-record.target` = the default recording set: `ewego-cam@camera1`, `ewego-cam@camera2` (USB cameras, `ewego-cam`), `ewego-imu-usb` (hub_imu module), `ewego-imu-uart` (the wearable's own BNO055 on UART5, `ewego-imu-uart`), `ewego-gps`, `ewego-audio`, `ewego-fuel`. All **installed but not enabled**; each can also run alone. `ewego-autostart`: **enabled**, starts `ewego-record.target` at boot only when `/boot/firmware/ewego-record` exists (see *Recording at boot* below). `ewego-webtest`: the browser test console on port 8080, **enabled** (see `Firmware/webtest/README.md`; no authentication, bench and lab networks only). |
 | `/etc/ewego/*.conf` | per-unit settings: `cam-camera1.conf` / `cam-camera2.conf` (hub port, size, fps), `imu-usb.conf`, `imu-uart.conf`, `gps.conf` (NTRIP, off by default), `audio.conf`, `fuel.conf` |
 | `/usr/local/bin/ewego-cam`, `ewego-imu-usb`, `ewego-imu-uart` | static C recorders, cross-compiled in CI |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
@@ -48,8 +48,10 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
 4. Start recording when you want it (or from the console's Recorder card):
 
        sudo systemctl start ewego-record.target        # this boot only
-       sudo systemctl enable --now ewego-record.target # every boot
        sudo systemctl stop ewego-record.target         # stops all of them
+
+   To record from every boot, set the boot flag (next section) rather than
+   `systemctl enable` the target.
 
    Any member (`ewego-cam@camera1`, `ewego-imu-usb`, `ewego-imu-uart`, `ewego-gps`,
    `ewego-audio`, `ewego-fuel`) can be started on its own for
@@ -72,6 +74,38 @@ audio, fuel); the GPS logger keeps writing to `/opt/ewego/gps-logs/`.
    live page), not the switch: it stops the recorders so every summary is
    written and syncs the card first. Power loss mid-write is what corrupts
    the filesystem.
+
+## Recording at boot (field cards)
+
+A wearable in the field has no operator: after a reboot (brown-out,
+watchdog, someone power-cycling it) it must resume recording on its own.
+`ewego-autostart.service` is enabled in the image and starts
+`ewego-record.target` at boot **only when the flag file
+`/boot/firmware/ewego-record` exists**. The flag lives on the FAT boot
+partition, so it can be created or removed from any laptop with the card in
+a reader (the file is `ewego-record` at the top of the `bootfs` volume), or
+on the wearable:
+
+    sudo touch /boot/firmware/ewego-record     # field card: record at every boot
+    sudo rm /boot/firmware/ewego-record        # bench card: come up idle
+
+- Bench cards leave the flag absent: the wearable boots idle and recording
+  is started from the console or `systemctl`.
+- Field cards get the flag after flashing (flashing rewrites the boot
+  partition, so set it again after every reflash). Raspberry Pi Imager's
+  customisation only adds its own `user-data` / `network-config` /
+  `meta-data` files there and cloud-init does not remove other files, so the
+  flag survives first boot. The first boot of a fresh card also resizes the
+  root filesystem and may reboot once; recording then starts on the boot
+  after that, like any other boot.
+- The flag gates the autostart unit, not the target: a `Condition` on a
+  target does not stop systemd from starting the units it `Wants=`, and the
+  target must stay startable by hand on a bench card.
+- `systemctl stop ewego-record.target` (or **Stop all** on the console)
+  stops recording until the next boot; delete the flag to keep it stopped.
+- Without network the clock comes from the last saved time, so the run
+  directory stamps after a field reboot are only as good as that; the GPS
+  `_timesync.csv` gives the correction.
 
 ## Building the image
 

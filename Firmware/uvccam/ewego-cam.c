@@ -93,6 +93,8 @@ struct cfg {
 	int wait_secs;       /* wait this long for the device to appear */
 	const char *live;    /* directory for the live frame + counters, or NULL */
 	int preview;         /* live files only, no recording */
+	const char *source;  /* --source: replay this MJPEG file instead of a camera (testing) */
+	int source_lose;     /* --source-lose N: skip a sequence number every N frames */
 };
 
 struct stats {
@@ -1131,7 +1133,10 @@ static void usage(FILE *f)
 		"  --lock-dir DIR      port claims (port-<port>.lock) so two instances never take one camera\n"
 		"                      (default /run/ewego; \"\" = off)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
-		"  --list              list USB cameras and exit\n",
+		"  --list              list USB cameras and exit\n"
+		"  --source FILE       testing: replay the JPEG frames of FILE (e.g. an .mjpeg) at --fps with\n"
+		"                      synthetic timestamps instead of a camera; --device is not needed\n"
+		"  --source-lose N     testing: with --source, skip one sequence number every N frames\n",
 		VERSION, MAX_BUFFERS);
 }
 
@@ -1214,6 +1219,306 @@ static int open_outputs(const struct cfg *c, char *dir, size_t dirlen, struct wr
 	return -1;
 }
 
+/* Open, configure and start the camera. Returns the fd, or -1 (message printed). */
+static int open_camera(struct cfg *c, const char *devpath, void **bufs, size_t *buflen)
+{
+	int fd;
+	unsigned int i;
+
+	fd = open(devpath, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		fprintf(stderr, "open %s: %s\n", devpath, strerror(errno));
+		return -1;
+	}
+	{
+		struct v4l2_capability cap;
+		memset(&cap, 0, sizeof(cap));
+		if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
+			perror("VIDIOC_QUERYCAP");
+			return -1;
+		}
+		uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+		if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) {
+			fprintf(stderr, "%s is not a streaming video capture device (caps 0x%x)\n", devpath, caps);
+			return -1;
+		}
+		fprintf(stderr, "ewego-cam %s: %s (%s, driver %s)\n", VERSION, devpath, cap.card, cap.driver);
+	}
+	{
+		struct v4l2_format fmt;
+		memset(&fmt, 0, sizeof(fmt));
+		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		fmt.fmt.pix.width = (uint32_t)c->width;
+		fmt.fmt.pix.height = (uint32_t)c->height;
+		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+		fmt.fmt.pix.field = V4L2_FIELD_NONE;
+		if (xioctl(fd, VIDIOC_S_FMT, &fmt)) {
+			perror("VIDIOC_S_FMT");
+			return -1;
+		}
+		if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
+			fprintf(stderr, "camera does not offer MJPEG\n");
+			return -1;
+		}
+		if ((int)fmt.fmt.pix.width != c->width || (int)fmt.fmt.pix.height != c->height)
+			fprintf(stderr, "note: camera chose %ux%u instead of %dx%d\n",
+				fmt.fmt.pix.width, fmt.fmt.pix.height, c->width, c->height);
+		c->width = (int)fmt.fmt.pix.width;
+		c->height = (int)fmt.fmt.pix.height;
+	}
+	{
+		struct v4l2_streamparm parm;
+		memset(&parm, 0, sizeof(parm));
+		parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		parm.parm.capture.timeperframe.numerator = 1;
+		parm.parm.capture.timeperframe.denominator = (uint32_t)c->fps;
+		if (xioctl(fd, VIDIOC_S_PARM, &parm))
+			fprintf(stderr, "note: VIDIOC_S_PARM failed (%s); using camera default rate\n", strerror(errno));
+		else if (parm.parm.capture.timeperframe.numerator &&
+			 (int)(parm.parm.capture.timeperframe.denominator / parm.parm.capture.timeperframe.numerator) != c->fps)
+			fprintf(stderr, "note: camera chose %u/%u s per frame instead of 1/%d\n",
+				parm.parm.capture.timeperframe.numerator, parm.parm.capture.timeperframe.denominator, c->fps);
+	}
+	if (!c->auto_fps) {
+		/* UVC "exposure, auto priority": when set, auto-exposure may lengthen
+		 * the exposure beyond the frame period and the camera delivers fewer
+		 * frames in dim light (seen: 24 fps in the evening). Clear it so the
+		 * rate stays fixed and frames get darker instead. */
+		struct v4l2_control ctl = {.id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = 0};
+		if (xioctl(fd, VIDIOC_S_CTRL, &ctl))
+			fprintf(stderr, "note: could not clear exposure-auto-priority (%s); frame rate may drop in dim light\n",
+				strerror(errno));
+	}
+	{
+		struct v4l2_requestbuffers req;
+		memset(&req, 0, sizeof(req));
+		req.count = (uint32_t)c->buffers;
+		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		req.memory = V4L2_MEMORY_MMAP;
+		if (xioctl(fd, VIDIOC_REQBUFS, &req)) {
+			perror("VIDIOC_REQBUFS");
+			return -1;
+		}
+		if (req.count < 2) {
+			fprintf(stderr, "driver gave only %u buffers\n", req.count);
+			return -1;
+		}
+		c->buffers = (int)req.count;
+		for (i = 0; i < req.count; i++) {
+			struct v4l2_buffer b;
+			memset(&b, 0, sizeof(b));
+			b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			b.memory = V4L2_MEMORY_MMAP;
+			b.index = i;
+			if (xioctl(fd, VIDIOC_QUERYBUF, &b)) {
+				perror("VIDIOC_QUERYBUF");
+				return -1;
+			}
+			bufs[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+			if (bufs[i] == MAP_FAILED) {
+				perror("mmap");
+				return -1;
+			}
+			buflen[i] = b.length;
+			if (xioctl(fd, VIDIOC_QBUF, &b)) {
+				perror("VIDIOC_QBUF");
+				return -1;
+			}
+		}
+	}
+
+	{
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		if (xioctl(fd, VIDIOC_STREAMON, &type)) {
+			perror("VIDIOC_STREAMON");
+			return -1;
+		}
+	}
+	return fd;
+}
+
+/* Capture loop: dequeue, copy into the queue, requeue. No disk I/O here.
+ * Returns the exit code so far (0, or 1 device error, 3 stalled). */
+static int capture_v4l2(const struct cfg *c, struct capture *cp, int fd, void **bufs, size_t *buflen,
+			int64_t t_start)
+{
+	int exit_code = 0;
+	int64_t t_last_frame = t_start;
+
+	while (!g_stop) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		struct v4l2_buffer b;
+		int64_t now, ts_us;
+		int r;
+
+		r = poll(&pfd, 1, 1000);
+		now = now_mono_us();
+		if (r < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("poll");
+			exit_code = 1;
+			break;
+		}
+		if (r == 0 || !(pfd.revents & POLLIN)) {
+			if (pfd.revents & POLLERR) {
+				fprintf(stderr, "poll: device error\n");
+				exit_code = 1;
+				break;
+			}
+			if (now - t_last_frame > (int64_t)c->stall_timeout * 1000000) {
+				fprintf(stderr, "no frame for %d s: camera stalled\n", c->stall_timeout);
+				pthread_mutex_lock(&cp->q->m);
+				cp->q->st.stalls++;
+				pthread_mutex_unlock(&cp->q->m);
+				exit_code = 3;
+				break;
+			}
+		} else {
+			memset(&b, 0, sizeof(b));
+			b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+			b.memory = V4L2_MEMORY_MMAP;
+			if (xioctl(fd, VIDIOC_DQBUF, &b)) {
+				if (errno == EAGAIN)
+					continue;
+				perror("VIDIOC_DQBUF");
+				exit_code = 1;
+				break;
+			}
+			ts_us = (int64_t)b.timestamp.tv_sec * 1000000 + b.timestamp.tv_usec;
+			t_last_frame = now;
+			if (b.bytesused > 0 && b.bytesused <= buflen[b.index])
+				capture_frame(cp, bufs[b.index], b.bytesused, ts_us, b.sequence, b.flags, now);
+			else
+				capture_frame(cp, NULL, 0, ts_us, b.sequence, b.flags, now);
+			if (xioctl(fd, VIDIOC_QBUF, &b)) {
+				perror("VIDIOC_QBUF");
+				exit_code = 1;
+				break;
+			}
+		}
+
+		if (c->seconds > 0 && now - t_start >= (int64_t)c->seconds * 1000000)
+			break;
+	}
+	return exit_code;
+}
+
+/*
+ * --source FILE: a test input instead of a camera. FILE is read into RAM and
+ * split into JPEG frames (SOI ff d8 ... EOI ff d9 followed by the next SOI
+ * or the end of the file, e.g. an .mjpeg written by this program); they are
+ * replayed in a loop at --fps with synthetic CLOCK_MONOTONIC timestamps
+ * and consecutive sequence numbers (--source-lose N skips one every N
+ * frames, as a lost frame), through the same queue, writer, live files and
+ * summary as a camera. For testing the recording path without hardware.
+ */
+struct source {
+	uint8_t *data;
+	size_t len;
+	size_t *off, *flen;
+	size_t n;
+};
+
+static int load_source(const char *path, struct source *src)
+{
+	struct stat sb;
+	size_t got = 0, p = 0, cap = 0;
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+	memset(src, 0, sizeof(*src));
+	if (fd < 0 || fstat(fd, &sb) || sb.st_size <= 0) {
+		fprintf(stderr, "ewego-cam: --source %s: %s\n", path, fd < 0 || sb.st_size > 0 ? strerror(errno) : "empty");
+		if (fd >= 0)
+			close(fd);
+		return -1;
+	}
+	src->len = (size_t)sb.st_size;
+	src->data = malloc(src->len);
+	if (!src->data) {
+		close(fd);
+		return -1;
+	}
+	while (got < src->len) {
+		ssize_t r = read(fd, src->data + got, src->len - got);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0) {
+			fprintf(stderr, "ewego-cam: --source %s: short read\n", path);
+			close(fd);
+			return -1;
+		}
+		got += (size_t)r;
+	}
+	close(fd);
+	while (p + 3 < src->len) {
+		size_t e;
+		if (src->data[p] != 0xff || src->data[p + 1] != 0xd8) {
+			p++;
+			continue;
+		}
+		for (e = p + 2; e + 1 < src->len; e++)
+			if (src->data[e] == 0xff && src->data[e + 1] == 0xd9 &&
+			    (e + 2 == src->len || (e + 3 < src->len && src->data[e + 2] == 0xff && src->data[e + 3] == 0xd8)))
+				break;
+		if (e + 1 >= src->len)
+			break;                      /* no EOI: trailing garbage */
+		if (src->n == cap) {
+			cap = cap ? cap * 2 : 256;
+			src->off = realloc(src->off, cap * sizeof(*src->off));
+			src->flen = realloc(src->flen, cap * sizeof(*src->flen));
+			if (!src->off || !src->flen)
+				return -1;
+		}
+		src->off[src->n] = p;
+		src->flen[src->n] = e + 2 - p;
+		src->n++;
+		p = e + 2;
+	}
+	if (src->n == 0) {
+		fprintf(stderr, "ewego-cam: --source %s: no JPEG frames found\n", path);
+		return -1;
+	}
+	fprintf(stderr, "ewego-cam: --source %s: %zu JPEG frames\n", path, src->n);
+	return 0;
+}
+
+static int capture_source(const struct cfg *c, struct capture *cp, const struct source *src, int64_t t_start)
+{
+	struct timespec next;
+	uint64_t k = 0;
+	uint32_t seq = 0;
+	long period_ns = 1000000000L / c->fps;
+
+	clock_gettime(CLOCK_MONOTONIC, &next);
+	while (!g_stop) {
+		int64_t now, ts_us;
+		size_t i;
+
+		next.tv_nsec += period_ns;
+		while (next.tv_nsec >= 1000000000L) {
+			next.tv_sec++;
+			next.tv_nsec -= 1000000000L;
+		}
+		while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR && !g_stop)
+			;
+		if (g_stop)
+			break;
+		now = now_mono_us();
+		ts_us = (int64_t)next.tv_sec * 1000000 + next.tv_nsec / 1000;
+		if (c->source_lose > 0 && k > 0 && k % (uint64_t)c->source_lose == 0)
+			seq++;                      /* simulate one lost frame */
+		i = (size_t)(k % src->n);
+		capture_frame(cp, src->data + src->off[i], src->flen[i], ts_us, seq,
+			      V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC, now);
+		k++;
+		seq++;
+		if (c->seconds > 0 && now - t_start >= (int64_t)c->seconds * 1000000)
+			break;
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct cfg c = {
@@ -1236,6 +1541,7 @@ int main(int argc, char **argv)
 		{"live", required_argument, 0, 'L'}, {"preview", no_argument, 0, 'P'},
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"lock-dir", required_argument, 0, 'K'},
+		{"source", required_argument, 0, 'X'}, {"source-lose", required_argument, 0, 'Z'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
 	int opt;
@@ -1247,18 +1553,20 @@ int main(int argc, char **argv)
 	struct queue q;
 	struct writer w;
 	struct capture cp;
+	struct source src;
 	pthread_t writer_thread;
 	pthread_condattr_t ca;
-	int64_t mono0, real0, t_start, t_last_frame;
+	int64_t mono0, real0, t_start;
 	int exit_code = 0;
 	unsigned int i;
 
 	memset(&q, 0, sizeof(q));
 	memset(&w, 0, sizeof(w));
 	memset(&cp, 0, sizeof(cp));
+	memset(&src, 0, sizeof(src));
 	setvbuf(stdout, NULL, _IOLBF, 0);   /* the stats line reaches the journal as it is printed */
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:PqlhK:", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:PqlhK:X:Z:", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -1285,11 +1593,15 @@ int main(int argc, char **argv)
 		case 'P': c.preview = 1; break;
 		case 'q': c.quiet = 1; break;
 		case 'K': g_lock_dir = optarg; break;
+		case 'X': c.source = optarg; break;
+		case 'Z': c.source_lose = atoi(optarg); break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 1;
 		}
 	}
+	if (c.source && !c.device)
+		c.device = c.source;
 	if (!c.device || (!c.out && !c.preview) || (c.preview && !c.live)) {
 		usage(stderr);
 		return 1;
@@ -1315,10 +1627,14 @@ int main(int argc, char **argv)
 		signal(SIGPIPE, SIG_IGN);
 	}
 
-	/* After a hub reset the camera re-enumerates a few seconds later; wait
-	 * for it rather than failing the unit (systemd would retry anyway, but
-	 * this keeps the gap and the log cleaner). */
-	{
+	if (c.source) {
+		if (load_source(c.source, &src))
+			return 1;
+		snprintf(devpath, sizeof(devpath), "%s", c.source);
+	} else {
+		/* After a hub reset the camera re-enumerates a few seconds later; wait
+		 * for it rather than failing the unit (systemd would retry anyway, but
+		 * this keeps the gap and the log cleaner). */
 		int tries = 0, rc, limit = c.wait_secs * 2 > 1 ? c.wait_secs * 2 : 1;
 		for (;;) {
 			int final = tries + 1 >= limit;
@@ -1355,115 +1671,10 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* open camera and configure */
-	fd = open(devpath, O_RDWR | O_CLOEXEC);
-	if (fd < 0) {
-		fprintf(stderr, "open %s: %s\n", devpath, strerror(errno));
-		return 1;
-	}
-	{
-		struct v4l2_capability cap;
-		memset(&cap, 0, sizeof(cap));
-		if (xioctl(fd, VIDIOC_QUERYCAP, &cap)) {
-			perror("VIDIOC_QUERYCAP");
+	if (!c.source) {
+		fd = open_camera(&c, devpath, bufs, buflen);
+		if (fd < 0)
 			return 1;
-		}
-		uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
-		if (!(caps & V4L2_CAP_VIDEO_CAPTURE) || !(caps & V4L2_CAP_STREAMING)) {
-			fprintf(stderr, "%s is not a streaming video capture device (caps 0x%x)\n", devpath, caps);
-			return 1;
-		}
-		fprintf(stderr, "ewego-cam %s: %s (%s, driver %s)\n", VERSION, devpath, cap.card, cap.driver);
-	}
-	{
-		struct v4l2_format fmt;
-		memset(&fmt, 0, sizeof(fmt));
-		fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		fmt.fmt.pix.width = (uint32_t)c.width;
-		fmt.fmt.pix.height = (uint32_t)c.height;
-		fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
-		fmt.fmt.pix.field = V4L2_FIELD_NONE;
-		if (xioctl(fd, VIDIOC_S_FMT, &fmt)) {
-			perror("VIDIOC_S_FMT");
-			return 1;
-		}
-		if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG) {
-			fprintf(stderr, "camera does not offer MJPEG\n");
-			return 1;
-		}
-		if ((int)fmt.fmt.pix.width != c.width || (int)fmt.fmt.pix.height != c.height)
-			fprintf(stderr, "note: camera chose %ux%u instead of %dx%d\n",
-				fmt.fmt.pix.width, fmt.fmt.pix.height, c.width, c.height);
-		c.width = (int)fmt.fmt.pix.width;
-		c.height = (int)fmt.fmt.pix.height;
-	}
-	{
-		struct v4l2_streamparm parm;
-		memset(&parm, 0, sizeof(parm));
-		parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		parm.parm.capture.timeperframe.numerator = 1;
-		parm.parm.capture.timeperframe.denominator = (uint32_t)c.fps;
-		if (xioctl(fd, VIDIOC_S_PARM, &parm))
-			fprintf(stderr, "note: VIDIOC_S_PARM failed (%s); using camera default rate\n", strerror(errno));
-		else if (parm.parm.capture.timeperframe.numerator &&
-			 (int)(parm.parm.capture.timeperframe.denominator / parm.parm.capture.timeperframe.numerator) != c.fps)
-			fprintf(stderr, "note: camera chose %u/%u s per frame instead of 1/%d\n",
-				parm.parm.capture.timeperframe.numerator, parm.parm.capture.timeperframe.denominator, c.fps);
-	}
-	if (!c.auto_fps) {
-		/* UVC "exposure, auto priority": when set, auto-exposure may lengthen
-		 * the exposure beyond the frame period and the camera delivers fewer
-		 * frames in dim light (seen: 24 fps in the evening). Clear it so the
-		 * rate stays fixed and frames get darker instead. */
-		struct v4l2_control ctl = {.id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = 0};
-		if (xioctl(fd, VIDIOC_S_CTRL, &ctl))
-			fprintf(stderr, "note: could not clear exposure-auto-priority (%s); frame rate may drop in dim light\n",
-				strerror(errno));
-	}
-	{
-		struct v4l2_requestbuffers req;
-		memset(&req, 0, sizeof(req));
-		req.count = (uint32_t)c.buffers;
-		req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		req.memory = V4L2_MEMORY_MMAP;
-		if (xioctl(fd, VIDIOC_REQBUFS, &req)) {
-			perror("VIDIOC_REQBUFS");
-			return 1;
-		}
-		if (req.count < 2) {
-			fprintf(stderr, "driver gave only %u buffers\n", req.count);
-			return 1;
-		}
-		c.buffers = (int)req.count;
-		for (i = 0; i < req.count; i++) {
-			struct v4l2_buffer b;
-			memset(&b, 0, sizeof(b));
-			b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			b.memory = V4L2_MEMORY_MMAP;
-			b.index = i;
-			if (xioctl(fd, VIDIOC_QUERYBUF, &b)) {
-				perror("VIDIOC_QUERYBUF");
-				return 1;
-			}
-			bufs[i] = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
-			if (bufs[i] == MAP_FAILED) {
-				perror("mmap");
-				return 1;
-			}
-			buflen[i] = b.length;
-			if (xioctl(fd, VIDIOC_QBUF, &b)) {
-				perror("VIDIOC_QBUF");
-				return 1;
-			}
-		}
-	}
-
-	{
-		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		if (xioctl(fd, VIDIOC_STREAMON, &type)) {
-			perror("VIDIOC_STREAMON");
-			return 1;
-		}
 	}
 
 	/* output files and writer thread: only now, with the camera streaming
@@ -1527,7 +1738,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "note: mlockall failed (%s)\n", strerror(errno));
 	}
 
-	t_start = t_last_frame = now_mono_us();
+	t_start = now_mono_us();
 	if (c.preview)
 		fprintf(stderr, "preview %dx%d MJPG @ %d fps -> %s/%s.jpg (nothing recorded)\n",
 			c.width, c.height, c.fps, c.live, c.name);
@@ -1537,74 +1748,21 @@ int main(int argc, char **argv)
 			c.live ? ", live files in " : "", c.live ? c.live : "");
 	sd_notify("READY=1");
 
-	/* capture loop: dequeue, copy into the queue, requeue. No disk I/O here. */
-	while (!g_stop) {
-		struct pollfd pfd = {.fd = fd, .events = POLLIN};
-		struct v4l2_buffer b;
-		int64_t now, ts_us;
-		int r;
-
-		r = poll(&pfd, 1, 1000);
-		now = now_mono_us();
-		if (r < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("poll");
-			exit_code = 1;
-			break;
-		}
-		if (r == 0 || !(pfd.revents & POLLIN)) {
-			if (pfd.revents & POLLERR) {
-				fprintf(stderr, "poll: device error\n");
-				exit_code = 1;
-				break;
-			}
-			if (now - t_last_frame > (int64_t)c.stall_timeout * 1000000) {
-				fprintf(stderr, "no frame for %d s: camera stalled\n", c.stall_timeout);
-				pthread_mutex_lock(&q.m);
-				q.st.stalls++;
-				pthread_mutex_unlock(&q.m);
-				exit_code = 3;
-				break;
-			}
-		} else {
-			memset(&b, 0, sizeof(b));
-			b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			b.memory = V4L2_MEMORY_MMAP;
-			if (xioctl(fd, VIDIOC_DQBUF, &b)) {
-				if (errno == EAGAIN)
-					continue;
-				perror("VIDIOC_DQBUF");
-				exit_code = 1;
-				break;
-			}
-			ts_us = (int64_t)b.timestamp.tv_sec * 1000000 + b.timestamp.tv_usec;
-			t_last_frame = now;
-			if (b.bytesused > 0 && b.bytesused <= buflen[b.index])
-				capture_frame(&cp, bufs[b.index], b.bytesused, ts_us, b.sequence, b.flags, now);
-			else
-				capture_frame(&cp, NULL, 0, ts_us, b.sequence, b.flags, now);
-			if (xioctl(fd, VIDIOC_QBUF, &b)) {
-				perror("VIDIOC_QBUF");
-				exit_code = 1;
-				break;
-			}
-		}
-
-		if (c.seconds > 0 && now - t_start >= (int64_t)c.seconds * 1000000)
-			break;
-	}
+	if (c.source)
+		exit_code = capture_source(&c, &cp, &src, t_start);
+	else
+		exit_code = capture_v4l2(&c, &cp, fd, bufs, buflen, t_start);
 
 	/* shutdown: stop the stream, then let the writer drain the queue */
 	sd_notify("STOPPING=1");
-	{
+	if (fd >= 0) {
 		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		xioctl(fd, VIDIOC_STREAMOFF, &type);
+		for (i = 0; i < (unsigned int)c.buffers; i++)
+			if (bufs[i])
+				munmap(bufs[i], buflen[i]);
+		close(fd);
 	}
-	for (i = 0; i < (unsigned int)c.buffers; i++)
-		if (bufs[i])
-			munmap(bufs[i], buflen[i]);
-	close(fd);
 
 	pthread_mutex_lock(&q.m);
 	q.done = 1;
@@ -1635,11 +1793,11 @@ int main(int argc, char **argv)
 		if (!c.preview && write_summary(&c, &s, &w, now_mono_us(), now_real_us(), exit_code, 0))
 			fprintf(stderr, "ewego-cam: could not write %s/%s_summary.json: %s\n", dir, c.name, strerror(errno));
 		fprintf(stderr, "%s: %" PRIu64 " frames, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " error-flagged, "
-		"%" PRIu64 " queue overruns, %.1f MB, interval min/mean/max %.1f/%.1f/%.1f ms, "
-		"queue peak %.1f MB, write max %.0f ms -> exit %d\n",
-		c.name, st->frames, st->lost, st->gaps, st->errors, s.qovr, (double)w.written_bytes / 1e6,
-		st->dt_n ? st->dt_min / 1000.0 : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n / 1000.0 : 0.0,
-		st->dt_n ? st->dt_max / 1000.0 : 0.0, (double)s.qhw / 1e6, w.write_max_ms, exit_code);
+			"%" PRIu64 " queue overruns, %.1f MB, interval min/mean/max %.1f/%.1f/%.1f ms, "
+			"queue peak %.1f MB, write max %.0f ms -> exit %d\n",
+			c.name, st->frames, st->lost, st->gaps, st->errors, s.qovr, (double)w.written_bytes / 1e6,
+			st->dt_n ? st->dt_min / 1000.0 : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n / 1000.0 : 0.0,
+			st->dt_n ? st->dt_max / 1000.0 : 0.0, (double)s.qhw / 1e6, w.write_max_ms, exit_code);
 	}
 	return exit_code;
 }

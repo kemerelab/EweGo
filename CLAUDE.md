@@ -194,6 +194,41 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   page warn when i2c_us_max > 8 ms. The console `dfu` command reboots the
   module but it comes back in the application (bootloader jump does not
   take on this board): flash with BOOT0 high at plug-in.
+- 2026-11-18 robustness programme (`ROBUSTNESS.md`, R1–R41): audit found the
+  recorders could stop writing without exiting (no ferror/fdatasync, cam write
+  error only at exit), ~30 s of IMU CSV / cam index lost per power cut,
+  summaries only at clean exit, the UART BNO055 reset-into-CONFIG read as
+  valid zeros (likely the v0.6.5 "freeze"), the console owning devices
+  (preview spawned by it, no exclusive opens), no boot autostart, no
+  low-battery shutdown, unbounded journal, audio wrapper SIGKILLing arecord,
+  gps_logger exit 0 on failure. Five parallel agent lanes implemented and
+  were merged: ewego-cam 0.6.0 (exit 4 on output error, writeback for
+  index/timestamps, truncate to the last good frame, periodic `in_progress`
+  summary, housekeeping on the writer thread, port lock files
+  `/run/ewego/port-*.lock`, `-2` session suffix, watchdog fed by real writes,
+  `--source FILE` replay for tests); `Firmware/common/ewego-rec.{c,h}`
+  shared by ewego-imu-usb 0.4.0 / ewego-imu-uart 0.3.0 (fdatasync 2 s, exit 4,
+  periodic summary, TIOCEXCL, POLLOUT deadline, EOF -> exit 3, CONFIG-mode
+  detection + re-init with flag bit1, Type=notify + WatchdogSec=30); console:
+  preview as `ewego-preview*` units with asymmetric exclusion (recorder
+  `ExecStartPre=-systemctl stop <preview>`, preview `ExecStartPre` refuses
+  while the recorder is active/activating; no `Conflicts=`), POSTs need
+  `X-EweGo: 1`, honest RECORDING badge (`recording_ok`, `recorders{}`),
+  socket timeouts/stream cap, battery from the fuel CSV; image:
+  `ewego-autostart.service` starts the target when `/boot/firmware/
+  ewego-record` exists (a Condition on the target does not stop its Wants=),
+  fuel logger low-battery `systemctl poweroff` (SOC<8 % and V<3.5 for 30
+  samples, `fuel.conf`), journald capped 100M, `--stats 30`, arecord run
+  directly by `ewego-audio-record` on the voicehat card, `ewego-check-space`
+  as `ExecCondition=` (ExecStartPre + RestartPreventExitStatus does not
+  work), gps_logger exit 1/3 + flush/fsync + TIOCEXCL; `tests/` (stdlib
+  unittest, 130 tests, pty fake BNO055, FIFO HID feeder, synthetic sessions,
+  console fixtures) run by the CI `Tests` step. All exit codes: 0 ok, 1
+  setup/device, 2 lost/flagged, 3 stalled/device gone, 4 output error.
+  TIOCEXCL is waived for root (all our processes), so unit state is the real
+  exclusion. Not yet on hardware: needs an image tag (v0.7.0) and the bench
+  list in ROBUSTNESS.md / the lane reports. Lane D (R38–R41) = check tool and
+  console integration of the new keys.
 - After that (Phase C): C port of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown.
 - Known limits: NetworkManager still in use (SD corruption after power

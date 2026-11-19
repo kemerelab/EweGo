@@ -290,9 +290,9 @@ class TestUartResetIntoConfigMode(UartBase):
     """The BNO055 resets into CONFIG mode but keeps answering register reads:
     every read succeeds, the fusion outputs and calibration read zero. The
     recorder should notice (all-zero quaternion / zero calibration -> read
-    OPR_MODE -> re-init). Item R14 (lane A2) adds that; until then the
-    recorder logs zeros forever and exits 0, which is the suspected cause of
-    the "collar IMU freezes" symptom. Flip the expectedFailure when R14 lands.
+    OPR_MODE -> re-init). Item R14 added that (ewego-imu-uart 0.3); before,
+    the recorder logged zeros forever and exited 0, the suspected cause of the
+    "collar IMU freezes" symptom.
     """
 
     @classmethod
@@ -318,12 +318,13 @@ class TestUartResetIntoConfigMode(UartBase):
         """Preconditions (true today): the fake reset, the recorder kept reading and logged zeros."""
         self.assertFalse(self.proc.killed)
         self.assertIsNotNone(self.t_reset)
-        self.assertGreater(self.fake.stats["data_config_mode"], 50)
-        zero = [r for r in self.rows if r[COL["flags"]] == "0" and float(r[COL["quat_w"]]) == 0
+        # R14: the recorder re-initialises after 20 all-zero quaternions
+        self.assertGreaterEqual(self.fake.stats["data_config_mode"], 20)
+        # those rows carry flag bit1 (0x02, all-zero quaternion) since ewego-imu-uart 0.3
+        zero = [r for r in self.rows if int(r[COL["flags"]]) & 2 and float(r[COL["quat_w"]]) == 0
                 and r[COL["cal_sys"]] == "0"]
         self.assertGreater(len(zero), 0, "rows read while the chip sat in CONFIG mode")
 
-    @unittest.expectedFailure  # R14: flip to a plain test when the recorder re-inits a CONFIG-mode sensor
     def test_recorder_restores_ndof(self):
         self.assertTrue(any(t > self.t_reset and reg == REG_OPR_MODE and val == MODE_NDOF
                             for t, reg, val in self.fake.writes),

@@ -73,6 +73,10 @@ def build_tool(subdir, binary):
                 raise unittest.SkipTest(f"{tool} not found; cannot build {binary}")
         dst = Path(_build_dir()) / subdir
         shutil.copytree(FIRMWARE / subdir, dst, ignore=shutil.ignore_patterns(binary, "*.o"), dirs_exist_ok=True)
+        # the IMU Makefiles compile ../common/ewego-rec.c; keep the sibling layout
+        if (FIRMWARE / "common").is_dir():
+            shutil.copytree(FIRMWARE / "common", Path(_build_dir()) / "common",
+                            ignore=shutil.ignore_patterns("*.o"), dirs_exist_ok=True)
         r = subprocess.run(["make", "-C", str(dst), "CC=gcc"], capture_output=True, text=True, timeout=300)
         out = (r.stdout + r.stderr).strip()
         exe = dst / binary

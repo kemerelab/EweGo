@@ -10,54 +10,54 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` merged.
 
 ## Lane A1: ewego-cam (`Firmware/uvccam/`, `image/units/ewego-cam@.service`)
 
-- [ ] **R1** Writer errors are fatal and visible: check `write_all`, `sync_file_range`
+- [x] **R1** Writer errors are fatal and visible: check `write_all`, `sync_file_range`
   (use WAIT_BEFORE|WRITE|WAIT_AFTER on the previous chunk so EIO surfaces) and
   `fdatasync` results; a persistent write error exits with a distinct code
   (4 = output error) instead of running on with `w->error`. Expose
   `writer_error` and free space (`statvfs`) in the live JSON and `STATUS=`.
-- [ ] **R2** Index and timestamp files get the same writeback cadence as the MJPEG
+- [x] **R2** Index and timestamp files get the same writeback cadence as the MJPEG
   stream (bounded loss on power cut; today ~30 s of `_index.bin`/`_timestamps.bin`).
-- [ ] **R3** On a failed or partial frame write, truncate back to the last good
+- [x] **R3** On a failed or partial frame write, truncate back to the last good
   frame boundary and do not advance `offset` or write the index record.
-- [ ] **R4** Summary JSON written every stats interval via tmp+rename with
+- [x] **R4** Summary JSON written every stats interval via tmp+rename with
   `"in_progress": true`; final write at exit flips it (wall-clock offset
   survives power loss and SIGKILL).
-- [ ] **R5** Stats, live JSON and sd_notify move off the capture thread (snapshot
+- [x] **R5** Stats, live JSON and sd_notify move off the capture thread (snapshot
   under the queue mutex, written by the writer thread); gap messages
   rate-limited; stdout line-buffered.
-- [ ] **R6** Session directory created after the device is open; signal handlers
+- [x] **R6** Session directory created after the device is open; signal handlers
   installed before the device wait and the wait loop honours `g_stop`.
-- [ ] **R7** `auto:N/M` fallback after `--wait` must not let two instances claim
+- [x] **R7** `auto:N/M` fallback after `--wait` must not let two instances claim
   one camera (drop the fallback, or claim ports via a lock file in /run/ewego).
-- [ ] **R8** Unit: `TimeoutStopSec=90`, `StartLimitIntervalSec=0`, `WatchdogSec`
+- [x] **R8** Unit: `TimeoutStopSec=90`, `StartLimitIntervalSec=0`, `WatchdogSec`
   fed from the writer thread only after a real write completed; `OOMScoreAdjust=-500`.
-- [ ] **R9** Session stamp collision (same second after a restart or a clock step)
+- [x] **R9** Session stamp collision (same second after a restart or a clock step)
   must not truncate an earlier recording (`O_EXCL` / suffix).
 
 ## Lane A2: IMU recorders (`Firmware/usbimu/`, `Firmware/imuuart/`, new `Firmware/common/`)
 
-- [ ] **R10** Shared recorder skeleton `Firmware/common/ewego-rec.{c,h}`: ring +
+- [x] **R10** Shared recorder skeleton `Firmware/common/ewego-rec.{c,h}`: ring +
   writer loop, flush/fdatasync/live/summary cadence, atomic file replace,
   session dir, signal handling, `--rt`, `mkdir_p`, time helpers. Both IMU
   recorders use it (the two files are ~70 % identical today). ewego-cam may
   adopt it later.
-- [ ] **R11** CSV write errors are fatal and visible: `ferror()`/`fflush`/`fdatasync`
+- [x] **R11** CSV write errors are fatal and visible: `ferror()`/`fflush`/`fdatasync`
   results checked, distinct exit code 4, `writer_error` in the live JSON.
-- [ ] **R12** `fdatasync` every 2–5 s from the writer thread (today: none at all;
+- [x] **R12** `fdatasync` every 2–5 s from the writer thread (today: none at all;
   ~30 s of CSV lost on every power cut).
-- [ ] **R13** Summary JSON written periodically with `in_progress`, as R4.
-- [ ] **R14** UART: detect a sensor that reset into CONFIG mode (reads succeed but
+- [x] **R13** Summary JSON written periodically with `in_progress`, as R4.
+- [x] **R14** UART: detect a sensor that reset into CONFIG mode (reads succeed but
   the fusion registers are frozen/zero): after N consecutive all-zero
   quaternions or a zero calibration byte, read OPR_MODE and re-init if not
   NDOF. Likely the "collar IMU freezes" symptom of v0.6.5.
-- [ ] **R15** UART: `write_all` must have a poll(POLLOUT) deadline (today it spins
+- [x] **R15** UART: `write_all` must have a poll(POLLOUT) deadline (today it spins
   on EAGAIN at SCHED_FIFO); `TIOCEXCL` after open so nothing else can share
   the port.
-- [ ] **R16** USB: stall detector must not count malformed reports as liveness;
+- [x] **R16** USB: stall detector must not count malformed reports as liveness;
   per-report error message rate-limited.
-- [ ] **R17** Session directory after device open; signal handlers before the wait;
+- [x] **R17** Session directory after device open; signal handlers before the wait;
   live counters read under the mutex; session stamp collision guard (as R6/R9).
-- [ ] **R18** Units: `StartLimitIntervalSec=0`, `OOMScoreAdjust=-500`, `Type=notify`
+- [x] **R18** Units: `StartLimitIntervalSec=0`, `OOMScoreAdjust=-500`, `Type=notify`
   + `WatchdogSec` fed from the writer thread.
 
 ## Lane B1: console (`Firmware/webtest/`, new `image/units/ewego-preview*.service`)
@@ -112,21 +112,40 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` merged.
 
 ## Lane C: tests (`tests/`, `.github/workflows/build-image.yml`)
 
-- [ ] **R32** Test harness: `tests/` with Python stdlib `unittest`, run by
+- [x] **R32** Test harness: `tests/` with Python stdlib `unittest`, run by
   `python3 -m unittest discover -s tests -v`; a `Tests` step in the CI `check`
   job after the native compile. No new dependencies.
-- [ ] **R33** ewego-imu-uart black-box test against a pty-based fake BNO055 (chip id,
+- [x] **R33** ewego-imu-uart black-box test against a pty-based fake BNO055 (chip id,
   NDOF init, 46-byte bursts, 0x07/0x0A errors, garbage, silence → exit 3,
   reset-into-CONFIG scenario for R14), checking CSV columns, summary JSON,
   live JSON, exit codes.
-- [ ] **R34** ewego-imu-usb black-box test feeding report structs through a FIFO
+- [x] **R34** ewego-imu-usb black-box test feeding report structs through a FIFO
   given as `--device`, covering sequence gaps, bad reports, device gone.
-- [ ] **R35** ewego-check tests on synthetic session directories (PASS/WARN/FAIL
+- [x] **R35** ewego-check tests on synthetic session directories (PASS/WARN/FAIL
   paths, missing summary, in-progress summary).
-- [ ] **R36** Console tests: `live_snapshot`, `parse_nav_pvt`, SSE dedupe, badge
+- [x] **R36** Console tests: `live_snapshot`, `parse_nav_pvt`, SSE dedupe, badge
   logic, POST header check, with `EWEGO_LIVE_DIR` pointing at fixtures.
-- [ ] **R37** ewego-cam: writer/index logic testable without a camera (replay a
+- [x] **R37** ewego-cam: writer/index logic testable without a camera (replay a
   recorded MJPEG through the writer path, or a `--source file` test mode).
+
+## Lane D: integration follow-ups (after the five lanes merged, 2026-11-18)
+
+- [ ] **R38** `ewego-check`: understand the periodic summary (`in_progress: true`,
+  `exit_code: null` = still recording or killed/power cut; exit code 4 = output
+  error, FAIL with the `writer_error_msg`), audio `audio-01.wav` parts (done in
+  R28), the `-2` session suffix, and all `audio*.wav`; WARN should exit non-zero
+  (distinct from PASS) so scripts can tell.
+- [ ] **R39** Console: map recorder exit 4 to "output error (card full / I/O)";
+  ignore `/run/ewego/port-*.lock` and `space.json` where it lists live files;
+  show `writer_error`, `free_mb`, `fusion_stalls` on the live page; start the
+  target with `systemctl start --no-block` (the recorders are `Type=notify`
+  and READY can take up to 30 s) and let the badge report progress; show
+  `space.json` when a recorder was skipped by the free-space condition.
+- [ ] **R40** Tests: `--wait N` flag for ewego-imu-usb so the VID:PID search path
+  is testable; UART counter for 0x07 overruns that succeeded on retry; sd_notify
+  tests against an abstract `NOTIFY_SOCKET`; the preview units' ExecStartPre
+  guard logic.
+- [ ] **R41** CI: shellcheck `image/ewego/*.sh` too (only `image/*.sh` today).
 
 ## Later
 

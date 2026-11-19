@@ -15,6 +15,12 @@ Type=notify
 WatchdogSec=30
 EnvironmentFile=-/etc/ewego/imu-usb.conf
 # DEVICE is optional: with it unset the logger finds the single hub_imu by VID:PID
+# the live preview (started by the web console) must let go of the device
+# first; "-" ignores the failure when no preview is loaded
+ExecStartPre=-/bin/systemctl stop ewego-preview-imu-usb.service
+# skip the start (inactive, not failed, no restart loop) when the card has
+# less than 500 MB free; writes /run/ewego/space.json for the console
+ExecCondition=/usr/local/bin/ewego-check-space ${OUT_DIR}
 ExecStart=/usr/local/bin/ewego-imu-usb --out ${OUT_DIR} --name ${NAME} $DEVICE_ARG $EXTRA_ARGS
 KillSignal=SIGINT
 TimeoutStopSec=10

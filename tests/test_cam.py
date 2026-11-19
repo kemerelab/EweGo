@@ -115,7 +115,7 @@ class TestCamReplay(CamBase):
         src = self.tmp / "in.mjpeg"
         src.write_bytes(data)
         out = self.tmp / "out"
-        r = run([self.exe, "--device", "replay", "--source", src, "--out", out, "--no-session-dir",
+        r = run([self.exe, "--source", src, "--out", out, "--no-session-dir", "--lock-dir", "",
                  "--name", "camera1", "--fps", "30", "--stats", "0"], timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((out / "camera1.mjpeg").read_bytes(), data)

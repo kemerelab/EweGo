@@ -316,7 +316,7 @@ class TestUsbRecording(UsbBase):
         header, rows, s = self.outputs(out)
         self.assertCommon(header, rows, s, rc)
         self.assertEqual(s["bad_reports"], 3, p.stderr[-500:])
-        self.assertIn("unexpected report: 32 bytes", p.stderr)
+        self.assertRegex(p.stderr, r"unexpected report #\d+: 32 bytes")
         self.assertIn("version 2", p.stderr)
         self.assertLessEqual(s["samples"], feeder.sent)
         # the skipped reports' seqs show up as a 1-sample gap each
@@ -332,7 +332,7 @@ class TestUsbRecording(UsbBase):
         rc = self.finish(p, feeder, timeout=15)
         self.assertEqual(rc, 3, self.diag(p))
         self.assertLess(time.monotonic() - t0, 8)
-        self.assertIn("no reports for 2 s", p.stderr)
+        self.assertIn("no valid reports for 2 s", p.stderr)
         header, rows, s = self.outputs(out)
         self.assertCommon(header, rows, s, rc)
         self.assertEqual(s["samples"], 100)
@@ -354,7 +354,6 @@ class TestUsbRecording(UsbBase):
         s = read_json(out / f"{NAME}_summary.json")
         self.assertEqual((s["samples"], s["exit_code"]), (0, 3))
 
-    @unittest.expectedFailure  # R16: flip when malformed/empty reads no longer count as liveness
     def test_writer_closes_exit_3(self):
         """The writer closes the FIFO after 0.5 s: read() returns 0 (EOF) forever.
 

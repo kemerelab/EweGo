@@ -11,22 +11,33 @@
  *
  * Same shape as ewego-imu-usb: the reader (main thread, --rt for SCHED_FIFO)
  * only does the UART transaction and timestamps it; a writer thread behind a
- * RAM ring does the accounting, the CSV, and the live file for the console.
+ * RAM ring (Firmware/common/ewego-rec.c) does the accounting, the CSV, and
+ * the live file for the console.
  *
  *   <name>.csv            same 28 columns as log_imu_data.py, then
  *                         host_mono_us (arrival), tick_mono_us (the scheduled
  *                         sample time), seq, xfer_us (UART round trip), flags
- *                         (bit0 = read failed; sensor columns empty)
+ *                         (bit0 = read failed, sensor columns empty;
+ *                         bit1 = all-zero quaternion, the sensor is not fusing)
  *   <name>_summary.json   samples, read errors, late ticks, interval and
- *                         jitter statistics, queue overruns, exit code
+ *                         jitter statistics, queue overruns, fusion stalls,
+ *                         write errors, exit code; rewritten every stats
+ *                         interval with "in_progress": true
+ *
+ * Self-check: a BNO055 that browns out comes back in CONFIG mode and keeps
+ * answering with zeros; 20 all-zero quaternions in a row (or 3 s of
+ * identical data) make the reader check OPR_MODE and re-initialise it.
+ * The port is held with TIOCEXCL: other openers get EBUSY.
  *
  * --live DIR writes DIR/<name>.json ten times a second (counters + recent
  * samples); --preview streams into the live file only.
  *
- * Exit: 0 every tick produced a sample; 2 read errors or ring overruns;
- * 3 no sample for --stall seconds (sensor or UART gone); 1 usage/device error.
+ * Exit: 0 every tick produced a sample; 2 read errors, ring overruns or a
+ * fusion stall; 3 no sample for --stall seconds (sensor or UART gone);
+ * 4 the recording could not be written; 1 usage/device error (EBUSY: the
+ * port is held by another process).
  *
- * Build: gcc -O2 -Wall -Wextra -pthread -static -o ewego-imu-uart ewego-imu-uart.c
+ * Build: make (compiles ../common/ewego-rec.c in)
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -35,20 +46,18 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
-#include <pthread.h>
-#include <sched.h>
-#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.2.1"
+#include "../common/ewego-rec.h"
+
+#define VERSION "0.3.0"
 
 #define BNO_CHIP_ID   0xA0
 #define REG_CHIP_ID   0x00
@@ -58,53 +67,16 @@
 #define REG_PWR_MODE  0x3E
 #define MODE_CONFIG   0x00
 #define MODE_NDOF     0x0C
-#define BURST_LEN     46          /* 0x08 .. 0x35 */
+#define BURST_LEN     REC_BNO_BURST_LEN          /* 0x08 .. 0x35 */
 
-#define FLAG_READ_ERROR 0x01
+#define FLAG_READ_ERROR     0x01  /* read failed; sensor columns empty */
+#define FLAG_FUSION_INVALID 0x02  /* read fine but the quaternion is all zero: not fusing */
 
-#define RING_N 8192
-#define LIVE_N 64
-#define LIVE_INTERVAL_US 100000
+#define ZERO_RUN_MAX 20           /* consecutive all-zero quaternions before checking OPR_MODE */
+#define FROZEN_S 3                /* seconds of identical data before checking OPR_MODE */
 
-static volatile sig_atomic_t g_stop;
-static void on_signal(int s) { (void)s; g_stop = 1; }
-
-static int64_t mono_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-static int64_t real_us(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_REALTIME, &ts);
-	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-}
-
-static int16_t le16(const uint8_t *p) { return (int16_t)(p[0] | (p[1] << 8)); }
-
-/* mkdir -p: every component, EEXIST is fine. Returns 0 or -1 with errno. */
-static int mkdir_p(const char *path, mode_t mode)
-{
-	char buf[PATH_MAX];
-	size_t len = strlen(path), i;
-
-	if (len == 0 || len >= sizeof(buf))
-		return -1;
-	memcpy(buf, path, len + 1);
-	for (i = 1; i <= len; i++) {
-		if (buf[i] == '/' || buf[i] == 0) {
-			char c = buf[i];
-			buf[i] = 0;
-			if (mkdir(buf, mode) && errno != EEXIST)
-				return -1;
-			buf[i] = c;
-		}
-	}
-	return 0;
-}
+#define A_LOAD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define A_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
 
 /* ---- BNO055 UART protocol ----------------------------------------------- */
 
@@ -132,7 +104,8 @@ static int uart_open(const char *port, int baud)
 	}
 	fd = open(port, O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
 	if (fd < 0) {
-		fprintf(stderr, "open %s: %s\n", port, strerror(errno));
+		fprintf(stderr, "open %s: %s%s\n", port, strerror(errno),
+			errno == EBUSY ? " (another process holds the port exclusively: a recorder or preview?)" : "");
 		return -1;
 	}
 	if (tcgetattr(fd, &t)) {
@@ -152,6 +125,11 @@ static int uart_open(const char *port, int baud)
 		return -1;
 	}
 	tcflush(fd, TCIOFLUSH);
+	/* exclusive: nobody else (the console's test scripts, a second
+	 * recorder) can open the port while we own it; they get EBUSY.
+	 * Processes with CAP_SYS_ADMIN are exempt (kernel rule). */
+	if (ioctl(fd, TIOCEXCL) && errno != ENOTTY)
+		fprintf(stderr, "note: TIOCEXCL on %s failed (%s)\n", port, strerror(errno));
 	return fd;
 }
 
@@ -160,7 +138,7 @@ static int read_exact(int fd, uint8_t *buf, int n, int64_t deadline)
 {
 	int got = 0;
 	while (got < n) {
-		int64_t left = deadline - mono_us();
+		int64_t left = deadline - rec_mono_us();
 		struct pollfd p = {.fd = fd, .events = POLLIN};
 		int r;
 		if (left <= 0)
@@ -182,14 +160,23 @@ static int read_exact(int fd, uint8_t *buf, int n, int64_t deadline)
 	return got;
 }
 
-static int write_all(int fd, const uint8_t *buf, int n)
+/* write n bytes by the deadline (the fd is non-blocking: wait for POLLOUT,
+ * never spin on EAGAIN, which on the SCHED_FIFO thread would starve the
+ * writer); -1 on error or timeout */
+static int write_all(int fd, const uint8_t *buf, int n, int64_t deadline)
 {
 	while (n > 0) {
 		ssize_t w = write(fd, buf, (size_t)n);
 		if (w < 0) {
-			if (errno == EINTR || errno == EAGAIN)
+			struct pollfd p = {.fd = fd, .events = POLLOUT};
+			int64_t left = deadline - rec_mono_us();
+			if (errno == EINTR)
 				continue;
-			return -1;
+			if (errno != EAGAIN || left <= 0)
+				return -1;
+			if (poll(&p, 1, (int)((left + 999) / 1000)) < 0 && errno != EINTR)
+				return -1;
+			continue;
 		}
 		buf += w;
 		n -= (int)w;
@@ -204,9 +191,9 @@ static int write_all(int fd, const uint8_t *buf, int n)
 static int bno_read(int fd, uint8_t reg, int len, uint8_t *buf, int timeout_ms)
 {
 	uint8_t cmd[4] = {0xAA, 0x01, reg, (uint8_t)len}, hdr[2];
-	int64_t deadline = mono_us() + (int64_t)timeout_ms * 1000;
+	int64_t deadline = rec_mono_us() + (int64_t)timeout_ms * 1000;
 
-	if (write_all(fd, cmd, 4))
+	if (write_all(fd, cmd, 4, deadline))
 		return -1;
 	if (read_exact(fd, hdr, 2, deadline) != 2)
 		return -1;
@@ -222,9 +209,9 @@ static int bno_read(int fd, uint8_t reg, int len, uint8_t *buf, int timeout_ms)
 static int bno_write(int fd, uint8_t reg, uint8_t val)
 {
 	uint8_t cmd[5] = {0xAA, 0x00, reg, 1, val}, rsp[2];
-	int64_t deadline = mono_us() + 200000;
+	int64_t deadline = rec_mono_us() + 200000;
 
-	if (write_all(fd, cmd, 5))
+	if (write_all(fd, cmd, 5, deadline))
 		return -1;
 	if (read_exact(fd, rsp, 2, deadline) != 2)
 		return -1;
@@ -243,10 +230,10 @@ static const char *const ERR_NAMES[16] = {
  * next request's reply is not glued to stale bytes. */
 static void drain_quiet(int fd, int quiet_ms, int max_ms)
 {
-	int64_t end = mono_us() + (int64_t)max_ms * 1000;
+	int64_t end = rec_mono_us() + (int64_t)max_ms * 1000;
 	uint8_t junk[128];
 
-	while (mono_us() < end) {
+	while (rec_mono_us() < end) {
 		struct pollfd p = {.fd = fd, .events = POLLIN};
 		if (poll(&p, 1, quiet_ms) <= 0)
 			return;
@@ -261,7 +248,7 @@ static int bno_init(int fd, int quiet, int attempts)
 	uint8_t id = 0;
 	int i, r = -1;
 
-	for (i = 0; i < attempts && !g_stop; i++) {
+	for (i = 0; i < attempts && !rec_stop; i++) {
 		tcflush(fd, TCIOFLUSH);
 		r = bno_read(fd, REG_CHIP_ID, 1, &id, 300);
 		if (r == 0 && id == BNO_CHIP_ID)
@@ -288,7 +275,14 @@ static int bno_init(int fd, int quiet, int attempts)
 	return 0;
 }
 
-/* ---- reader -> writer ring ---------------------------------------------- */
+/* quaternion w,x,y,z = burst[24..31] */
+static int quat_zero(const uint8_t *burst)
+{
+	static const uint8_t z[8];
+	return !memcmp(burst + 24, z, sizeof(z));
+}
+
+/* ---- samples and writer callbacks ---------------------------------------- */
 
 struct sample {
 	int64_t host_mono, host_real, tick_mono;
@@ -297,134 +291,110 @@ struct sample {
 	uint8_t burst[BURST_LEN];
 };
 
-struct ring {
-	pthread_mutex_t m;
-	pthread_cond_t cv;
-	struct sample s[RING_N];
-	unsigned head, tail, count, peak;
-	uint64_t overruns;
-	int done;
-};
-
-struct writer {
-	struct ring *r;
-	FILE *csv;
-	const char *name, *port, *live_dir, *session;
-	int quiet, stats_interval, preview, rate;
-	int64_t t_start;
-	uint64_t n, valid, read_errors, error_runs;
+struct uart {
+	int baud, rate;
+	/* writer thread */
+	uint64_t valid, read_errors, error_runs, fusion_invalid;
 	int in_error_run;
 	int64_t first_host, last_valid_host;
 	double dt_min, dt_max, dt_sum;
 	uint64_t dt_n;
 	uint32_t xfer_us_max;
 	int64_t jitter_us_max;
-	struct sample live[LIVE_N];
-	uint64_t live_n[LIVE_N];
-	unsigned live_head, live_count;
-	pthread_t thread;
+	/* reader thread (atomic) */
+	uint64_t late_ticks, err_by_code[16], err_total, reinits;
+	uint64_t fusion_stalls;     /* zero-quaternion or frozen-data runs that reached the threshold */
+	uint64_t fusion_reinits;    /* re-inits those runs caused (also counted in reinits) */
 };
 
-static double rate_hz(const struct writer *w)
+static double rate_hz(const struct uart *u)
 {
-	return w->dt_n ? 1e6 / (w->dt_sum / (double)w->dt_n) : 0;
+	return u->dt_n ? 1e6 / (u->dt_sum / (double)u->dt_n) : 0;
 }
 
-static void csv_row(FILE *csv, const struct sample *s)
+static const uint8_t *valid_burst(const void *p)
 {
-	const uint8_t *bu = s->burst;
-	time_t secs = (time_t)(s->host_real / 1000000);
-	struct tm tm;
-	char ts[40];
+	const struct sample *s = p;
+	return (s->flags & FLAG_READ_ERROR) ? NULL : s->burst;
+}
 
-	localtime_r(&secs, &tm);
-	strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm);
-	fprintf(csv, "%s.%06" PRId64, ts, s->host_real % 1000000);
-	if (s->flags & FLAG_READ_ERROR) {
-		for (int i = 0; i < 27; i++)
-			fputs(",", csv);
-	} else {
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 18) / 16.0, le16(bu + 20) / 16.0, le16(bu + 22) / 16.0);
-		fprintf(csv, ",%.6f,%.6f,%.6f,%.6f", le16(bu + 24) / 16384.0, le16(bu + 26) / 16384.0,
-			le16(bu + 28) / 16384.0, le16(bu + 30) / 16384.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 32) / 100.0, le16(bu + 34) / 100.0, le16(bu + 36) / 100.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 38) / 100.0, le16(bu + 40) / 100.0, le16(bu + 42) / 100.0);
-		fprintf(csv, ",%.2f,%.2f,%.2f", le16(bu + 0) / 100.0, le16(bu + 2) / 100.0, le16(bu + 4) / 100.0);
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 12) / 16.0, le16(bu + 14) / 16.0, le16(bu + 16) / 16.0);
-		fprintf(csv, ",%.4f,%.4f,%.4f", le16(bu + 6) / 16.0, le16(bu + 8) / 16.0, le16(bu + 10) / 16.0);
-		fprintf(csv, ",%d,%u,%u,%u,%u", (int8_t)bu[44], (bu[45] >> 6) & 3, (bu[45] >> 4) & 3,
-			(bu[45] >> 2) & 3, bu[45] & 3);
-	}
+static void csv_row(FILE *csv, const void *p)
+{
+	const struct sample *s = p;
+
+	rec_bno_csv(csv, s->host_real, valid_burst(s));
 	fprintf(csv, ",%" PRId64 ",%" PRId64 ",%" PRIu32 ",%" PRIu32 ",%u\n", s->host_mono, s->tick_mono, s->seq,
 		s->xfer_us, s->flags);
 }
 
-static void write_live(struct writer *w, int64_t now)
+static void live_row(FILE *f, uint64_t n, const void *p)
 {
-	char tmp[PATH_MAX + 64], fin[PATH_MAX + 64];
-	FILE *f;
-	unsigned i;
-	const uint8_t *latest = NULL;
+	const struct sample *s = p;
 
-	snprintf(fin, sizeof(fin), "%s/%s.json", w->live_dir, w->name);
-	snprintf(tmp, sizeof(tmp), "%s/.%s.json.tmp", w->live_dir, w->name);
-	f = fopen(tmp, "w");
-	if (!f)
-		return;
-	for (i = 0; i < w->live_count; i++) {
-		const struct sample *s = &w->live[(w->live_head + LIVE_N - 1 - i) % LIVE_N];
-		if (!(s->flags & FLAG_READ_ERROR)) {
-			latest = s->burst;
-			break;
-		}
-	}
-	fprintf(f, "{\"program\":\"ewego-imu-uart %s\",\"name\":\"%s\",\"device\":\"%s\",\"preview\":%d,",
-		VERSION, w->name, w->port, w->preview);
-	if (w->session)
-		fprintf(f, "\"session\":\"%s\",", w->session);
-	else
-		fputs("\"session\":null,", f);
-	/* same keys as ewego-imu-usb where they mean the same thing, so the
-	 * console shows both IMUs with one piece of code */
-	fprintf(f, "\"elapsed_s\":%.1f,\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
-		   ",\"flagged\":%" PRIu64 ",\"read_errors\":%" PRIu64 ",\"i2c_errors\":0,\"queue_overruns\":%" PRIu64
-		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":0,\"xfer_us_max\":%u,\"jitter_us_max\":%" PRId64 ",",
-		(double)(now - w->t_start) / 1e6, w->valid, w->read_errors, w->error_runs, w->read_errors, w->read_errors,
-		w->r->overruns, w->r->peak, rate_hz(w), w->xfer_us_max, w->jitter_us_max);
-	if (latest)
-		fprintf(f, "\"temp_c\":%d,\"cal\":[%u,%u,%u,%u],", (int8_t)latest[44], (latest[45] >> 6) & 3,
-			(latest[45] >> 4) & 3, (latest[45] >> 2) & 3, latest[45] & 3);
-	else
-		fputs("\"temp_c\":null,\"cal\":null,", f);
-	fprintf(f, "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 ",", now, real_us());
-	fputs("\"cols\":[\"n\",\"seq\",\"tick_mono_us\",\"host_mono_us\",\"heading\",\"roll\",\"pitch\","
-	      "\"ax\",\"ay\",\"az\",\"gx\",\"gy\",\"gz\",\"lax\",\"lay\",\"laz\",\"flags\"],\"recent\":[", f);
-	for (i = 0; i < w->live_count; i++) {
-		unsigned k = (w->live_head + LIVE_N - w->live_count + i) % LIVE_N;
-		const struct sample *s = &w->live[k];
-		const uint8_t *bu = s->burst;
-		fprintf(f, "%s[%" PRIu64 ",%" PRIu32 ",%" PRId64 ",%" PRId64, i ? "," : "", w->live_n[k],
-			s->seq, s->tick_mono, s->host_mono);
-		if (s->flags & FLAG_READ_ERROR)
-			fputs(",null,null,null,null,null,null,null,null,null,null,null,null", f);
-		else
-			fprintf(f, ",%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f",
-				le16(bu + 18) / 16.0, le16(bu + 20) / 16.0, le16(bu + 22) / 16.0,
-				le16(bu + 0) / 100.0, le16(bu + 2) / 100.0, le16(bu + 4) / 100.0,
-				le16(bu + 12) / 16.0, le16(bu + 14) / 16.0, le16(bu + 16) / 16.0,
-				le16(bu + 32) / 100.0, le16(bu + 34) / 100.0, le16(bu + 36) / 100.0);
-		fprintf(f, ",%u]", s->flags);
-	}
-	fputs("]}\n", f);
-	fclose(f);
-	rename(tmp, fin);
+	fprintf(f, "[%" PRIu64 ",%" PRIu32 ",%" PRId64 ",%" PRId64, n, s->seq, s->tick_mono, s->host_mono);
+	rec_bno_live(f, valid_burst(s));
+	fprintf(f, ",%u]", s->flags);
 }
 
-static void process_sample(struct writer *w, const struct sample *s)
+static void live_counters(FILE *f, struct rec *r, const struct rec_snap *q)
 {
+	struct uart *u = r->app;
+
+	/* same keys as ewego-imu-usb where they mean the same thing, so the
+	 * console shows both IMUs with one piece of code */
+	fprintf(f, "\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
+		   ",\"flagged\":%" PRIu64 ",\"read_errors\":%" PRIu64 ",\"i2c_errors\":0,\"queue_overruns\":%" PRIu64
+		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":0,\"xfer_us_max\":%u,\"jitter_us_max\":%" PRId64 ","
+		   "\"fusion_invalid\":%" PRIu64 ",\"fusion_stalls\":%" PRIu64 ",\"reinits\":%" PRIu64 ",",
+		u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid, u->read_errors,
+		q->overruns, q->peak, rate_hz(u), u->xfer_us_max, u->jitter_us_max,
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->reinits));
+}
+
+static void stats(char *buf, size_t len, struct rec *r, const struct rec_snap *q)
+{
+	struct uart *u = r->app;
+
+	snprintf(buf, len, "%s: %" PRIu64 " samples, %" PRIu64 " read errors | %.2f Hz, interval %.0f/%.0f us, "
+		 "xfer max %u us, jitter max %" PRId64 " us | queue peak %u, overruns %" PRIu64 "%s",
+		 r->name, u->valid, u->read_errors, rate_hz(u), u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_max : 0.0,
+		 u->xfer_us_max, u->jitter_us_max, q->peak, q->overruns,
+		 A_LOAD(u->fusion_stalls) ? " | FUSION STALLED (sensor reset?)" : "");
+}
+
+static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
+{
+	struct uart *u = r->app;
+	uint64_t e0 = A_LOAD(u->err_by_code[0]), e7 = A_LOAD(u->err_by_code[7]), e10 = A_LOAD(u->err_by_code[10]);
+
+	fprintf(js, "  \"baud\": %d,\n"
+		    "  \"rate_hz\": %d,\n  \"samples\": %" PRIu64 ",\n"
+		    "  \"lost\": %" PRIu64 ",\n  \"gaps\": %" PRIu64 ",\n  \"flagged\": %" PRIu64 ",\n"
+		    "  \"read_errors\": %" PRIu64 ",\n  \"error_runs\": %" PRIu64 ",\n  \"late_ticks\": %" PRIu64 ",\n"
+		    "  \"errors_by_code\": {\"timeout_or_garbage\": %" PRIu64 ", \"bus_overrun_07\": %" PRIu64
+		    ", \"receive_timeout_0a\": %" PRIu64 ", \"other\": %" PRIu64 "},\n  \"reinits\": %" PRIu64 ",\n"
+		    "  \"fusion_invalid\": %" PRIu64 ",\n  \"fusion_stalls\": %" PRIu64 ",\n  \"fusion_reinits\": %" PRIu64 ",\n"
+		    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
+		    "  \"realtime\": %d,\n"
+		    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
+		    "  \"effective_hz\": %.3f,\n  \"xfer_us_max\": %u,\n  \"jitter_us_max\": %" PRId64 ",\n"
+		    "  \"first_host_mono_us\": %" PRId64 ",\n",
+		u->baud, u->rate, u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid,
+		u->read_errors, u->error_runs, A_LOAD(u->late_ticks),
+		e0, e7, e10, A_LOAD(u->err_total) - e0 - e7 - e10, A_LOAD(u->reinits),
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->fusion_reinits),
+		q->overruns, q->peak, REC_RING_N, r->realtime,
+		u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_sum / (double)u->dt_n : 0.0, u->dt_n ? u->dt_max : 0.0, u->dt_n,
+		rate_hz(u), u->xfer_us_max, u->jitter_us_max, u->first_host);
+}
+
+static void account(struct rec *r, const void *p)
+{
+	struct uart *w = r->app;
+	const struct sample *s = p;
 	int64_t jitter = s->host_mono - s->tick_mono;
 
-	if (w->n == 0)
+	if (r->n == 0)
 		w->first_host = s->host_mono;
 	if (s->flags & FLAG_READ_ERROR) {
 		w->read_errors++;
@@ -444,90 +414,30 @@ static void process_sample(struct writer *w, const struct sample *s)
 		w->valid++;
 		w->last_valid_host = s->host_mono;
 	}
+	if (s->flags & FLAG_FUSION_INVALID)
+		w->fusion_invalid++;
 	if (s->xfer_us > w->xfer_us_max)
 		w->xfer_us_max = s->xfer_us;
 	if (jitter > w->jitter_us_max)
 		w->jitter_us_max = jitter;
-	if (w->csv)
-		csv_row(w->csv, s);
-	if (w->live_dir) {
-		w->live[w->live_head] = *s;
-		w->live_n[w->live_head] = w->n;
-		w->live_head = (w->live_head + 1) % LIVE_N;
-		if (w->live_count < LIVE_N)
-			w->live_count++;
-	}
-	w->n++;
 }
 
-static void print_stats(struct writer *w, int64_t now)
-{
-	uint64_t ovr;
-	unsigned peak;
-
-	pthread_mutex_lock(&w->r->m);
-	ovr = w->r->overruns;
-	peak = w->r->peak;
-	pthread_mutex_unlock(&w->r->m);
-	printf("[%7.1fs] %s: %" PRIu64 " samples, %" PRIu64 " read errors | %.2f Hz, interval %.0f/%.0f us, "
-	       "xfer max %u us, jitter max %" PRId64 " us | queue peak %u, overruns %" PRIu64 "\n",
-	       (double)(now - w->t_start) / 1e6, w->name, w->valid, w->read_errors, rate_hz(w),
-	       w->dt_n ? w->dt_min : 0.0, w->dt_n ? w->dt_max : 0.0, w->xfer_us_max, w->jitter_us_max, peak, ovr);
-	fflush(stdout);
-}
-
-static void *writer_main(void *arg)
-{
-	struct writer *w = arg;
-	struct ring *r = w->r;
-	int64_t t_last_stats = w->t_start, t_last_flush = w->t_start, t_last_live = w->t_start;
-
-	for (;;) {
-		struct sample s;
-		int got = 0, done;
-		int64_t now;
-
-		pthread_mutex_lock(&r->m);
-		if (r->count == 0 && !r->done) {
-			struct timespec ts;
-			clock_gettime(CLOCK_MONOTONIC, &ts);
-			ts.tv_nsec += 100000000;
-			if (ts.tv_nsec >= 1000000000) {
-				ts.tv_sec++;
-				ts.tv_nsec -= 1000000000;
-			}
-			pthread_cond_timedwait(&r->cv, &r->m, &ts);
-		}
-		if (r->count) {
-			s = r->s[r->tail];
-			r->tail = (r->tail + 1) % RING_N;
-			r->count--;
-			got = 1;
-		}
-		done = r->done;
-		pthread_mutex_unlock(&r->m);
-
-		if (got)
-			process_sample(w, &s);
-		else if (done)
-			break;
-
-		now = mono_us();
-		if (w->stats_interval > 0 && !w->quiet && now - t_last_stats >= (int64_t)w->stats_interval * 1000000) {
-			print_stats(w, now);
-			t_last_stats = now;
-		}
-		if (w->csv && now - t_last_flush >= 1000000) {
-			fflush(w->csv);
-			t_last_flush = now;
-		}
-		if (w->live_dir && now - t_last_live >= LIVE_INTERVAL_US) {
-			write_live(w, now);
-			t_last_live = now;
-		}
-	}
-	return NULL;
-}
+static const struct rec_ops ops = {
+	.sample_size = sizeof(struct sample),
+	.csv_header = "timestamp,heading_deg,roll_deg,pitch_deg,quat_w,quat_x,quat_y,quat_z,"
+		      "lin_accel_x,lin_accel_y,lin_accel_z,gravity_x,gravity_y,gravity_z,"
+		      "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z,temp_c,"
+		      "cal_sys,cal_gyro,cal_accel,cal_mag,host_mono_us,tick_mono_us,seq,xfer_us,flags\n",
+	.live_cols = "[\"n\",\"seq\",\"tick_mono_us\",\"host_mono_us\",\"heading\",\"roll\",\"pitch\","
+		     "\"ax\",\"ay\",\"az\",\"gx\",\"gy\",\"gz\",\"lax\",\"lay\",\"laz\",\"flags\"]",
+	.account = account,
+	.csv_row = csv_row,
+	.valid_burst = valid_burst,
+	.live_counters = live_counters,
+	.live_row = live_row,
+	.stats = stats,
+	.summary = summary,
+};
 
 static void usage(FILE *f)
 {
@@ -553,15 +463,15 @@ int main(int argc, char **argv)
 		{"help", 0, 0, 'h'}, {0, 0, 0, 0},
 	};
 	int opt;
-	char dir[PATH_MAX], path[PATH_MAX + 64];
-	static struct ring ring;
-	static struct writer w;
-	FILE *csv = NULL;
+	static struct rec rec;
+	static struct uart u;
 	int fd, exit_code = 0, r;
-	int64_t t_start, t_last_ok, real0, period_us, next_tick;
-	uint64_t late_ticks = 0, err_by_code[16] = {0}, err_total = 0, reinits = 0;
-	int64_t t_last_reinit = 0;
+	int64_t t_last_ok, period_us, next_tick;
+	int64_t t_last_reinit = 0, t_last_check = 0;
 	uint32_t seq = 0;
+	uint64_t zero_run = 0, same_run = 0;
+	uint8_t prev_burst[BURST_LEN];
+	int have_prev = 0, frozen_noted = 0;
 
 	while ((opt = getopt_long(argc, argv, "p:b:R:o:n:t:S:x:NrL:Pqh", lo, NULL)) != -1) {
 		switch (opt) {
@@ -587,29 +497,24 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!preview) {
-		if (session_dir) {
-			time_t t = time(NULL);
-			struct tm tm;
-			char stamp[32];
-			localtime_r(&t, &tm);
-			strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
-			snprintf(dir, sizeof(dir), "%s/%s", out, stamp);
-		} else {
-			snprintf(dir, sizeof(dir), "%s", out);
-		}
-		if (mkdir_p(dir, 0755)) {
-			perror(dir);
-			return 1;
-		}
-	}
-	if (live && mkdir_p(live, 0755)) {
+	u.baud = baud;
+	u.rate = rate;
+	rec.ops = &ops;
+	rec.app = &u;
+	rec.program = "ewego-imu-uart " VERSION;
+	rec.name = name;
+	rec.device = port;
+	rec.live_dir = live;
+	rec.quiet = quiet;
+	rec.stats_interval = stats_interval;
+	rec.preview = preview;
+	rec.realtime = realtime;
+
+	if (live && rec_mkdir_p(live, 0755)) {
 		perror(live);
 		return 1;
 	}
-
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
+	rec_signals();
 
 	fd = uart_open(port, baud);
 	if (fd < 0)
@@ -621,77 +526,35 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (!preview) {
-		snprintf(path, sizeof(path), "%s/%s.csv", dir, name);
-		csv = fopen(path, "w");
-		if (!csv) {
-			perror(path);
-			return 1;
-		}
-		setvbuf(csv, NULL, _IOFBF, 64 * 1024);
-		fputs("timestamp,heading_deg,roll_deg,pitch_deg,quat_w,quat_x,quat_y,quat_z,"
-		      "lin_accel_x,lin_accel_y,lin_accel_z,gravity_x,gravity_y,gravity_z,"
-		      "accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,mag_x,mag_y,mag_z,temp_c,"
-		      "cal_sys,cal_gyro,cal_accel,cal_mag,host_mono_us,tick_mono_us,seq,xfer_us,flags\n", csv);
-	}
-
-	t_start = t_last_ok = mono_us();
-	real0 = real_us();
-
-	pthread_mutex_init(&ring.m, NULL);
-	{
-		pthread_condattr_t ca;
-		pthread_condattr_init(&ca);
-		pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-		pthread_cond_init(&ring.cv, &ca);
-		pthread_condattr_destroy(&ca);
-	}
-	w.r = &ring;
-	w.csv = csv;
-	w.name = name;
-	w.port = port;
-	w.live_dir = live;
-	w.session = preview ? NULL : dir;
-	w.quiet = quiet;
-	w.stats_interval = stats_interval;
-	w.preview = preview;
-	w.rate = rate;
-	w.t_start = t_start;
-	if (pthread_create(&w.thread, NULL, writer_main, &w)) {
-		perror("pthread_create");
+	if (!preview && rec_open_output(&rec, out, session_dir))
 		return 1;
-	}
-	if (realtime) {
-		struct sched_param sp = {.sched_priority = 10};
-		if (sched_setscheduler(0, SCHED_FIFO, &sp))
-			fprintf(stderr, "note: SCHED_FIFO not granted (%s)\n", strerror(errno));
-		if (mlockall(MCL_CURRENT | MCL_FUTURE))
-			fprintf(stderr, "note: mlockall failed (%s)\n", strerror(errno));
-	}
+	if (rec_start(&rec))
+		return 1;
+	t_last_ok = rec.t_start;
 
 	if (preview)
 		fprintf(stderr, "ewego-imu-uart %s: %s @ %d, %d Hz -> live file %s/%s.json only (preview)\n",
 			VERSION, port, baud, rate, live, name);
 	else
 		fprintf(stderr, "ewego-imu-uart %s: %s @ %d, %d Hz -> %s/%s.csv%s%s\n", VERSION, port, baud, rate,
-			dir, name, live ? ", live file in " : "", live ? live : "");
+			rec.dir, name, live ? ", live file in " : "", live ? live : "");
 
 	/* reader loop: one burst read per tick on a steady schedule */
 	period_us = 1000000 / rate;
-	next_tick = t_start + period_us;
-	while (!g_stop) {
+	next_tick = rec.t_start + period_us;
+	while (!rec_stop) {
 		struct sample s;
 		struct timespec ts = {.tv_sec = next_tick / 1000000, .tv_nsec = (next_tick % 1000000) * 1000};
 		int64_t now, t0;
 
-		while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR && !g_stop)
+		while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR && !rec_stop)
 			;
-		if (g_stop)
+		if (rec_stop)
 			break;
 		memset(&s, 0, sizeof(s));
 		s.tick_mono = next_tick;
 		s.seq = seq++;
-		t0 = mono_us();
+		t0 = rec_mono_us();
 		/* 30 ms: the 48-byte answer takes 4.2 ms on the wire plus whatever
 		 * the sensor adds; a tick that runs long is resynchronised below */
 		r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 30);
@@ -699,25 +562,26 @@ int main(int argc, char **argv)
 			drain_quiet(fd, 2, 10);
 			r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 30);
 		}
-		now = mono_us();
+		now = rec_mono_us();
 		s.host_mono = now;
-		s.host_real = real_us();
+		s.host_real = rec_real_us();
 		s.xfer_us = (uint32_t)(now - t0);
 		if (r) {
 			int code = (r > 0 && r < 16) ? r : 0;
+			uint64_t nerr;
 			s.flags |= FLAG_READ_ERROR;
-			err_by_code[code]++;
-			err_total++;
-			if (!quiet && (err_total <= 10 || err_total % 1000 == 0))
-				fprintf(stderr, "read error #%" PRIu64 " at %.1f s: %s (0x%02X)\n", err_total,
-					(double)(now - t_start) / 1e6, ERR_NAMES[code], r > 0 ? r : 0);
+			A_INC(u.err_by_code[code]);
+			nerr = A_INC(u.err_total);
+			if (!quiet && (nerr <= 10 || nerr % 1000 == 0))
+				fprintf(stderr, "read error #%" PRIu64 " at %.1f s: %s (0x%02X)\n", nerr,
+					(double)(now - rec.t_start) / 1e6, ERR_NAMES[code], r > 0 ? r : 0);
 			drain_quiet(fd, 5, 60);
 			/* two seconds without a sample: the sensor may have reset (it
 			 * comes back in config mode, silent on the fusion registers) */
 			if (now - t_last_ok > 2000000 && now - t_last_reinit > 2000000) {
 				t_last_reinit = now;
-				reinits++;
-				fprintf(stderr, "no valid sample for 2 s: re-initialising the sensor (attempt %" PRIu64 ")\n", reinits);
+				fprintf(stderr, "no valid sample for 2 s: re-initialising the sensor (attempt %" PRIu64 ")\n",
+					A_INC(u.reinits));
 				if (bno_init(fd, quiet, 3) == 0)
 					fprintf(stderr, "sensor re-initialised\n");
 			}
@@ -728,78 +592,88 @@ int main(int argc, char **argv)
 			}
 		} else {
 			t_last_ok = now;
+			/* self-check: a BNO055 that browned out and reset (POR 0.4-0.65 s)
+			 * comes back in CONFIG mode and answers burst reads normally,
+			 * with the data registers at zero. In NDOF the quaternion is a
+			 * unit vector, never all zero. */
+			if (quat_zero(s.burst)) {
+				s.flags |= FLAG_FUSION_INVALID;
+				if (++zero_run == ZERO_RUN_MAX)
+					A_INC(u.fusion_stalls);
+			} else {
+				zero_run = 0;
+			}
+			/* frozen: identical sensor data (acc/mag/gyr/fusion; LSB noise
+			 * makes that impossible on a live sensor) for FROZEN_S seconds */
+			if (have_prev && !memcmp(s.burst, prev_burst, 44)) {
+				if (++same_run == (uint64_t)rate * FROZEN_S)
+					A_INC(u.fusion_stalls);
+			} else {
+				same_run = 0;
+			}
+			memcpy(prev_burst, s.burst, sizeof(prev_burst));
+			have_prev = 1;
 		}
 
-		pthread_mutex_lock(&ring.m);
-		if (ring.count == RING_N) {
-			ring.overruns++;
-		} else {
-			ring.s[ring.head] = s;
-			ring.head = (ring.head + 1) % RING_N;
-			ring.count++;
-			if (ring.count > ring.peak)
-				ring.peak = ring.count;
+		rec_push(&rec, &s);
+
+		if (!r && (zero_run >= ZERO_RUN_MAX || same_run >= (uint64_t)rate * FROZEN_S) &&
+		    now - t_last_check >= 2000000) {
+			int zero = zero_run >= ZERO_RUN_MAX;
+			uint8_t mode = 0xFF;
+			int mr = bno_read(fd, REG_OPR_MODE, 1, &mode, 30);
+			t_last_check = now;
+			if (mr) {
+				fprintf(stderr, "%s: reading OPR_MODE failed (%d)\n",
+					zero ? "all-zero quaternion" : "data frozen", mr);
+				drain_quiet(fd, 5, 60);
+			} else if ((mode & 0x0F) != MODE_NDOF || zero) {
+				fprintf(stderr, "%s at %.1f s, OPR_MODE 0x%02X%s: re-initialising the sensor (attempt %" PRIu64 ")\n",
+					zero ? "all-zero quaternion for 20 samples" : "sensor data frozen for 3 s",
+					(double)(now - rec.t_start) / 1e6, mode,
+					(mode & 0x0F) != MODE_NDOF ? " (not NDOF: the sensor reset)" : "", A_INC(u.reinits));
+				A_INC(u.fusion_reinits);
+				if (bno_init(fd, quiet, 3) == 0)
+					fprintf(stderr, "sensor re-initialised\n");
+				zero_run = same_run = 0;
+				have_prev = 0;
+			} else if (!frozen_noted) {
+				fprintf(stderr, "sensor data frozen for 3 s but OPR_MODE is NDOF: not re-initialising\n");
+				frozen_noted = 1;
+			}
 		}
-		pthread_cond_signal(&ring.cv);
-		pthread_mutex_unlock(&ring.m);
+		if (same_run == 0)
+			frozen_noted = 0;
 
 		next_tick += period_us;
+		now = rec_mono_us();                /* a re-init above may have taken a while */
 		if (next_tick < now) {              /* fell behind by a whole period: resynchronise */
-			late_ticks++;
+			A_INC(u.late_ticks);
 			next_tick = now + period_us;
 		}
-		if (seconds > 0 && now - t_start >= (int64_t)seconds * 1000000)
+		if (seconds > 0 && now - rec.t_start >= (int64_t)seconds * 1000000)
 			break;
 	}
 
 	/* leave the sensor in config mode, like the Python logger did */
 	bno_write(fd, REG_OPR_MODE, MODE_CONFIG);
+	ioctl(fd, TIOCNXCL);
 	close(fd);
-	pthread_mutex_lock(&ring.m);
-	ring.done = 1;
-	pthread_cond_signal(&ring.cv);
-	pthread_mutex_unlock(&ring.m);
-	pthread_join(w.thread, NULL);
-	if (csv)
-		fclose(csv);
-	if (live) {
-		snprintf(path, sizeof(path), "%s/%s.json", live, name);
-		unlink(path);
+	{
+		int oc = rec_end(&rec);
+		struct rec_snap q = rec_snapshot(&rec);
+		uint64_t e0 = u.err_by_code[0], e7 = u.err_by_code[7], e10 = u.err_by_code[10];
+		if (oc)
+			exit_code = oc;              /* the recording itself is incomplete: trumps everything */
+		else if (exit_code == 0 && (u.read_errors || q.overruns || u.fusion_stalls))
+			exit_code = 2;
+		rec_write_summary(&rec, exit_code);
+		fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s) (timeout/garbage %" PRIu64
+			", bus overrun %" PRIu64 ", receive timeout %" PRIu64 "), %" PRIu64 " re-inits, %" PRIu64
+			" late ticks, %" PRIu64 " fusion stalls (%" PRIu64 " zero-quaternion samples), queue peak %u, %" PRIu64
+			" overruns -> exit %d\n",
+			name, u.valid, u.read_errors, u.error_runs, e0, e7, e10, u.reinits, u.late_ticks, u.fusion_stalls,
+			u.fusion_invalid, q.peak, q.overruns, exit_code);
 	}
-	if (exit_code == 0 && (w.read_errors || ring.overruns))
-		exit_code = 2;
-
-	if (!preview) {
-		FILE *js;
-		snprintf(path, sizeof(path), "%s/%s_summary.json", dir, name);
-		js = fopen(path, "w");
-		if (js) {
-			fprintf(js, "{\n  \"program\": \"ewego-imu-uart %s\",\n  \"device\": \"%s\",\n  \"baud\": %d,\n"
-				    "  \"rate_hz\": %d,\n  \"samples\": %" PRIu64 ",\n"
-				    "  \"lost\": %" PRIu64 ",\n  \"gaps\": %" PRIu64 ",\n  \"flagged\": %" PRIu64 ",\n"
-				    "  \"read_errors\": %" PRIu64 ",\n  \"error_runs\": %" PRIu64 ",\n  \"late_ticks\": %" PRIu64 ",\n"
-				    "  \"errors_by_code\": {\"timeout_or_garbage\": %" PRIu64 ", \"bus_overrun_07\": %" PRIu64
-				    ", \"receive_timeout_0a\": %" PRIu64 ", \"other\": %" PRIu64 "},\n  \"reinits\": %" PRIu64 ",\n"
-				    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
-				    "  \"realtime\": %d,\n"
-				    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
-				    "  \"effective_hz\": %.3f,\n  \"xfer_us_max\": %u,\n  \"jitter_us_max\": %" PRId64 ",\n"
-				    "  \"first_host_mono_us\": %" PRId64 ",\n"
-				    "  \"realtime_minus_monotonic_us\": %" PRId64 ",\n  \"exit_code\": %d\n}\n",
-				VERSION, port, baud, rate, w.valid, w.read_errors, w.error_runs, w.read_errors,
-				w.read_errors, w.error_runs, late_ticks,
-				err_by_code[0], err_by_code[7], err_by_code[10],
-				err_total - err_by_code[0] - err_by_code[7] - err_by_code[10], reinits,
-				ring.overruns, ring.peak, RING_N, realtime,
-				w.dt_n ? w.dt_min : 0.0, w.dt_n ? w.dt_sum / (double)w.dt_n : 0.0, w.dt_n ? w.dt_max : 0.0, w.dt_n,
-				rate_hz(&w), w.xfer_us_max, w.jitter_us_max, w.first_host, real0 - t_start, exit_code);
-			fclose(js);
-		}
-	}
-	fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s) (timeout/garbage %" PRIu64
-		", bus overrun %" PRIu64 ", receive timeout %" PRIu64 "), %" PRIu64 " re-inits, %" PRIu64
-		" late ticks, queue peak %u, %" PRIu64 " overruns -> exit %d\n",
-		name, w.valid, w.read_errors, w.error_runs, err_by_code[0], err_by_code[7], err_by_code[10], reinits,
-		late_ticks, ring.peak, ring.overruns, exit_code);
 	return exit_code;
 }

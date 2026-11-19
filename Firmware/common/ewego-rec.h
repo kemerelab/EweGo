@@ -30,6 +30,14 @@
 #define REC_EXIT_USAGE  1        /* usage, device or setup error */
 #define REC_EXIT_LOSS   2        /* lost or flagged samples, ring overruns */
 #define REC_EXIT_STALL  3        /* the device stopped answering (--stall) */
+#define REC_EXIT_OUTPUT 4        /* the recording could not be written (ENOSPC, EIO, ...) */
+
+#define REC_FLUSH_US 1000000     /* CSV stdio buffer -> kernel */
+#define REC_SYNC_US 2000000      /* fdatasync: at most this much CSV is lost on a power cut */
+#define REC_OUTPUT_FATAL_US 3000000  /* output failing this long stops the recorder (exit 4) */
+#define REC_OUTPUT_CLEAN_US 10000000 /* ... and only this long without a failure is recovery */
+#define REC_SUMMARY_US 5000000   /* in-progress summary when --stats is 0 */
+#define REC_WATCHDOG_FRESH_US 10000000  /* WATCHDOG=1 only if a real write completed this recently */
 
 /* set by SIGINT/SIGTERM (rec_signals) */
 extern volatile sig_atomic_t rec_stop;
@@ -41,8 +49,12 @@ static inline int16_t rec_le16(const uint8_t *p) { return (int16_t)(p[0] | (p[1]
 /* mkdir -p: every component, EEXIST is fine. Returns 0 or -1 with errno. */
 int rec_mkdir_p(const char *path, mode_t mode);
 
-/* SIGINT and SIGTERM set rec_stop (no SA_RESTART, so blocking calls return EINTR) */
+/* SIGINT and SIGTERM set rec_stop (no SA_RESTART, so blocking calls return
+ * EINTR). Install before any wait for the device. */
 void rec_signals(void);
+
+/* sd_notify(3) without libsystemd: one datagram to $NOTIFY_SOCKET, if set */
+void rec_notify(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 /* BNO055 register burst 0x08..0x35 (46 bytes), shared by both IMU recorders */
 #define REC_BNO_BURST_LEN 46
@@ -94,6 +106,7 @@ struct rec {
 	/* filled by rec_open_output: session dir (empty in --preview) and CSV */
 	char dir[PATH_MAX];
 	FILE *csv;
+	int dirfd;                       /* the session dir, for fsync after create/rename */
 
 	int64_t t_start, real0;          /* rec_start: CLOCK_MONOTONIC and CLOCK_REALTIME at start */
 	uint64_t n;                      /* samples processed by the writer */
@@ -106,6 +119,16 @@ struct rec {
 	uint64_t overruns;
 	int done;
 
+	/* output health (writer thread; final values read after rec_end) */
+	uint64_t write_errors;           /* failed flush / fdatasync / summary writes */
+	char write_error_msg[128];       /* the latest one, "" if none */
+	int64_t werr_since;              /* start of the current failing stretch, 0 when healthy */
+	int64_t werr_last;               /* latest failure */
+	int output_failed;               /* failing for REC_OUTPUT_FATAL_US: exit 4 */
+	double free_mb;                  /* statvfs of the session dir, -1 unknown */
+	int64_t last_good_write;         /* last fdatasync that carried new rows (preview: live write) */
+	uint64_t n_at_sync;
+
 	/* writer-private */
 	unsigned char *cur, *live;
 	uint64_t live_n[REC_LIVE_N];
@@ -114,12 +137,16 @@ struct rec {
 };
 
 /* Session directory OUT/<YYYYmmdd_HHMMSS> (or OUT itself with
- * session_dir == 0), then OUT/.../<name>.csv with the header. 0 or -1
- * (message printed). */
+ * session_dir == 0), then OUT/.../<name>.csv with the header. A stamp that
+ * already exists (restart within the same second, clock step) gets -2, -3,
+ * ... appended; nothing earlier is ever truncated. Call it after the device
+ * is open so a dead sensor leaves no empty directories. 0 or -1 (message
+ * printed). */
 int rec_open_output(struct rec *r, const char *out, int session_dir);
 
-/* Allocate the ring, start the writer thread, then (realtime) put the
- * calling thread on SCHED_FIFO 10 and mlockall. 0 or -1. */
+/* Allocate the ring, start the writer thread (SIGINT/SIGTERM blocked in
+ * it), then (realtime) put the calling thread on SCHED_FIFO 10 and
+ * mlockall, and tell systemd READY=1. 0 or -1. */
 int rec_start(struct rec *r);
 
 /* Reader: hand one sample to the writer (counts an overrun when full). */
@@ -128,10 +155,15 @@ void rec_push(struct rec *r, const void *sample);
 /* Ring counters, copied under the mutex. */
 struct rec_snap rec_snapshot(struct rec *r);
 
-/* Stop the writer after it drained the ring, close the CSV, remove the live file. */
-void rec_end(struct rec *r);
+/* Stop the writer after it drained the ring, flush + fdatasync + close the
+ * CSV, remove the live file. Returns REC_EXIT_OUTPUT if the recording
+ * could not be written (now or earlier, persistently), else 0. */
+int rec_end(struct rec *r);
 
-/* <dir>/<name>_summary.json with the given exit code (no-op in --preview). */
+/* Final <dir>/<name>_summary.json ("in_progress": false) with the exit
+ * code (no-op in --preview). The writer thread writes the same file every
+ * stats interval with "in_progress": true and "exit_code": null; each write
+ * is tmp + fdatasync + rename, so a power cut leaves the previous one. */
 void rec_write_summary(struct rec *r, int exit_code);
 
 #endif

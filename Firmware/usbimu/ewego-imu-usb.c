@@ -281,7 +281,7 @@ int main(int argc, char **argv)
 	static struct rec rec;
 	static struct usb u;
 	int fd, exit_code = 0;
-	int64_t t_last_rpt;
+	int64_t t_last_rpt, t_bad_msg = 0;
 
 	while ((opt = getopt_long(argc, argv, "d:o:n:t:S:x:NrL:Pqlh", lo, NULL)) != -1) {
 		switch (opt) {
@@ -309,12 +309,22 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 1;
 	}
+	/* first, so a stop during the device wait is honoured */
+	rec_signals();
+	if (live && rec_mkdir_p(live, 0755)) {
+		perror(live);
+		return 1;
+	}
 	if (dev) {
 		snprintf(devpath, sizeof(devpath), "%s", dev);
 	} else {
 		/* wait up to 30 s: after a hub reset the module re-enumerates late */
 		int r, tries = 0;
 		while ((r = find_device(devpath, sizeof(devpath))) == -1) {
+			if (rec_stop) {
+				fprintf(stderr, "ewego-imu-usb: stopped while waiting for the device\n");
+				return 0;
+			}
 			if (++tries >= 60) {
 				fprintf(stderr, "ewego-imu-usb: no hub_imu device after 30 s (plugged in, firmware >= v0.3.0?)\n");
 				return 1;
@@ -340,20 +350,14 @@ int main(int argc, char **argv)
 	rec.preview = preview;
 	rec.realtime = realtime;
 
-	if (!preview && rec_open_output(&rec, out, session_dir))
-		return 1;
-	if (live && rec_mkdir_p(live, 0755)) {
-		perror(live);
-		return 1;
-	}
-
 	fd = open(devpath, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
 		fprintf(stderr, "open %s: %s\n", devpath, strerror(errno));
 		return 1;
 	}
-
-	rec_signals();
+	/* the session directory only once there is a device to record */
+	if (!preview && rec_open_output(&rec, out, session_dir))
+		return 1;
 	if (rec_start(&rec))
 		return 1;
 	t_last_rpt = rec.t_start;
@@ -377,41 +381,57 @@ int main(int argc, char **argv)
 			exit_code = 1;
 			break;
 		}
-		if (r == 0) {
-			if (now - t_last_rpt > (int64_t)stall * 1000000) {
-				fprintf(stderr, "no reports for %d s: device stalled or unplugged\n", stall);
+		if (r > 0) {
+			ssize_t len;
+			if (!(pfd.revents & POLLIN)) {      /* POLLERR/POLLHUP/POLLNVAL alone: node gone */
+				fprintf(stderr, "poll: device error (revents 0x%x, unplugged?)\n", pfd.revents);
 				exit_code = 3;
 				break;
 			}
-		} else {
-			ssize_t len = read(fd, s.rpt, sizeof(s.rpt));
+			len = read(fd, s.rpt, sizeof(s.rpt));
 			if (len < 0) {
-				if (errno == EINTR)
+				if (errno == EINTR || errno == EAGAIN)
 					continue;
 				fprintf(stderr, "read: %s (device unplugged?)\n", strerror(errno));
 				exit_code = 3;
 				break;
 			}
+			if (len == 0) {
+				fprintf(stderr, "read: end of file (device gone)\n");
+				exit_code = 3;
+				break;
+			}
 			s.host_mono = now;
 			s.host_real = rec_real_us();
-			t_last_rpt = now;
-			if (len != RPT_LEN || s.rpt[0] != 1) {
-				A_INC(u.bad_reports);
-				if (!quiet)
-					fprintf(stderr, "unexpected report: %zd bytes, version %u\n", len, s.rpt[0]);
-				continue;
+			if (len == RPT_LEN && s.rpt[0] == 1) {
+				t_last_rpt = now;           /* liveness: valid reports only */
+				rec_push(&rec, &s);
+			} else {
+				/* a module streaming reports we cannot use must still trip
+				 * --stall; message rate-limited (100 Hz on the RT thread) */
+				uint64_t nbad = A_INC(u.bad_reports);
+				if (!quiet && (nbad <= 3 || now - t_bad_msg >= 10000000)) {
+					fprintf(stderr, "unexpected report #%" PRIu64 ": %zd bytes, version %u\n", nbad, len, s.rpt[0]);
+					t_bad_msg = now;
+				}
 			}
-			rec_push(&rec, &s);
+		}
+		if (now - t_last_rpt > (int64_t)stall * 1000000) {
+			fprintf(stderr, "no valid reports for %d s: device stalled or unplugged\n", stall);
+			exit_code = 3;
+			break;
 		}
 		if (seconds > 0 && now - rec.t_start >= (int64_t)seconds * 1000000)
 			break;
 	}
 
 	close(fd);
-	rec_end(&rec);
 	{
+		int oc = rec_end(&rec);
 		struct rec_snap q = rec_snapshot(&rec);
-		if (exit_code == 0 && (u.lost || u.flagged || q.overruns))
+		if (oc)
+			exit_code = oc;              /* the recording itself is incomplete: trumps everything */
+		else if (exit_code == 0 && (u.lost || u.flagged || q.overruns))
 			exit_code = 2;
 		rec_write_summary(&rec, exit_code);
 		fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " lost in %" PRIu64 " gap(s), %" PRIu64 " flagged, "

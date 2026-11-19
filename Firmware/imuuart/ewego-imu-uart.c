@@ -59,7 +59,11 @@
 #define MODE_NDOF     0x0C
 #define BURST_LEN     REC_BNO_BURST_LEN          /* 0x08 .. 0x35 */
 
-#define FLAG_READ_ERROR 0x01
+#define FLAG_READ_ERROR     0x01  /* read failed; sensor columns empty */
+#define FLAG_FUSION_INVALID 0x02  /* read fine but the quaternion is all zero: not fusing */
+
+#define ZERO_RUN_MAX 20           /* consecutive all-zero quaternions before checking OPR_MODE */
+#define FROZEN_S 3                /* seconds of identical data before checking OPR_MODE */
 
 #define A_LOAD(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 #define A_INC(x) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED)
@@ -261,6 +265,13 @@ static int bno_init(int fd, int quiet, int attempts)
 	return 0;
 }
 
+/* quaternion w,x,y,z = burst[24..31] */
+static int quat_zero(const uint8_t *burst)
+{
+	static const uint8_t z[8];
+	return !memcmp(burst + 24, z, sizeof(z));
+}
+
 /* ---- samples and writer callbacks ---------------------------------------- */
 
 struct sample {
@@ -273,7 +284,7 @@ struct sample {
 struct uart {
 	int baud, rate;
 	/* writer thread */
-	uint64_t valid, read_errors, error_runs;
+	uint64_t valid, read_errors, error_runs, fusion_invalid;
 	int in_error_run;
 	int64_t first_host, last_valid_host;
 	double dt_min, dt_max, dt_sum;
@@ -282,6 +293,8 @@ struct uart {
 	int64_t jitter_us_max;
 	/* reader thread (atomic) */
 	uint64_t late_ticks, err_by_code[16], err_total, reinits;
+	uint64_t fusion_stalls;     /* zero-quaternion or frozen-data runs that reached the threshold */
+	uint64_t fusion_reinits;    /* re-inits those runs caused (also counted in reinits) */
 };
 
 static double rate_hz(const struct uart *u)
@@ -321,9 +334,11 @@ static void live_counters(FILE *f, struct rec *r, const struct rec_snap *q)
 	 * console shows both IMUs with one piece of code */
 	fprintf(f, "\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
 		   ",\"flagged\":%" PRIu64 ",\"read_errors\":%" PRIu64 ",\"i2c_errors\":0,\"queue_overruns\":%" PRIu64
-		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":0,\"xfer_us_max\":%u,\"jitter_us_max\":%" PRId64 ",",
-		u->valid, u->read_errors, u->error_runs, u->read_errors, u->read_errors,
-		q->overruns, q->peak, rate_hz(u), u->xfer_us_max, u->jitter_us_max);
+		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":0,\"xfer_us_max\":%u,\"jitter_us_max\":%" PRId64 ","
+		   "\"fusion_invalid\":%" PRIu64 ",\"fusion_stalls\":%" PRIu64 ",\"reinits\":%" PRIu64 ",",
+		u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid, u->read_errors,
+		q->overruns, q->peak, rate_hz(u), u->xfer_us_max, u->jitter_us_max,
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->reinits));
 }
 
 static void stats(char *buf, size_t len, struct rec *r, const struct rec_snap *q)
@@ -331,9 +346,10 @@ static void stats(char *buf, size_t len, struct rec *r, const struct rec_snap *q
 	struct uart *u = r->app;
 
 	snprintf(buf, len, "%s: %" PRIu64 " samples, %" PRIu64 " read errors | %.2f Hz, interval %.0f/%.0f us, "
-		 "xfer max %u us, jitter max %" PRId64 " us | queue peak %u, overruns %" PRIu64,
+		 "xfer max %u us, jitter max %" PRId64 " us | queue peak %u, overruns %" PRIu64 "%s",
 		 r->name, u->valid, u->read_errors, rate_hz(u), u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_max : 0.0,
-		 u->xfer_us_max, u->jitter_us_max, q->peak, q->overruns);
+		 u->xfer_us_max, u->jitter_us_max, q->peak, q->overruns,
+		 A_LOAD(u->fusion_stalls) ? " | FUSION STALLED (sensor reset?)" : "");
 }
 
 static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
@@ -347,14 +363,16 @@ static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
 		    "  \"read_errors\": %" PRIu64 ",\n  \"error_runs\": %" PRIu64 ",\n  \"late_ticks\": %" PRIu64 ",\n"
 		    "  \"errors_by_code\": {\"timeout_or_garbage\": %" PRIu64 ", \"bus_overrun_07\": %" PRIu64
 		    ", \"receive_timeout_0a\": %" PRIu64 ", \"other\": %" PRIu64 "},\n  \"reinits\": %" PRIu64 ",\n"
+		    "  \"fusion_invalid\": %" PRIu64 ",\n  \"fusion_stalls\": %" PRIu64 ",\n  \"fusion_reinits\": %" PRIu64 ",\n"
 		    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
 		    "  \"realtime\": %d,\n"
 		    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
 		    "  \"effective_hz\": %.3f,\n  \"xfer_us_max\": %u,\n  \"jitter_us_max\": %" PRId64 ",\n"
 		    "  \"first_host_mono_us\": %" PRId64 ",\n",
-		u->baud, u->rate, u->valid, u->read_errors, u->error_runs, u->read_errors,
+		u->baud, u->rate, u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid,
 		u->read_errors, u->error_runs, A_LOAD(u->late_ticks),
 		e0, e7, e10, A_LOAD(u->err_total) - e0 - e7 - e10, A_LOAD(u->reinits),
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->fusion_reinits),
 		q->overruns, q->peak, REC_RING_N, r->realtime,
 		u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_sum / (double)u->dt_n : 0.0, u->dt_n ? u->dt_max : 0.0, u->dt_n,
 		rate_hz(u), u->xfer_us_max, u->jitter_us_max, u->first_host);
@@ -386,6 +404,8 @@ static void account(struct rec *r, const void *p)
 		w->valid++;
 		w->last_valid_host = s->host_mono;
 	}
+	if (s->flags & FLAG_FUSION_INVALID)
+		w->fusion_invalid++;
 	if (s->xfer_us > w->xfer_us_max)
 		w->xfer_us_max = s->xfer_us;
 	if (jitter > w->jitter_us_max)
@@ -437,8 +457,11 @@ int main(int argc, char **argv)
 	static struct uart u;
 	int fd, exit_code = 0, r;
 	int64_t t_last_ok, period_us, next_tick;
-	int64_t t_last_reinit = 0;
+	int64_t t_last_reinit = 0, t_last_check = 0;
 	uint32_t seq = 0;
+	uint64_t zero_run = 0, same_run = 0;
+	uint8_t prev_burst[BURST_LEN];
+	int have_prev = 0, frozen_noted = 0;
 
 	while ((opt = getopt_long(argc, argv, "p:b:R:o:n:t:S:x:NrL:Pqh", lo, NULL)) != -1) {
 		switch (opt) {
@@ -559,11 +582,61 @@ int main(int argc, char **argv)
 			}
 		} else {
 			t_last_ok = now;
+			/* self-check: a BNO055 that browned out and reset (POR 0.4-0.65 s)
+			 * comes back in CONFIG mode and answers burst reads normally,
+			 * with the data registers at zero. In NDOF the quaternion is a
+			 * unit vector, never all zero. */
+			if (quat_zero(s.burst)) {
+				s.flags |= FLAG_FUSION_INVALID;
+				if (++zero_run == ZERO_RUN_MAX)
+					A_INC(u.fusion_stalls);
+			} else {
+				zero_run = 0;
+			}
+			/* frozen: identical sensor data (acc/mag/gyr/fusion; LSB noise
+			 * makes that impossible on a live sensor) for FROZEN_S seconds */
+			if (have_prev && !memcmp(s.burst, prev_burst, 44)) {
+				if (++same_run == (uint64_t)rate * FROZEN_S)
+					A_INC(u.fusion_stalls);
+			} else {
+				same_run = 0;
+			}
+			memcpy(prev_burst, s.burst, sizeof(prev_burst));
+			have_prev = 1;
 		}
 
 		rec_push(&rec, &s);
 
+		if (!r && (zero_run >= ZERO_RUN_MAX || same_run >= (uint64_t)rate * FROZEN_S) &&
+		    now - t_last_check >= 2000000) {
+			int zero = zero_run >= ZERO_RUN_MAX;
+			uint8_t mode = 0xFF;
+			int mr = bno_read(fd, REG_OPR_MODE, 1, &mode, 30);
+			t_last_check = now;
+			if (mr) {
+				fprintf(stderr, "%s: reading OPR_MODE failed (%d)\n",
+					zero ? "all-zero quaternion" : "data frozen", mr);
+				drain_quiet(fd, 5, 60);
+			} else if ((mode & 0x0F) != MODE_NDOF || zero) {
+				fprintf(stderr, "%s at %.1f s, OPR_MODE 0x%02X%s: re-initialising the sensor (attempt %" PRIu64 ")\n",
+					zero ? "all-zero quaternion for 20 samples" : "sensor data frozen for 3 s",
+					(double)(now - rec.t_start) / 1e6, mode,
+					(mode & 0x0F) != MODE_NDOF ? " (not NDOF: the sensor reset)" : "", A_INC(u.reinits));
+				A_INC(u.fusion_reinits);
+				if (bno_init(fd, quiet, 3) == 0)
+					fprintf(stderr, "sensor re-initialised\n");
+				zero_run = same_run = 0;
+				have_prev = 0;
+			} else if (!frozen_noted) {
+				fprintf(stderr, "sensor data frozen for 3 s but OPR_MODE is NDOF: not re-initialising\n");
+				frozen_noted = 1;
+			}
+		}
+		if (same_run == 0)
+			frozen_noted = 0;
+
 		next_tick += period_us;
+		now = rec_mono_us();                /* a re-init above may have taken a while */
 		if (next_tick < now) {              /* fell behind by a whole period: resynchronise */
 			A_INC(u.late_ticks);
 			next_tick = now + period_us;
@@ -582,14 +655,15 @@ int main(int argc, char **argv)
 		uint64_t e0 = u.err_by_code[0], e7 = u.err_by_code[7], e10 = u.err_by_code[10];
 		if (oc)
 			exit_code = oc;              /* the recording itself is incomplete: trumps everything */
-		else if (exit_code == 0 && (u.read_errors || q.overruns))
+		else if (exit_code == 0 && (u.read_errors || q.overruns || u.fusion_stalls))
 			exit_code = 2;
 		rec_write_summary(&rec, exit_code);
 		fprintf(stderr, "%s: %" PRIu64 " samples, %" PRIu64 " read errors in %" PRIu64 " run(s) (timeout/garbage %" PRIu64
 			", bus overrun %" PRIu64 ", receive timeout %" PRIu64 "), %" PRIu64 " re-inits, %" PRIu64
-			" late ticks, queue peak %u, %" PRIu64 " overruns -> exit %d\n",
-			name, u.valid, u.read_errors, u.error_runs, e0, e7, e10, u.reinits, u.late_ticks, q.peak,
-			q.overruns, exit_code);
+			" late ticks, %" PRIu64 " fusion stalls (%" PRIu64 " zero-quaternion samples), queue peak %u, %" PRIu64
+			" overruns -> exit %d\n",
+			name, u.valid, u.read_errors, u.error_runs, e0, e7, e10, u.reinits, u.late_ticks, u.fusion_stalls,
+			u.fusion_invalid, q.peak, q.overruns, exit_code);
 	}
 	return exit_code;
 }

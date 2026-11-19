@@ -2,6 +2,10 @@
 """
 Simple audio recorder script using ALSA (arecord)
 Records audio from the default microphone and saves to a WAV file
+
+Bench use only. The ewego-audio unit no longer runs this script: it runs
+arecord directly through /usr/local/bin/ewego-audio-record
+(image/ewego/audio-record.sh), which also picks the voicehat card by name.
 """
 
 import subprocess
@@ -51,18 +55,25 @@ def record_audio(filename=None, duration=None, device=None):
     else:
         print("Press Ctrl+C to stop recording")
 
+    proc = subprocess.Popen(cmd)
     try:
-        # Run arecord
-        result = subprocess.run(cmd, check=True)
-        print(f"\nRecording saved to: {filename}")
-        return 0
-    except subprocess.CalledProcessError as e:
-        print(f"\nError during recording: {e}", file=sys.stderr)
-        return 1
+        rc = proc.wait()
     except KeyboardInterrupt:
+        # Ctrl+C reached arecord too (same process group). Give it time to
+        # finish the WAV header; subprocess.run would SIGKILL it after 250 ms.
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
         print(f"\nRecording stopped by user")
         print(f"Recording saved to: {filename}")
         return 0
+    if rc != 0:
+        print(f"\nError during recording: arecord exited with {rc}", file=sys.stderr)
+        return 1
+    print(f"\nRecording saved to: {filename}")
+    return 0
 
 if __name__ == "__main__":
     import argparse

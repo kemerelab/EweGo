@@ -5,7 +5,7 @@ Each recorder writes its own timestamped session directory:
   <root>/recordings/camera1/<stamp>/camera1.mjpeg, _timestamps.bin, _index.bin, _summary.json
   <root>/recordings/camera2/<stamp>/...
   <root>/recordings/imu/<stamp>/imu.csv, imu_summary.json
-  <root>/recordings/audio/<stamp>/audio.wav
+  <root>/recordings/audio/<stamp>/audio.wav (audio-01.wav, audio-02.wav ... past 2 GiB)
   <root>/recordings/fuel/<stamp>/fuel_gauge.csv
   <root>/gps-logs/gps_log_<stamp>.ubx, _timesync.csv
 This tool groups the sessions that started within a minute of each other
@@ -254,29 +254,66 @@ def peak_dbfs(p, data_off, bits, nbytes, samples_per_slice=48000 * 2):
     return 20 * math.log10(peak / full) if peak else -999
 
 
+AUDIO_PART_RE = re.compile(r"^audio(?:-(\d+))?\.wav$")
+
+
+def audio_parts(d):
+    """The audio recording of one session, in order.
+
+    arecord stops a WAV file at the 2 GiB limit (~93 min at 48 kHz stereo
+    S32_LE): it renames audio.wav to audio-01.wav and continues in
+    audio-02.wav, audio-03.wav, ... So a session holds either audio.wav or
+    audio-01.wav, audio-02.wav, ... (audio.wav first if both are present)."""
+    parts = []
+    for p in d.glob("audio*.wav"):
+        m = AUDIO_PART_RE.match(p.name)
+        if m:
+            parts.append((int(m.group(1)) if m.group(1) else 0, p))
+    return [p for _, p in sorted(parts)]
+
+
 def check_audio(d):
     notes = []
-    w = d / "audio.wav"
-    if not w.exists():
+    parts = audio_parts(d)
+    if not parts:
         return "FAIL", "no audio.wav", notes, None
-    info = wav_info(w)
-    if not info:
-        return "FAIL", f"{w.stat().st_size} bytes, not a WAV header", notes, None
-    rate, ch, bits, nbytes, header_ok, data_off = info
-    dur = nbytes / (rate * ch * bits // 8) if rate else 0
     verdict = "PASS"
-    if not header_ok:
-        verdict = "WARN"
-        notes.append("WAV header length not final: still recording, or arecord was killed before it could finish the header "
-                     "(players may need `ffmpeg -i audio.wav -c copy fixed.wav`)")
-    pk = peak_dbfs(w, data_off, bits, nbytes)
+    total_bytes = 0
+    dur = 0.0
+    fmt = None
+    pk = None
+    for i, w in enumerate(parts):
+        info = wav_info(w)
+        if not info:
+            return "FAIL", f"{w.name}: {w.stat().st_size} bytes, not a WAV header", notes, None
+        rate, ch, bits, nbytes, header_ok, data_off = info
+        if fmt is None:
+            fmt = (rate, ch, bits)
+        elif (rate, ch, bits) != fmt:
+            verdict = "WARN"
+            notes.append(f"{w.name}: format {rate} Hz / {ch} ch / {bits}-bit differs from {parts[0].name}")
+        total_bytes += nbytes
+        dur += nbytes / (rate * ch * bits // 8) if rate else 0
+        if not header_ok:
+            verdict = "WARN"
+            if i == len(parts) - 1:
+                notes.append(f"{w.name}: WAV header length not final: still recording, or arecord was killed before "
+                             f"it could finish the header (players may need `ffmpeg -i {w.name} -c copy fixed.wav`)")
+            else:
+                notes.append(f"{w.name}: WAV header length not final although a later part exists")
+        p = peak_dbfs(w, data_off, bits, nbytes)
+        if p is not None:
+            pk = p if pk is None else max(pk, p)
+    rate, ch, bits = fmt
     if pk is not None:
         if pk < -60:
             verdict = "WARN" if verdict == "PASS" else verdict
             notes.append(f"peak {pk:.0f} dBFS: near silence, check the mics / ALSA device")
         elif pk > -0.5:
             notes.append("peak at full scale: clipping")
-    line = f"{fmt_dur(dur)}, {rate} Hz, {ch} ch, {bits}-bit, {nbytes / 1e6:.0f} MB" + (f", peak {pk:.0f} dBFS (sampled)" if pk is not None else "")
+    line = f"{fmt_dur(dur)}, {rate} Hz, {ch} ch, {bits}-bit, {total_bytes / 1e6:.0f} MB" + \
+        (f" in {len(parts)} files ({parts[0].name} .. {parts[-1].name})" if len(parts) > 1 else "") + \
+        (f", peak {pk:.0f} dBFS (sampled)" if pk is not None else "")
     return verdict, line, notes, None
 
 
@@ -447,9 +484,11 @@ def collect(run, dest):
                 link(src, dest / "camera" / src.name)
                 n += 1
     a = run["units"].get("audio")
-    if a and (a / "audio.wav").exists():
-        link(a / "audio.wav", dest / f"audio_{run['stamps']['audio']}.wav")
-        n += 1
+    if a:
+        # audio.wav, or audio-01.wav, audio-02.wav ... after arecord's 2 GiB rollover
+        for w in audio_parts(a):
+            link(w, dest / f"audio_{run['stamps']['audio']}{w.stem[len('audio'):]}.wav")
+            n += 1
     for unit in ("imu", "imu-uart", "fuel"):
         d = run["units"].get(unit)
         if d:

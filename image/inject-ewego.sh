@@ -23,8 +23,16 @@
 # What it does to the target:
 #   rootfs: /opt/ewego/                          Firmware tree from this repo
 #           /opt/ewego/pylib/                    vendored pure-Python packages
-#           /etc/systemd/system/ewego-*.service  installed, NOT enabled
+#           /etc/systemd/system/ewego-*.service  installed; only ewego-webtest and
+#                                                ewego-autostart are enabled (the
+#                                                latter starts ewego-record.target
+#                                                when /boot/firmware/ewego-record
+#                                                exists)
+#           /usr/local/bin/ewego-audio-record,   helper scripts from image/ewego/*.sh
+#                          ewego-check-space
 #           /etc/modules-load.d/ewego.conf       i2c-dev
+#           /etc/systemd/journald.conf.d/ewego.conf  persistent journal capped at
+#                                                100M, rate-limited
 #           /etc/ewego-image-release             version + build date
 #           apt packages from apt-packages.txt   installed inside the image
 #                                                through an emulated chroot
@@ -66,7 +74,7 @@ while [ $# -gt 0 ]; do
         --no-apt) DO_APT=0; shift ;;
         --no-uvc) DO_UVC=0; shift ;;
         --grow)   GROW=$2; shift 2 ;;
-        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
         -*)       die "unknown option $1" ;;
         *)        [ -z "$TARGET" ] || die "unexpected argument $1"; TARGET=$1; shift ;;
     esac
@@ -179,11 +187,27 @@ else
 fi
 install -d "$ROOT_MNT/etc/ewego"
 for f in "$IMAGE_DIR"/ewego/*.conf; do
+    case $(basename "$f") in journald-*) continue ;; esac   # installed below
     install -m 644 "$f" "$ROOT_MNT/etc/ewego/$(basename "$f")"
 done
 
+# helper scripts used by the units: image/ewego/<name>.sh -> /usr/local/bin/ewego-<name>
+for f in "$IMAGE_DIR"/ewego/*.sh; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f" .sh)
+    log "Installing /usr/local/bin/ewego-$b"
+    install -m 755 "$f" "$ROOT_MNT/usr/local/bin/ewego-$b"
+done
+
+# --- rootfs: bounded, persistent journal ------------------------------------
+# The journal shares the SD card with the recordings: cap it and rate-limit
+# chatty units, but keep it persistent for post-mortems.
+log "Installing /etc/systemd/journald.conf.d/ewego.conf"
+install -d "$ROOT_MNT/etc/systemd/journald.conf.d"
+install -m 644 "$IMAGE_DIR/ewego/journald-ewego.conf" "$ROOT_MNT/etc/systemd/journald.conf.d/ewego.conf"
+
 # --- rootfs: units (installed, deliberately not enabled) ------------------
-log "Installing systemd units (not enabled)"
+log "Installing systemd units"
 for u in "$IMAGE_DIR"/units/*.service "$IMAGE_DIR"/units/*.target; do
     install -m 644 "$u" "$ROOT_MNT/etc/systemd/system/$(basename "$u")"
 done
@@ -191,10 +215,15 @@ done
 rm -f "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.service \
       "$ROOT_MNT"/etc/systemd/system/multi-user.target.wants/ewego-*.target
 
-# The only unit enabled by default is the web test console (port 8080,
-# no authentication), so a freshly flashed collar can be exercised from a
-# browser. Recording units stay disabled until started deliberately.
-ENABLE_UNITS="ewego-webtest.service"
+# Enabled by default:
+#  - the web test console (port 8080, no authentication), so a freshly
+#    flashed wearable can be exercised from a browser;
+#  - ewego-autostart, which starts ewego-record.target at boot only when the
+#    flag file /boot/firmware/ewego-record exists (field cards: touch it on
+#    the FAT partition from any laptop; bench cards leave it absent and come
+#    up idle). A field reboot then resumes recording with no operator.
+# The recorders themselves stay disabled; the target pulls them in.
+ENABLE_UNITS="ewego-webtest.service ewego-autostart.service"
 install -d "$ROOT_MNT/etc/systemd/system/multi-user.target.wants"
 for u in $ENABLE_UNITS; do
     log "Enabling $u"
@@ -361,3 +390,4 @@ log "done: EweGo $EWEGO_VERSION injected into $TARGET"
 echo "    units installed: $(ls "$IMAGE_DIR"/units | tr '\n' ' ')"
 echo "    enabled by default: $ENABLE_UNITS (web console at http://<host>:8080)"
 echo "    start recording on the wearable with: sudo systemctl start ewego-record.target"
+echo "    record at every boot (field cards): touch /boot/firmware/ewego-record"

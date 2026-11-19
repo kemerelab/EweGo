@@ -3,14 +3,24 @@ Description=EweGo audio recorder (stereo mics via arecord)
 Documentation=file:///opt/ewego/Firmware/audio/README.md
 After=local-fs.target sound.target
 PartOf=ewego-record.target
+# keep retrying (RestartSec apart) for as long as the target runs
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment=OUT_DIR=/opt/ewego/recordings/audio
 EnvironmentFile=-/etc/ewego/audio.conf
 # One timestamped directory per start, like the other recorders:
-# $OUT_DIR/<YYYYmmdd_HHMMSS>/audio.wav (48 kHz, stereo, S32_LE).
-ExecStart=/bin/sh -c 'd="$OUT_DIR/$(date +%%Y%%m%%d_%%H%%M%%S)"; mkdir -p "$d"; exec /usr/bin/python3 -u /opt/ewego/Firmware/audio/record_audio.py --output "$d/audio.wav" $DEVICE_ARG'
-# SIGINT reaches arecord too (default KillMode), so it finishes the WAV header
+# $OUT_DIR/<YYYYmmdd_HHMMSS>/audio.wav (48 kHz, stereo, S32_LE; audio-01.wav,
+# audio-02.wav ... past 2 GiB). ewego-audio-record finds the voicehat card by
+# name unless DEVICE is set, then execs arecord, so arecord is the main
+# process and receives SIGINT directly.
+# Free-space guard: below 500 MB the start is skipped (exit 75; not a
+# failure, no restart loop) and /run/ewego/space.json says why.
+ExecCondition=/usr/local/bin/ewego-check-space ${OUT_DIR}
+ExecStart=/usr/local/bin/ewego-audio-record ${OUT_DIR} $DEVICE
+OOMScoreAdjust=-500
+# arecord finishes the WAV header on SIGINT
 KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure

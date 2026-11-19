@@ -2,6 +2,29 @@
 
 Python script for logging GPS data from u-blox ZED-X20P with RTK corrections via NTRIP.
 
+## On the wearable: unit `ewego-gps`
+
+The image runs this logger as `ewego-gps` (part of `ewego-record.target`):
+`gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs $NTRIP_ARGS`,
+NTRIP set in `/etc/ewego/gps.conf` (off by default). Output, unchanged:
+`gps_log_<YYYYmmdd_HHMMSS>.ubx` (raw UBX for PPK) and `..._timesync.csv`.
+
+- **Exit status**: 0 after SIGINT / Ctrl+C; 1 when it cannot start (port or
+  log file); 3 after 5 s of nothing but read/write errors (the error is
+  printed once when the streak starts, not on every retry), or if the read
+  thread ends on its own. The unit restarts it 10 s later, with no start
+  limit.
+- **Durability**: the `.ubx` is flushed to the kernel every second and
+  `fsync`ed (with the time sync CSV) every 5 s, so a power cut loses
+  seconds, not the write buffer.
+- **Exclusive port**: `TIOCEXCL` on the serial port after opening, so a
+  second non-root reader cannot steal bytes from the stream.
+- **NTRIP**: if the caster is unreachable at start, or the stream drops
+  (closed, socket error, 10 s of silence), logging continues without
+  corrections and it reconnects every 30 s.
+- **Status line** every 30 s (`--status-every`, e.g. `--status-every 2` on
+  the bench), so the journal is not written every two seconds.
+
 ## Features
 
 - ✅ Logs raw UBX binary data for PPK post-processing

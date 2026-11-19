@@ -7,7 +7,9 @@ each piece of a wearable from a browser: status strip, one test per sensor
 with live output, a live camera view, unit start/stop, journal tails and
 a session listing. /live is the field dashboard: both cameras, IMU traces,
 GPS, battery and the recorder controls, fed by the files the recorders keep
-on tmpfs (/run/ewego) or by preview processes when nothing is recording. Everything runs the same tools you would use over SSH;
+on tmpfs (/run/ewego) or by the preview units (ewego-preview@camera1/2,
+ewego-preview-imu-usb/uart) when nothing is recording. Everything runs the
+same tools you would use over SSH;
 this just puts their output in a browser.
 
     python3 ewego_webtest.py [--port 8080] [--ewego-dir /opt/ewego]
@@ -54,12 +56,13 @@ LOCKS = {k: threading.Lock() for k in ("imu", "gps", "camera", "audio")}
 # helpers
 # ---------------------------------------------------------------------------
 
-def sh(argv, timeout=15):
-    """Run a command, return (rc, combined output)."""
+def sh(argv, timeout=15, merge=True):
+    """Run a command, return (rc, output): stdout + stderr, or stdout only
+    with merge=False (for output that is parsed line by line)."""
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                            errors="replace")
-        return p.returncode, (p.stdout + p.stderr)
+        return p.returncode, (p.stdout + p.stderr if merge else p.stdout)
     except FileNotFoundError:
         return 127, f"{argv[0]}: not found\n"
     except subprocess.TimeoutExpired:
@@ -206,10 +209,39 @@ def video_devices():
     return devs
 
 
+# A unit in any of these states owns its device, is about to, or is still
+# releasing it: the UART recorder's init alone takes ~6 s in "activating",
+# and a Restart= wait is "activating" too.
+BUSY_STATES = ("active", "activating", "reloading", "deactivating", "refreshing")
+
+
+def is_busy(state):
+    return state in BUSY_STATES
+
+
+def systemctl(*args, timeout=15):
+    """Every systemctl call goes through here (and sh), so tests can fake it."""
+    return sh(["systemctl", *args], timeout=timeout)
+
+
+def units_state(units, verb="is-active"):
+    """{unit: state} for many units in one systemctl call (is-active and
+    is-enabled print one line per unit, in order)."""
+    units = list(units)
+    if not units:
+        return {}
+    rc, out = sh(["systemctl", verb, *units], merge=False)
+    lines = out.split()
+    return {u: (lines[i] if i < len(lines) else "unknown") for i, u in enumerate(units)}
+
+
+def unit_busy(unit):
+    return is_busy(units_state([unit])[unit])
+
+
 def unit_status(unit):
-    rc, active = sh(["systemctl", "is-active", unit])
-    rc2, enabled = sh(["systemctl", "is-enabled", unit])
-    return {"unit": unit, "active": active.strip(), "enabled": enabled.strip()}
+    return {"unit": unit, "active": units_state([unit])[unit],
+            "enabled": units_state([unit], "is-enabled")[unit]}
 
 
 def status():
@@ -1084,136 +1116,115 @@ def read_conf(path):
     return out
 
 
-def tool(name):
-    """Path of a C tool: the image installs them in /usr/local/bin; a checkout
-    may have a native build next to the source."""
-    p = shutil.which(name)
-    if p:
-        return p
-    for sub in ("uvccam", "usbimu", "imuuart"):
-        c = EWEGO / "Firmware" / sub / name
-        if c.exists():
-            return str(c)
-    return name
+PREVIEW_UNITS = {"camera1": "ewego-preview@camera1", "camera2": "ewego-preview@camera2",
+                 "imu": "ewego-preview-imu-usb", "imu-uart": "ewego-preview-imu-uart"}
+# recorder unit -> the preview unit that uses the same device
+PREVIEW_OF = {"ewego-cam@camera1": "ewego-preview@camera1", "ewego-cam@camera2": "ewego-preview@camera2",
+              "ewego-imu-usb": "ewego-preview-imu-usb", "ewego-imu-uart": "ewego-preview-imu-uart"}
 
 
 class Preview:
-    """ewego-cam --preview and ewego-imu-usb --preview feeding LIVE_DIR while
-    nothing is recording: the live page's cameras and IMU without writing a
-    byte to the card. Stopped before any recorder starts (they need the
-    cameras), and on its own after IDLE_S without a live-page client."""
+    """Thin controller for the preview units (image/units/ewego-preview*):
+    ewego-cam --preview per camera and both IMU recorders in --preview feed
+    LIVE_DIR while nothing is recording, so the live page shows cameras and
+    IMUs without writing a byte to the card. They are systemd units, not
+    console children, so a recorder started from SSH or at boot stops them
+    itself (its ExecStartPre), and a preview refuses to start while its
+    recorder is up. The console still stops them before starting a recorder,
+    and after IDLE_S without a live-page client. Logs: journalctl -u."""
     IDLE_S = 90
 
     def __init__(self):
-        self.lock = threading.Lock()
-        self.procs = {}
+        self.lock = threading.Lock()       # serialises start / stop / reap
         self.last_seen = time.monotonic()
         self.message = ""
         self.started = None
-        self.holding = False     # we hold LOCKS["camera"] while processes run
-        threading.Thread(target=self._reaper, daemon=True).start()
+        self.holding = False               # we hold LOCKS["camera"] while the units run
+        self._states = ({}, 0.0)
 
     def touch(self):
         self.last_seen = time.monotonic()
 
-    def status(self):
-        with self.lock:
-            procs = {n: ("running" if p.poll() is None else f"exited {p.returncode}") for n, p in self.procs.items()}
-        return {"running": any(v == "running" for v in procs.values()), "procs": procs,
+    def states(self, fresh=False):
+        """{preview unit: is-active}, cached for a second (the live page asks 4x/s per client)."""
+        st, t = self._states
+        if fresh or time.monotonic() - t > 1.0:
+            st = units_state(PREVIEW_UNITS.values())
+            self._states = (st, time.monotonic())
+        return st
+
+    def status(self, fresh=False):
+        st = self.states(fresh)
+        return {"running": any(is_busy(s) for s in st.values()), "units": st,
                 "message": self.message, "since": self.started}
 
-    def start(self):
-        if self.status()["running"]:
-            self.touch()
-            return True, "preview already running"
-        active = [u for u in RECORDERS if unit_status(u)["active"] == "active"]
-        if active:
-            return False, "recorders are running (" + ", ".join(active) + "): the live view already shows their data"
-        with self.lock:
-            self._stop_locked()
-            if not LOCKS["camera"].acquire(blocking=False):
-                return False, "the cameras are busy with a console test; wait for it to finish"
-            self.holding = True
-            LIVE_DIR.mkdir(parents=True, exist_ok=True)
-            RUN_DIR.mkdir(parents=True, exist_ok=True)
-            n = max(len(video_devices()), 1)
-            for i, cam in enumerate(CAMERAS, 1):
-                conf = read_conf(f"/etc/ewego/cam-{cam}.conf")
-                argv = [tool("ewego-cam"), "--device", conf.get("DEVICE", f"auto:{i}/{n}"),
-                        "--size", conf.get("SIZE", "1920x1080"), "--fps", conf.get("FPS", "30"),
-                        "--name", cam, "--preview", "--live", str(LIVE_DIR), "--stats", "5", "--wait", "10"]
-                self._spawn(cam, argv)
-            conf = read_conf("/etc/ewego/imu-usb.conf")
-            argv = [tool("ewego-imu-usb"), "--preview", "--live", str(LIVE_DIR),
-                    "--name", conf.get("NAME", "imu"), "--stats", "5", "--rt"] + conf.get("DEVICE_ARG", "").split()
-            self._spawn("imu", argv)
-            conf = read_conf("/etc/ewego/imu-uart.conf")
-            argv = [tool("ewego-imu-uart"), "--preview", "--live", str(LIVE_DIR),
-                    "--name", conf.get("NAME", "imu-uart"), "--port", conf.get("PORT", IMU_PORT),
-                    "--baud", conf.get("BAUD", "115200"), "--rate", conf.get("RATE", "100"), "--stats", "5", "--rt"]
-            self._spawn("imu-uart", argv)
-            if not self.procs:
-                msg = self.message
-                self._stop_locked()
-                return False, "preview could not start: " + msg
-            self.started = time.time()
-            self.message = "preview running"
-            self.touch()
-        return True, "preview started: cameras and IMU streaming to the live view, nothing recorded"
-
-    def _spawn(self, name, argv):
-        log = open(RUN_DIR / f"preview-{name}.log", "wb")
-        try:
-            self.procs[name] = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT,
-                                                start_new_session=True)
-        except OSError as e:
-            self.message = f"{argv[0]}: {e}"
-        finally:
-            log.close()
-
-    def stop(self, why="stopped"):
-        with self.lock:
-            had = self._stop_locked()
-            if had:
-                self.message = f"preview {why}"
-        return had
-
-    def _stop_locked(self):
-        """Kill what is left, forget it, give the camera lock back. Caller holds self.lock."""
-        had = False
-        for p in self.procs.values():
-            if p.poll() is None:
-                had = True
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGINT)
-                except ProcessLookupError:
-                    pass
-        for p in self.procs.values():
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                p.wait()
-        self.procs = {}
-        self.started = None
+    def _release(self):
         if self.holding:
             self.holding = False
             LOCKS["camera"].release()
+
+    def start(self):
+        with self.lock:
+            if self.status(fresh=True)["running"]:
+                self.touch()
+                return True, "preview already running"
+            busy = [u for u, s in units_state(RECORDERS).items() if is_busy(s)]
+            if busy:
+                return False, "recorders are running (" + ", ".join(busy) + "): the live view already shows their data"
+            if LOCKS["imu"].locked():
+                return False, "the UART IMU is busy with a console test; wait for it to finish"
+            if not LOCKS["camera"].acquire(blocking=False):
+                return False, "the cameras are busy with a console test; wait for it to finish"
+            self.holding = True
+            rc, out = systemctl("start", *PREVIEW_UNITS.values(), timeout=45)
+            st = self.status(fresh=True)["units"]
+            down = [n for n, u in PREVIEW_UNITS.items() if not is_busy(st.get(u))]
+            if len(down) == len(PREVIEW_UNITS):
+                self._release()
+                self.message = "preview could not start: " + (out.strip() or f"systemctl rc {rc}") + \
+                    " (journalctl -u 'ewego-preview*')"
+                return False, self.message
+            self.started = time.time()
+            self.touch()
+            self.message = "preview running" + (" without " + ", ".join(down) + " (see its journal)" if down else "")
+        return True, ("preview started: cameras and IMUs streaming to the live view, nothing recorded"
+                      + ("; not running: " + ", ".join(down) if down else ""))
+
+    def _stop_locked(self, why):
+        had = any(is_busy(s) for s in self.states(fresh=True).values())
+        if had:
+            systemctl("stop", *PREVIEW_UNITS.values(), timeout=45)
+            self.message = f"preview {why}"
+            self._states = ({}, 0.0)
+        self.started = None
+        self._release()
         return had
 
-    def _reaper(self):
-        while True:
-            time.sleep(5)
-            with self.lock:
-                running = any(p.poll() is None for p in self.procs.values())
-                stale = bool(self.procs) and not running
-            if stale:
-                self.stop("ended (see preview-*.log in the runtime directory)")
-            elif running and time.monotonic() - self.last_seen > self.IDLE_S:
-                self.stop(f"stopped after {self.IDLE_S} s without a live-view client")
+    def stop(self, why="stopped"):
+        """Stop every preview unit (synchronous: the devices are free on return)."""
+        with self.lock:
+            return self._stop_locked(why)
+
+    def reap_once(self):
+        with self.lock:
+            running = self.status(fresh=True)["running"]
+            if not running:
+                if self.started is not None:
+                    self.message = "preview ended (see journalctl -u 'ewego-preview*')"
+                self.started = None
+                self._release()
+            elif time.monotonic() - self.last_seen > self.IDLE_S:
+                self._stop_locked(f"stopped after {self.IDLE_S} s without a live-view client")
+
+    def start_reaper(self):
+        def loop():
+            while True:
+                time.sleep(5)
+                try:
+                    self.reap_once()
+                except Exception as e:      # never let the reaper die
+                    sys.stderr.write(f"preview reaper: {e}\n")
+        threading.Thread(target=loop, daemon=True).start()
 
 
 PREVIEW = Preview()
@@ -1221,9 +1232,7 @@ PREVIEW = Preview()
 
 def units_active():
     """active/inactive/failed for every unit in one systemctl call."""
-    rc, out = sh(["systemctl", "is-active"] + UNITS)
-    lines = out.split()
-    return {u: (lines[i] if i < len(lines) else out.strip()) for i, u in enumerate(UNITS)}
+    return units_state(UNITS)
 
 
 def live_json(name):
@@ -1525,10 +1534,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
-                if action != "stop" and (unit == "ewego-record.target" or unit in RECORDERS) \
-                        and PREVIEW.stop("stopped for the recorder"):
-                    time.sleep(1)   # let the preview processes release the cameras
-                rc, out = sh(["systemctl", action, unit], timeout=45)
+                if action != "stop" and (unit == "ewego-record.target" or unit in RECORDERS):
+                    # synchronous: the preview units have released the devices on return
+                    # (the recorder units also stop their preview in ExecStartPre)
+                    PREVIEW.stop("stopped for the recorder")
+                rc, out = systemctl(action, unit, timeout=45)
                 self.send_json({"rc": rc, "output": out, "status": unit_status(unit)})
             elif u.path in ("/api/preview/start", "/api/preview/stop"):
                 if u.path.endswith("start"):
@@ -1632,7 +1642,7 @@ class Handler(BaseHTTPRequestHandler):
         """Stop recording cleanly (every recorder writes its summary), flush
         the card, then power off or reboot a second after answering."""
         PREVIEW.stop("stopped for " + action)
-        rc, out = sh(["systemctl", "stop", "ewego-record.target"], timeout=90)
+        rc, out = systemctl("stop", "ewego-record.target", timeout=90)
         sh(["sync"], timeout=60)
         self.send_json({"ok": True, "action": action, "stop_rc": rc, "output": out,
                         "message": f"recorders stopped (rc {rc}), disk synced, {action} in a moment: "
@@ -1665,7 +1675,7 @@ class Handler(BaseHTTPRequestHandler):
     def journal(self, q):
         unit = q.get("unit", ["ewego-cam@camera1"])[0]
         n = min(int(q.get("n", ["100"])[0]), 2000)
-        if unit not in UNITS + ["ewego-webtest"]:
+        if unit not in UNITS + list(PREVIEW_UNITS.values()) + ["ewego-webtest"]:
             self.send_json({"error": "unknown unit"}, 404)
             return
         rc, out = sh(["journalctl", "-u", unit, "-n", str(n), "--no-pager", "-o", "short-precise"])
@@ -1792,7 +1802,7 @@ PAGE = r"""<!doctype html>
   <h2>Units</h2>
   <table><thead><tr><th>unit</th><th>active</th><th>enabled</th><th></th></tr></thead><tbody id="units"></tbody></table>
   <div class="row">
-    <select id="jr-unit"><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-imu-uart</option><option>ewego-gps</option><option>ewego-audio</option><option>ewego-fuel</option><option>ewego-record.target</option><option>ewego-webtest</option></select>
+    <select id="jr-unit"><option>ewego-cam@camera1</option><option>ewego-cam@camera2</option><option>ewego-imu-usb</option><option>ewego-imu-uart</option><option>ewego-gps</option><option>ewego-audio</option><option>ewego-fuel</option><option>ewego-record.target</option><option>ewego-preview@camera1</option><option>ewego-preview@camera2</option><option>ewego-preview-imu-usb</option><option>ewego-preview-imu-uart</option><option>ewego-webtest</option></select>
     <button onclick="journal()">Journal tail</button>
     <button onclick="listSessions()">Sessions</button>
   </div>
@@ -2386,6 +2396,7 @@ def main():
     if args.ewego_dir:
         EWEGO = Path(args.ewego_dir)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    PREVIEW.start_reaper()
     srv = ThreadingHTTPServer((args.bind, args.port), Handler)
     srv.daemon_threads = True
     print(f"ewego-webtest listening on http://{args.bind}:{args.port}  (EWEGO_DIR={EWEGO})", flush=True)

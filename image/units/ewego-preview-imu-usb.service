@@ -1,0 +1,21 @@
+[Unit]
+Description=EweGo USB IMU preview: live view only, nothing recorded
+Documentation=file:///opt/ewego/Firmware/webtest/README.md
+After=local-fs.target
+# Started and stopped by the web console. Refuses to start while the
+# recorder is up (ExecStartPre); the recorder unit stops this one before it
+# starts. No Conflicts=: it is symmetric and would let a preview stop the
+# recorder.
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/ewego/imu-usb.conf
+ExecStartPre=/bin/sh -c 'case "$$(systemctl is-active ewego-imu-usb.service)" in active|activating|reloading|deactivating|refreshing) echo "ewego-imu-usb is running: no preview" >&2; exit 1;; esac'
+ExecStart=/usr/local/bin/ewego-imu-usb --name ${NAME} $DEVICE_ARG --preview --live /run/ewego --stats 5 --rt
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=no
+RuntimeMaxSec=3600
+
+[Install]
+# none: started only by the web console, never enabled

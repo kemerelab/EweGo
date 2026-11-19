@@ -1,0 +1,203 @@
+"""Unit tests for the web console (Firmware/webtest/ewego_webtest.py).
+
+Stdlib only, no hardware: systemctl and every other command go through the
+module's sh(), which is replaced by a fake systemd; live files are fixtures
+in a temporary EWEGO_LIVE_DIR.
+
+    python3 -m unittest discover -s tests -v
+"""
+
+import importlib.util
+import json
+import os
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+_LIVE = tempfile.mkdtemp(prefix="ewego-live-")
+os.environ["EWEGO_LIVE_DIR"] = _LIVE
+os.environ.setdefault("RUNTIME_DIRECTORY", tempfile.mkdtemp(prefix="ewego-run-"))
+
+_spec = importlib.util.spec_from_file_location("ewego_webtest", ROOT / "Firmware/webtest/ewego_webtest.py")
+W = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(W)
+W.Handler.log_message = lambda self, *a: None     # keep the test output readable
+
+
+class FakeSystemd:
+    """Stands in for sh(): answers systemctl is-active/is-enabled/start/stop
+    from a dict of unit states, records every command."""
+
+    def __init__(self, states=None):
+        self.states = dict(states or {})
+        self.calls = []
+        self.start_fails = set()     # units whose start fails (ExecStartPre refusal etc.)
+
+    def __call__(self, argv, timeout=15, merge=True):
+        self.calls.append(list(argv))
+        if argv[0] == "systemctl":
+            verb, units = argv[1], argv[2:]
+            if verb == "is-active":
+                return 0, "".join(self.states.get(u, "inactive") + "\n" for u in units)
+            if verb == "is-enabled":
+                return 0, "".join("disabled\n" for _ in units)
+            if verb in ("start", "restart"):
+                rc = 0
+                for u in units:
+                    if u in self.start_fails:
+                        self.states[u] = "failed"
+                        rc = 1
+                    else:
+                        self.states[u] = "active"
+                return rc, "" if rc == 0 else "Job failed. See journalctl.\n"
+            if verb == "stop":
+                for u in units:
+                    self.states[u] = "inactive"
+                return 0, ""
+        return 0, ""
+
+    def ran(self, *prefix):
+        return [c for c in self.calls if c[:len(prefix)] == list(prefix)]
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.fake = FakeSystemd()
+        self._orig_sh = W.sh
+        W.sh = self.fake
+        W._LIVE_CACHE.clear()
+        W.PREVIEW.__init__()
+        self.live = Path(_LIVE)
+        for f in self.live.iterdir():
+            f.unlink()
+
+    def tearDown(self):
+        W.sh = self._orig_sh
+        for lock in W.LOCKS.values():
+            if lock.locked():
+                lock.release()
+
+
+class PreviewUnits(Base):
+    """R19: the preview is four systemd units driven by systemctl."""
+
+    def test_start_starts_the_four_units_and_holds_the_camera_lock(self):
+        ok, msg = W.PREVIEW.start()
+        self.assertTrue(ok, msg)
+        starts = self.fake.ran("systemctl", "start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(sorted(starts[0][2:]), sorted(W.PREVIEW_UNITS.values()))
+        self.assertTrue(W.PREVIEW.status(fresh=True)["running"])
+        self.assertTrue(W.LOCKS["camera"].locked())
+        self.assertTrue(W.PREVIEW.stop())
+        self.assertFalse(W.LOCKS["camera"].locked())
+        self.assertTrue(all(self.fake.states[u] == "inactive" for u in W.PREVIEW_UNITS.values()))
+
+    def test_refused_while_a_recorder_is_active_or_activating(self):
+        for state in ("active", "activating"):
+            self.fake.states = {"ewego-imu-uart": state}
+            ok, msg = W.PREVIEW.start()
+            self.assertFalse(ok)
+            self.assertIn("ewego-imu-uart", msg)
+            self.assertEqual(self.fake.ran("systemctl", "start"), [])
+            # the recorder was not touched
+            self.assertEqual(self.fake.ran("systemctl", "stop"), [])
+            self.assertFalse(W.LOCKS["camera"].locked())
+
+    def test_all_units_failing_reports_failure_and_releases_the_lock(self):
+        self.fake.start_fails = set(W.PREVIEW_UNITS.values())
+        ok, msg = W.PREVIEW.start()
+        self.assertFalse(ok)
+        self.assertIn("journalctl", msg)
+        self.assertFalse(W.LOCKS["camera"].locked())
+
+    def test_partial_start_names_what_is_missing(self):
+        self.fake.start_fails = {"ewego-preview-imu-usb"}
+        ok, msg = W.PREVIEW.start()
+        self.assertTrue(ok)
+        self.assertIn("imu", msg)
+
+    def test_reaper_stops_after_idle_and_notices_external_stop(self):
+        W.PREVIEW.start()
+        W.PREVIEW.last_seen -= W.Preview.IDLE_S + 1
+        W.PREVIEW.reap_once()
+        self.assertFalse(W.PREVIEW.status(fresh=True)["running"])
+        self.assertIn("without a live-view client", W.PREVIEW.message)
+        self.assertFalse(W.LOCKS["camera"].locked())
+        # stopped behind the console's back (a recorder's ExecStartPre)
+        W.PREVIEW.start()
+        for u in W.PREVIEW_UNITS.values():
+            self.fake.states[u] = "inactive"
+        W.PREVIEW.reap_once()
+        self.assertFalse(W.LOCKS["camera"].locked())
+        self.assertIn("ended", W.PREVIEW.message)
+
+    def test_recorder_start_stops_preview_first(self):
+        W.PREVIEW.start()
+        self.fake.calls.clear()
+        h = make_handler("POST", "/api/unit/ewego-record.target/start")
+        h.do_POST()
+        stops = [i for i, c in enumerate(self.fake.calls) if c[:2] == ["systemctl", "stop"]]
+        start = [i for i, c in enumerate(self.fake.calls) if c == ["systemctl", "start", "ewego-record.target"]]
+        self.assertTrue(stops and start and stops[0] < start[0], self.fake.calls)
+
+    def test_preview_units_ship_with_asymmetric_exclusion(self):
+        for name, rec in (("ewego-preview@.service", "ewego-cam@%i.service"),
+                          ("ewego-preview-imu-usb.service", "ewego-imu-usb.service"),
+                          ("ewego-preview-imu-uart.service", "ewego-imu-uart.service")):
+            txt = (ROOT / "image/units" / name).read_text()
+            self.assertNotIn("\nConflicts=", txt, name)
+            self.assertIn("ExecStartPre=", txt, name)
+            self.assertIn(rec, txt, name)
+            self.assertIn("--preview", txt, name)
+            self.assertIn("RuntimeMaxSec=", txt, name)
+            self.assertIn("[Install]", txt, name)
+
+
+# ---------------------------------------------------------------------------
+# a Handler without a socket: enough to call do_GET/do_POST and read the reply
+# ---------------------------------------------------------------------------
+
+class _Sock:
+    def __init__(self):
+        self.closed = False
+
+    def settimeout(self, t):
+        pass
+
+
+def make_handler(method, path, headers=None):
+    import email.message
+    import io
+    h = W.Handler.__new__(W.Handler)
+    h.command, h.path, h.request_version = method, path, "HTTP/1.1"
+    h.requestline = f"{method} {path} HTTP/1.1"
+    h.client_address = ("127.0.0.1", 1)
+    h.server = None
+    h.connection = _Sock()
+    msg = email.message.Message()
+    for k, v in (headers or {}).items():
+        msg[k] = v
+    h.headers = msg
+    h.wfile = io.BytesIO()
+    h.rfile = io.BytesIO()
+    h.close_connection = True
+    return h
+
+
+def reply(h):
+    """(status code, json or text body) of what the handler wrote."""
+    raw = h.wfile.getvalue()
+    head, _, body = raw.partition(b"\r\n\r\n")
+    code = int(head.split(b" ", 2)[1])
+    try:
+        return code, json.loads(body)
+    except ValueError:
+        return code, body.decode(errors="replace")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,26 @@
+[Unit]
+Description=EweGo camera preview (%i): live view only, nothing recorded
+Documentation=file:///opt/ewego/Firmware/webtest/README.md
+After=local-fs.target
+# Started and stopped by the web console (Preview on the /live page). Never
+# runs alongside the recorder: the console checks first, the ExecStartPre
+# below refuses while ewego-cam@%i is up (also while it is activating, e.g.
+# waiting to restart), and the recorder unit stops this one before it
+# starts. Conflicts= is not used on purpose: it is symmetric, so starting a
+# preview would stop a running recorder.
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ewego/cam-%i.conf
+ExecStartPre=/bin/sh -c 'case "$$(systemctl is-active ewego-cam@%i.service)" in active|activating|reloading|deactivating|refreshing) echo "ewego-cam@%i is running: no preview" >&2; exit 1;; esac'
+ExecStart=/usr/local/bin/ewego-cam --device ${DEVICE} --size ${SIZE} --fps ${FPS} --name %i --preview --live /run/ewego --stats 5 --wait 10
+# ewego-cam stops the stream and removes its live files on SIGINT
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=no
+# backstop if the console dies with a preview running (the console itself
+# stops previews after 90 s without a live-view client)
+RuntimeMaxSec=3600
+
+[Install]
+# none: started only by the web console, never enabled

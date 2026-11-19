@@ -73,9 +73,14 @@ class Base(unittest.TestCase):
         self.live = Path(_LIVE)
         for f in self.live.iterdir():
             f.unlink()
+        self._tmp = tempfile.TemporaryDirectory(prefix="ewego-root-")
+        self._orig_ewego = W.EWEGO
+        W.EWEGO = Path(self._tmp.name)
 
     def tearDown(self):
         W.sh = self._orig_sh
+        W.EWEGO = self._orig_ewego
+        self._tmp.cleanup()
         for lock in W.LOCKS.values():
             if lock.locked():
                 lock.release()
@@ -278,6 +283,92 @@ class PostHeader(Base):
                 self.assertIn("headers:", m.group(0))
             for m in re.finditer(r"fetch\('/api/run/[^;]*", page):
                 self.assertIn("headers:", m.group(0))
+
+
+ALL_UP = {"ewego-record.target": "active", "ewego-cam@camera1": "active", "ewego-cam@camera2": "active",
+          "ewego-imu-usb": "active", "ewego-imu-uart": "active"}
+
+
+class Badge(Base):
+    """R22: RECORDING means every recorder is active with fresh live JSON
+    and no writer_error."""
+
+    def write_live(self, name, age=0.2, **extra):
+        p = self.live / f"{name}.json"
+        p.write_text(json.dumps(dict({"preview": 0}, **extra)))
+        t = time.time() - age
+        os.utime(p, (t, t))
+
+    def all_fresh(self):
+        for n in ("camera1", "camera2", "imu", "imu-uart"):
+            self.write_live(n)
+
+    def snap(self):
+        W._LIVE_CACHE.clear()
+        return W.live_snapshot()
+
+    def test_all_healthy_is_recording(self):
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        s = self.snap()
+        self.assertTrue(s["recording"])
+        self.assertTrue(s["recording_ok"])
+        self.assertEqual(s["recording_label"], "RECORDING")
+        self.assertTrue(all(r["ok"] for r in s["recorders"].values()))
+        json.dumps(s)    # the SSE stream serialises it
+
+    def test_idle(self):
+        s = self.snap()
+        self.assertFalse(s["recording"])
+        self.assertEqual(s["recording_label"], "IDLE")
+
+    def test_failed_member_while_target_active(self):
+        self.fake.states = dict(ALL_UP, **{"ewego-cam@camera2": "failed"})
+        self.all_fresh()
+        s = self.snap()
+        self.assertTrue(s["recording"])
+        self.assertFalse(s["recording_ok"])
+        self.assertEqual(s["recording_label"], "RECORDING (camera2 down)")
+        self.assertEqual(s["recorders"]["camera2"]["problem"], "failed")
+
+    def test_stale_live_json(self):
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        self.write_live("imu-uart", age=5)
+        s = self.snap()
+        self.assertEqual(s["recording_label"], "RECORDING (imu-uart down)")
+        self.assertIn("old", s["recorders"]["imu-uart"]["problem"])
+
+    def test_missing_live_json(self):
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        (self.live / "imu.json").unlink()
+        s = self.snap()
+        self.assertEqual(s["recording_label"], "RECORDING (imu-usb down)")
+
+    def test_writer_error(self):
+        self.fake.states = dict(ALL_UP)
+        self.all_fresh()
+        self.write_live("camera1", writer_error="ENOSPC")
+        self.write_live("camera2", writer_error=None)     # present but null: fine
+        s = self.snap()
+        self.assertEqual(s["recording_label"], "RECORDING (camera1 down)")
+        self.assertIn("ENOSPC", s["recorders"]["camera1"]["problem"])
+        self.assertTrue(s["recorders"]["camera2"]["ok"])
+
+    def test_activating_reads_starting_and_several_listed(self):
+        self.fake.states = dict(ALL_UP, **{"ewego-imu-uart": "activating", "ewego-cam@camera1": "inactive"})
+        self.all_fresh()
+        s = self.snap()
+        self.assertFalse(s["recording_ok"])
+        self.assertEqual(s["recording_label"], "RECORDING (camera1 down, imu-uart starting)")
+
+    def test_single_recorder_without_target(self):
+        self.fake.states = {"ewego-imu-usb": "active"}
+        self.write_live("imu")
+        s = self.snap()
+        self.assertTrue(s["recording"])
+        self.assertFalse(s["recording_ok"])
 
 
 # ---------------------------------------------------------------------------

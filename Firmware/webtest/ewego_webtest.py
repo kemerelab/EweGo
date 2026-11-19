@@ -1306,6 +1306,51 @@ def live_json(name):
     return d
 
 
+# recorder unit -> (name on the badge, its live file in LIVE_DIR)
+RECORDER_LIVE = {"ewego-cam@camera1": ("camera1", "camera1"), "ewego-cam@camera2": ("camera2", "camera2"),
+                 "ewego-imu-usb": ("imu-usb", "imu"), "ewego-imu-uart": ("imu-uart", "imu-uart")}
+LIVE_FRESH_S = 2.0   # cameras rewrite their JSON once a second, the IMUs ten times
+
+
+def recorder_health(units, lives):
+    """Per recorder: is it really recording? The target uses Wants=, so it
+    stays active while members fail; a unit can be active while its writer
+    has given up. units: {unit: is-active}; lives: {live name: live_json()}.
+    A missing writer_error key (older recorders) counts as no error."""
+    out = {}
+    for unit, (short, live) in RECORDER_LIVE.items():
+        state = units.get(unit, "unknown")
+        d = lives.get(live)
+        if state != "active":
+            problem = "starting" if state in ("activating", "reloading") else state
+        elif not d:
+            problem = "no live data"
+        elif d.get("writer_error"):
+            problem = f"writer error: {d['writer_error']}"
+        elif d.get("age_s") is None or d["age_s"] >= LIVE_FRESH_S:
+            problem = f"live data {d.get('age_s')} s old"
+        elif d.get("preview"):
+            problem = "live data is from a preview, not the recorder"
+        else:
+            problem = None
+        out[short] = {"unit": unit, "state": state, "ok": problem is None, "problem": problem,
+                      "live_age_s": d.get("age_s") if d else None}
+    return out
+
+
+def recording_summary(units, health):
+    """(recording, recording_ok, label) for the live page's badge. RECORDING
+    only when every recorder is healthy; otherwise which ones are not."""
+    recording = is_busy(units.get("ewego-record.target")) or any(is_busy(h["state"]) for h in health.values())
+    if not recording:
+        return False, False, "IDLE"
+    bad = [f"{n} {'starting' if h['problem'] == 'starting' else 'down'}"
+           for n, h in health.items() if not h["ok"]]
+    if not bad:
+        return True, True, "RECORDING"
+    return True, False, "RECORDING (" + ", ".join(bad) + ")"
+
+
 def live_frame_info(name):
     try:
         st = (LIVE_DIR / f"{name}.jpg").stat()
@@ -1416,15 +1461,22 @@ def live_snapshot():
     cams = {}
     for cam in CAMERAS:
         cams[cam] = {"stats": live_json(cam), "frame": live_frame_info(cam)}
+    imu, imu_uart = live_json("imu"), live_json("imu-uart")
+    health = recorder_health(units, {"camera1": cams["camera1"]["stats"], "camera2": cams["camera2"]["stats"],
+                                     "imu": imu, "imu-uart": imu_uart})
+    recording, recording_ok, label = recording_summary(units, health)
     return {
         "t": time.time(),
         "hostname": socket.gethostname(),
         "units": units,
-        "recording": units.get("ewego-record.target") == "active",
+        "recording": recording,            # anything recording (target or a recorder up)
+        "recording_ok": recording_ok,      # every recorder active, live data fresh, no writer error
+        "recording_label": label,          # "RECORDING", "RECORDING (camera2 down)", "IDLE"
+        "recorders": health,               # per recorder: unit, state, ok, problem, live_age_s
         "preview": PREVIEW.status(),
         "cam": cams,
-        "imu": live_json("imu"),
-        "imu_uart": live_json("imu-uart"),
+        "imu": imu,
+        "imu_uart": imu_uart,
         "gps": cached("gps", 1.0, gps_live),
         "pps": cached("pps", 1.0, pps_status),
         "battery": cached("battery", 2.0, battery),
@@ -2171,6 +2223,7 @@ LIVE_PAGE = r"""<!doctype html>
   header span { color:var(--muted); font-size:13px; }
   .badge { font-weight:700; font-size:12px; padding:2px 8px; border-radius:3px; color:#fff; background:var(--muted); }
   .badge.rec { background:var(--bad); } .badge.pre { background:var(--ok); }
+  .badge.down { background:transparent; color:var(--bad); box-shadow:inset 0 0 0 2px var(--bad); }
   .ok { color:var(--ok); font-weight:600; } .bad { color:var(--bad); font-weight:600; } .warn { color:var(--warn); font-weight:600; }
   .bar { padding:8px 16px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; border-bottom:1px solid var(--line); }
   /* two columns: a camera each on top, an IMU each below, so both pictures and
@@ -2274,6 +2327,7 @@ LIVE_PAGE = r"""<!doctype html>
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'})[c]);
 const fmtDur = s => { s = Math.round(s||0); return s >= 3600 ? Math.floor(s/3600)+'h'+String(Math.floor(s%3600/60)).padStart(2,'0')+'m' : Math.floor(s/60)+'m'+String(s%60).padStart(2,'0')+'s'; };
 const SERIES = [getComputedStyle(document.documentElement).getPropertyValue('--s1').trim(),
                 getComputedStyle(document.documentElement).getPropertyValue('--s2').trim(),
@@ -2438,8 +2492,11 @@ let lastSnap = 0;
 function update(s) {
   lastSnap = Date.now();
   $('host').textContent = 'EweGo live · ' + s.hostname;
-  const st = $('state'); st.className = 'badge ' + (s.recording ? 'rec' : s.preview.running ? 'pre' : '');
-  st.textContent = s.recording ? 'RECORDING' : s.preview.running ? 'PREVIEW' : 'IDLE';
+  // RECORDING only when every recorder is up with fresh live data; otherwise
+  // the server's label names the ones that are down (red outline badge)
+  const st = $('state'); st.className = 'badge ' + (s.recording ? (s.recording_ok ? 'rec' : 'down') : s.preview.running ? 'pre' : '');
+  st.textContent = s.recording ? s.recording_label : s.preview.running ? 'PREVIEW' : 'IDLE';
+  const recs = Object.entries(s.recorders).map(([n, r]) => '<span class="' + (r.ok ? 'ok' : 'bad') + '">' + n + (r.ok ? '' : ': ' + esc(r.problem)) + '</span>').join(' · ');
   $('pv').textContent = s.preview.running ? 'Stop preview' : 'Preview (no recording)'; $('pv').classList.toggle('on', s.preview.running);
   $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>' : 'battery ' + s.battery.voltage + ' V · <span class="' + (s.battery.soc < 15 ? 'bad' : s.battery.soc < 30 ? 'warn' : '') + '">' + s.battery.soc.toFixed(0) + ' %</span>';
   $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
@@ -2448,7 +2505,7 @@ function update(s) {
   for (const n in cams) camLine(n, s.cam[n]);
   imus.imu.handle(s.imu); imus.imu_uart.handle(s.imu_uart);
   gpsBlock(s.gps, s.pps);
-  $('sys').innerHTML = '<b>preview</b><span>' + (s.preview.message || 'off') + '</span><b>clock</b><span>' + new Date(s.t * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC</span>';
+  $('sys').innerHTML = (s.recording ? '<b>recorders</b><span>' + recs + '</span>' : '') + '<b>preview</b><span>' + esc(s.preview.message || 'off') + '</span><b>clock</b><span>' + new Date(s.t * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC</span>';
   $('units').innerHTML = Object.entries(s.units).map(([u, a]) => '<tr><td style="padding:2px 8px 2px 0">' + u + '</td><td class="' + (a === 'active' ? 'ok' : a === 'failed' ? 'bad' : '') + '">' + a + '</td></tr>').join('');
 }
 function connect() {

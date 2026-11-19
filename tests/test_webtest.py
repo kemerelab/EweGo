@@ -138,7 +138,7 @@ class PreviewUnits(Base):
     def test_recorder_start_stops_preview_first(self):
         W.PREVIEW.start()
         self.fake.calls.clear()
-        h = make_handler("POST", "/api/unit/ewego-record.target/start")
+        h = make_handler("POST", "/api/unit/ewego-record.target/start", {"X-EweGo": "1"})
         h.do_POST()
         stops = [i for i, c in enumerate(self.fake.calls) if c[:2] == ["systemctl", "stop"]]
         start = [i for i, c in enumerate(self.fake.calls) if c == ["systemctl", "start", "ewego-record.target"]]
@@ -232,6 +232,52 @@ class BusyRefusal(Base):
         import errno
         msg = W.serial_open_error("/dev/ttyAMA5", OSError(errno.EBUSY, "Device or resource busy"))
         self.assertIn("owned by the recorder", msg)
+
+
+class PostHeader(Base):
+    """R21: POSTs (and /api/run tests) need X-EweGo: 1."""
+
+    POSTS = ["/api/unit/ewego-record.target/start", "/api/unit/ewego-gps/stop",
+             "/api/preview/start", "/api/preview/stop", "/api/power/poweroff",
+             "/api/power/reboot", "/api/bridge/start", "/api/bridge/stop", "/api/nothing"]
+
+    def test_post_without_header_is_403_and_does_nothing(self):
+        for path in self.POSTS:
+            for hdr in ({}, {"X-EweGo": "0"}, {"Origin": "http://evil.example"}):
+                h = make_handler("POST", path, hdr)
+                h.do_POST()
+                code, body = reply(h)
+                self.assertEqual(code, 403, (path, hdr))
+                self.assertIn("X-EweGo", body["error"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_post_with_header_is_handled(self):
+        h = make_handler("POST", "/api/unit/ewego-gps/start", {"X-EweGo": "1"})
+        h.do_POST()
+        code, body = reply(h)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["status"]["active"], "active")
+        self.assertTrue(self.fake.ran("systemctl", "start", "ewego-gps"))
+        h = make_handler("POST", "/api/preview/stop", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(reply(h)[0], 200)
+
+    def test_run_needs_header_status_does_not(self):
+        h = make_handler("GET", "/api/run/uvc-quirk?on=1")
+        h.do_GET()
+        self.assertEqual(reply(h)[0], 403)
+        self.assertEqual(self.fake.calls, [])
+        h = make_handler("GET", "/api/sessions")
+        h.do_GET()
+        self.assertEqual(reply(h)[0], 200)
+
+    def test_every_page_post_sends_the_header(self):
+        import re
+        for page in (W.PAGE, W.LIVE_PAGE):
+            for m in re.finditer(r"fetch\([^;]*method: 'POST'[^;]*", page):
+                self.assertIn("headers:", m.group(0))
+            for m in re.finditer(r"fetch\('/api/run/[^;]*", page):
+                self.assertIn("headers:", m.group(0))
 
 
 # ---------------------------------------------------------------------------

@@ -1569,7 +1569,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/sessions":
                 self.send_json(sessions())
             elif path.startswith("/api/run/"):
-                self.run_test(path[len("/api/run/"):], q)
+                if self.has_token():
+                    self.run_test(path[len("/api/run/"):], q)
             elif path == "/api/journal":
                 self.journal(q)
             elif path == "/api/snapshot":
@@ -1587,7 +1588,23 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def has_token(self):
+        """Every POST, and every /api/run/ test (some change state: modprobe,
+        max_payload, recordings), must carry X-EweGo: 1. A cross-site page
+        can only send simple requests without a preflight, and those cannot
+        set custom headers; the preflight is never answered."""
+        if self.headers.get("X-EweGo") == "1":
+            return True
+        try:
+            self.send_json({"error": "forbidden: request lacks the X-EweGo: 1 header "
+                                     "(the console's own pages send it)"}, 403)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_POST(self):
+        if not self.has_token():
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         m = re.fullmatch(r"/api/unit/([a-z0-9@.-]+)/(start|stop|restart)", u.path)
@@ -2004,6 +2021,7 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const val = id => $(id).value;
+const TOKEN = {'X-EweGo': '1'};   // required on POSTs and tests: cross-site pages cannot send it
 const fmtUp = s => s == null ? '' : (s < 3600 ? Math.round(s/60)+' min' : (s/3600).toFixed(1)+' h');
 
 async function refresh() {
@@ -2049,7 +2067,7 @@ async function refresh() {
 
 async function run(name, paneId, extra) {
   const pane = $(paneId); pane.textContent = '…\n';
-  const r = await fetch('/api/run/' + name + '?t=' + Date.now() + (extra || ''));
+  const r = await fetch('/api/run/' + name + '?t=' + Date.now() + (extra || ''), {headers: TOKEN});
   if (!r.ok) { pane.textContent = 'HTTP ' + r.status + ': ' + await r.text(); return; }
   pane.textContent = '';
   const reader = r.body.getReader(); const dec = new TextDecoder();
@@ -2058,13 +2076,13 @@ async function run(name, paneId, extra) {
 }
 
 async function unit(name, action) {
-  const r = await (await fetch('/api/unit/' + name + '/' + action, {method: 'POST'})).json();
+  const r = await (await fetch('/api/unit/' + name + '/' + action, {method: 'POST', headers: TOKEN})).json();
   $('out-units').textContent = 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output + '\n' + JSON.stringify(r.status);
   refresh();
 }
 
 async function bridge(action) {
-  const r = await (await fetch('/api/bridge/' + action + '?port=' + val('br-port') + '&baud=' + val('br-baud'), {method: 'POST'})).json();
+  const r = await (await fetch('/api/bridge/' + action + '?port=' + val('br-port') + '&baud=' + val('br-baud'), {method: 'POST', headers: TOKEN})).json();
   $('out-gps').textContent = r.message + (r.ok && action === 'start'
     ? '\n\nIn PyGPSClient: Settings -> connection "Socket", host ' + location.hostname + ', port ' + val('br-port') + ', protocol TCP client, then Connect.\n'
       + 'The bridge is two-way, so PyGPSClient can also send UBX configuration to the module.\nStop the bridge before starting the GPS logger unit.'
@@ -2075,7 +2093,7 @@ async function bridge(action) {
 async function power(action) {
   if (!confirm((action === 'poweroff' ? 'Shut down' : 'Reboot') + ' the wearable? Recording stops first.')) return;
   $('out-rec').textContent = 'stopping recorders…';
-  const r = await (await fetch('/api/power/' + action, {method: 'POST'})).json();
+  const r = await (await fetch('/api/power/' + action, {method: 'POST', headers: TOKEN})).json();
   $('out-rec').textContent = r.message + '\n' + (r.output || '');
 }
 
@@ -2441,7 +2459,8 @@ function connect() {
 setInterval(() => { if (Date.now() - lastSnap > 5000) { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; } }, 2000);
 
 // ---- controls ----
-async function post(url) { const r = await fetch(url, {method: 'POST'}); return r.json(); }
+// X-EweGo: 1 is required on every POST: cross-site pages cannot send it
+async function post(url) { const r = await fetch(url, {method: 'POST', headers: {'X-EweGo': '1'}}); return r.json(); }
 async function preview() {
   const on = $('pv').classList.contains('on');
   const r = await post('/api/preview/' + (on ? 'stop' : 'start'));

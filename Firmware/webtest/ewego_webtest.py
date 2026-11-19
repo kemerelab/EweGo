@@ -19,6 +19,7 @@ on networks you control.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -239,6 +240,58 @@ def unit_busy(unit):
     return is_busy(units_state([unit])[unit])
 
 
+# Which units own the device behind each console lock. A device test, the
+# serial bridge and the camera views refuse while any of these is busy.
+DEVICE_UNITS = {
+    "camera": ["ewego-cam@camera1", "ewego-cam@camera2", "ewego-preview@camera1", "ewego-preview@camera2"],
+    "imu": ["ewego-imu-uart", "ewego-preview-imu-uart"],
+    "gps": ["ewego-gps"],
+    "audio": ["ewego-audio"],
+}
+# The other direction: starting one of these units needs these console locks free.
+UNIT_DEVICES = {
+    "ewego-cam@camera1": ["camera"], "ewego-cam@camera2": ["camera"],
+    "ewego-imu-uart": ["imu"], "ewego-gps": ["gps"], "ewego-audio": ["audio"],
+    "ewego-record.target": ["camera", "imu", "gps", "audio"],
+}
+
+
+def device_owners(device):
+    """Units in a busy state that own `device` (a LOCKS key): [(unit, state)]."""
+    st = units_state(DEVICE_UNITS.get(device, []))
+    return [(u, s) for u, s in st.items() if is_busy(s)]
+
+
+def owners_message(device, owners):
+    return (f"{device}: owned by " + ", ".join(f"{u} ({s})" for u, s in owners)
+            + "; stop it first (the live view shows a running recorder's data)")
+
+
+def console_holds(devices):
+    """Why the console itself is using any of `devices` (LOCKS keys), as
+    messages; empty when they are free. The preview's camera lock does not
+    count: starting a recorder stops the preview."""
+    why = []
+    for d in devices:
+        if not LOCKS[d].locked():
+            continue
+        if d == "camera" and PREVIEW.holding:
+            continue
+        if d == "gps" and BRIDGE.status()["running"]:
+            why.append("the GPS serial bridge holds the port; stop the bridge first")
+        else:
+            why.append(f"a console {d} test is running; wait for it to finish")
+    return why
+
+
+def serial_open_error(dev, e):
+    """Readable reason a console open of a serial port failed. The C
+    recorders hold their tty with TIOCEXCL, so EBUSY means a recorder has it."""
+    if getattr(e, "errno", None) == errno.EBUSY:
+        return f"{dev}: port owned by the recorder (EBUSY); stop it first"
+    return f"open {dev}: {e}"
+
+
 def unit_status(unit):
     return {"unit": unit, "active": units_state([unit])[unit],
             "enabled": units_state([unit], "is-enabled")[unit]}
@@ -316,7 +369,7 @@ class SerialBridge:
                 fd = open_serial_raw(dev, baud, writable=True)
             except (OSError, AttributeError) as e:
                 LOCKS["gps"].release()
-                return False, f"open {dev}: {e}"
+                return False, serial_open_error(dev, e)
             try:
                 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -466,8 +519,14 @@ def test_fuel(write, q):
 
 def test_imu(write, q):
     secs = int(q.get("seconds", ["10"])[0])
-    if unit_status("ewego-imu-uart")["active"] == "active" or PREVIEW.status()["running"]:
-        write(b"ewego-imu-uart (the recorder) or the live-view preview owns the port; stop it first.\n")
+    owners = device_owners("imu")
+    if owners:
+        write((owners_message("imu", owners) + "\n").encode())
+        return
+    try:      # a quick open first, so a recorder holding the tty gives a clear message
+        os.close(os.open(IMU_PORT, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK))
+    except OSError as e:
+        write((serial_open_error(IMU_PORT, e) + "\n").encode())
         return
     cwd = RUN_DIR / "imu"
     cwd.mkdir(parents=True, exist_ok=True)
@@ -480,14 +539,15 @@ def test_imu(write, q):
 def test_gps_raw(write, q):
     secs = int(q.get("seconds", ["3"])[0])
     baud = int(q.get("baud", [str(GPS_BAUD)])[0])
-    if unit_status("ewego-gps")["active"] == "active":
-        write(b"ewego-gps is running and owns the port. Stop it first, or read its journal instead.\n")
+    owners = device_owners("gps")
+    if owners:
+        write((owners_message("gps", owners) + " Or read its journal instead.\n").encode())
         return
     write(f"Reading {GPS_PORT} at {baud} baud for {secs}s ...\n".encode())
     try:
         fd = open_serial_raw(GPS_PORT, baud)
     except (OSError, AttributeError) as e:
-        write(f"open failed: {e}\n".encode())
+        write((serial_open_error(GPS_PORT, e) + "\n").encode())
         return
     data = bytearray()
     end = time.monotonic() + secs
@@ -1534,6 +1594,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if m and m.group(1) in UNITS:
                 unit, action = m.group(1), m.group(2)
+                held = console_holds(UNIT_DEVICES.get(unit, [])) if action != "stop" else []
+                if held:
+                    msg = f"not starting {unit}: " + "; ".join(held)
+                    self.send_json({"ok": False, "rc": None, "output": msg, "message": msg,
+                                    "status": unit_status(unit)}, 409)
+                    return
                 if action != "stop" and (unit == "ewego-record.target" or unit in RECORDERS):
                     # synchronous: the preview units have released the devices on return
                     # (the recorder units also stop their preview in ExecStartPre)
@@ -1549,8 +1615,10 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path in ("/api/power/poweroff", "/api/power/reboot"):
                 self.power(u.path.rsplit("/", 1)[1])
             elif u.path == "/api/bridge/start":
-                if unit_status("ewego-gps")["active"] == "active":
-                    self.send_json({"ok": False, "message": "ewego-gps is running and owns the port; stop it first"})
+                owners = device_owners("gps")
+                if owners:
+                    self.send_json({"ok": False, "message": owners_message("gps", owners),
+                                    "status": BRIDGE.status()}, 409)
                     return
                 dev = q.get("dev", [GPS_PORT])[0]
                 baud = int(q.get("baud", [str(GPS_BAUD)])[0])
@@ -1654,6 +1722,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": f"unknown test {name}"}, 404)
             return
         fn, lock_name = TESTS[name]
+        owners = device_owners(lock_name) if lock_name else []
+        if owners:
+            self.send_json({"error": owners_message(lock_name, owners)}, 409)
+            return
         lock = LOCKS.get(lock_name)
         if lock and not lock.acquire(blocking=False):
             self.send_json({"error": f"{lock_name} is busy with another test"}, 409)
@@ -1684,6 +1756,10 @@ class Handler(BaseHTTPRequestHandler):
     def snapshot(self, q):
         dev = q.get("dev", ["/dev/video0"])[0]
         w, h = q.get("w", ["1280"])[0], q.get("h", ["720"])[0]
+        owners = device_owners("camera")
+        if owners:
+            self.send_json({"error": owners_message("camera", owners)}, 409)
+            return
         if not LOCKS["camera"].acquire(blocking=False):
             self.send_json({"error": "camera is busy (streaming?)"}, 409)
             return
@@ -1700,6 +1776,10 @@ class Handler(BaseHTTPRequestHandler):
         dev = q.get("dev", ["/dev/video0"])[0]
         w, h = q.get("w", ["1280"])[0], q.get("h", ["720"])[0]
         fps = q.get("fps", ["15"])[0]
+        owners = device_owners("camera")
+        if owners:
+            self.send_json({"error": owners_message("camera", owners)}, 409)
+            return
         if not LOCKS["camera"].acquire(blocking=False):
             self.send_json({"error": "camera is busy"}, 409)
             return

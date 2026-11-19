@@ -157,6 +157,83 @@ class PreviewUnits(Base):
             self.assertIn("[Install]", txt, name)
 
 
+class BusyRefusal(Base):
+    """R20: tests and the bridge refuse while a unit owns the device; unit
+    start refuses while a console test or the bridge holds it."""
+
+    def run_test(self, name, qs=""):
+        h = make_handler("GET", f"/api/run/{name}?seconds=1{qs}", {"X-EweGo": "1"})
+        h.do_GET()
+        return reply(h)
+
+    def test_device_tests_refused_in_every_busy_state(self):
+        for test, unit in (("imu", "ewego-imu-uart"), ("imu", "ewego-preview-imu-uart"),
+                           ("gps-raw", "ewego-gps"), ("dualcam", "ewego-cam@camera2"),
+                           ("camrec", "ewego-preview@camera1"), ("audio", "ewego-audio")):
+            for state in ("active", "activating", "reloading", "deactivating"):
+                self.fake.states = {unit: state}
+                code, body = self.run_test(test)
+                self.assertEqual(code, 409, (test, unit, state, body))
+                self.assertIn(unit, body["error"])
+                self.assertIn(state, body["error"])
+                self.assertFalse(any(l.locked() for l in W.LOCKS.values()))
+
+    def test_failed_unit_does_not_block(self):
+        self.fake.states = {"ewego-gps": "failed"}
+        self.assertEqual(W.device_owners("gps"), [])
+
+    def test_bridge_refused_while_gps_logger_activating(self):
+        self.fake.states = {"ewego-gps": "activating"}
+        h = make_handler("POST", "/api/bridge/start", {"X-EweGo": "1"})
+        h.do_POST()
+        code, body = reply(h)
+        self.assertEqual(code, 409)
+        self.assertFalse(body["ok"])
+        self.assertIn("ewego-gps", body["message"])
+
+    def test_unit_start_refused_while_a_test_holds_the_device(self):
+        W.LOCKS["imu"].acquire()
+        for unit in ("ewego-imu-uart", "ewego-record.target"):
+            h = make_handler("POST", f"/api/unit/{unit}/start", {"X-EweGo": "1"})
+            h.do_POST()
+            code, body = reply(h)
+            self.assertEqual(code, 409, unit)
+            self.assertIn("imu test", body["message"])
+        self.assertEqual(self.fake.ran("systemctl", "start"), [])
+        # stopping is always allowed, and other units are not affected
+        h = make_handler("POST", "/api/unit/ewego-imu-uart/stop", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(reply(h)[0], 200)
+        h = make_handler("POST", "/api/unit/ewego-fuel/start", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(reply(h)[0], 200)
+
+    def test_unit_start_refused_while_bridge_holds_gps(self):
+        W.LOCKS["gps"].acquire()
+        orig = W.BRIDGE.status
+        W.BRIDGE.status = lambda: {"running": True}
+        try:
+            h = make_handler("POST", "/api/unit/ewego-gps/start", {"X-EweGo": "1"})
+            h.do_POST()
+            code, body = reply(h)
+        finally:
+            W.BRIDGE.status = orig
+        self.assertEqual(code, 409)
+        self.assertIn("bridge", body["message"])
+
+    def test_preview_camera_lock_does_not_block_recording(self):
+        W.PREVIEW.start()
+        h = make_handler("POST", "/api/unit/ewego-record.target/start", {"X-EweGo": "1"})
+        h.do_POST()
+        self.assertEqual(reply(h)[0], 200)
+        self.assertFalse(W.LOCKS["camera"].locked())
+
+    def test_ebusy_reads_as_owned_by_the_recorder(self):
+        import errno
+        msg = W.serial_open_error("/dev/ttyAMA5", OSError(errno.EBUSY, "Device or resource busy"))
+        self.assertIn("owned by the recorder", msg)
+
+
 # ---------------------------------------------------------------------------
 # a Handler without a socket: enough to call do_GET/do_POST and read the reply
 # ---------------------------------------------------------------------------

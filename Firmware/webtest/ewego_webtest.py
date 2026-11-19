@@ -46,6 +46,8 @@ GPS_BAUD = 460800
 IMU_PORT = "/dev/ttyAMA5"
 FUEL_BUS = 1
 FUEL_ADDR = 0x36
+FUEL_LOG_STALE_S = 30
+CONF_DIR = Path(os.environ.get("EWEGO_CONF_DIR", "/etc/ewego"))
 SERIAL_PORTS = {"gps": GPS_PORT, "imu": IMU_PORT}
 
 # One test per device at a time, so a stray IMU test cannot fight the
@@ -88,7 +90,45 @@ def clock_status():
     return {"synchronized": synced, "utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())}
 
 
-def battery():
+def battery_from_log():
+    """Newest reading in the fuel logger's CSV (<OUT_DIR>/<stamp>/fuel_gauge.csv,
+    columns Timestamp, Datetime, Elapsed_Seconds, Voltage_V, SOC_Percent,
+    Alert; failed reads are ERROR rows), or None."""
+    out_dir = Path(read_conf(CONF_DIR / "fuel.conf").get("OUT_DIR") or EWEGO / "recordings" / "fuel")
+    try:
+        csvs = sorted(out_dir.glob("*/fuel_gauge.csv"), key=lambda p: p.stat().st_mtime)
+        if not csvs:
+            return None
+        p = csvs[-1]
+        with p.open("rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        parts = line.strip().split(",")
+        if len(parts) < 5:
+            continue
+        try:
+            ts, v, soc = float(parts[0]), float(parts[3]), float(parts[4])
+        except ValueError:
+            continue          # header, ERROR row, or a line cut by the 4 kB window
+        age = round(time.time() - ts, 1)
+        return {"voltage": round(v, 3), "soc": round(soc, 2), "source": f"fuel log {p.parent.name}",
+                "age_s": age, "stale": age > FUEL_LOG_STALE_S}
+    return None
+
+
+def battery(fuel_state=None):
+    """Voltage and SOC. While ewego-fuel runs it owns the gauge: read its CSV
+    instead of opening the I2C bus; otherwise read the MAX17048 directly.
+    fuel_state: ewego-fuel's is-active if the caller already has it."""
+    if fuel_state is None:
+        fuel_state = units_state(["ewego-fuel"])["ewego-fuel"]
+    if fuel_state == "active":
+        b = battery_from_log()
+        return b if b else {"error": "ewego-fuel is running but has logged no reading yet"}
     try:
         import smbus2  # apt: python3-smbus2, present on the image
     except ImportError:
@@ -310,6 +350,8 @@ def status():
     rc, ips = sh(["hostname", "-I"])
     devs = {p: os.path.exists(p) for p in (GPS_PORT, IMU_PORT, f"/dev/i2c-{FUEL_BUS}")}
     card = audio_card()
+    units = units_table(UNITS + ["ewego-webtest"])
+    fuel = next(u["active"] for u in units if u["unit"] == "ewego-fuel")
     return {
         "hostname": socket.gethostname(),
         "ips": ips.split(),
@@ -320,13 +362,13 @@ def status():
         "clock": clock_status(),
         "disk": {"free_gb": round(du.free / 1e9, 2), "total_gb": round(du.total / 1e9, 2),
                  "path": str(EWEGO)},
-        "battery": battery(),
+        "battery": battery(fuel),
         "pps": pps_status(),
         "bridge": BRIDGE.status(),
         "devices": devs,
         "audio_card": {"index": card[0], "name": card[1]} if card else None,
         "video": video_devices(),
-        "units": units_table(UNITS + ["ewego-webtest"]),
+        "units": units,
     }
 
 
@@ -1485,7 +1527,7 @@ def live_snapshot():
         "imu_uart": imu_uart,
         "gps": cached("gps", 1.0, gps_live),
         "pps": cached("pps", 1.0, pps_status),
-        "battery": cached("battery", 2.0, battery),
+        "battery": cached("battery", 2.0, lambda: battery(units.get("ewego-fuel"))),
         "disk": {"free_gb": round(du.free / 1e9, 2), "total_gb": round(du.total / 1e9, 2)},
         "load": os.getloadavg()[0],
         "temp_c": temp,
@@ -1524,6 +1566,16 @@ TESTS = {
     "firstboot": (test_firstboot, None),
     "check": (test_check, None),
 }
+
+# Tests that load the SD card: refused while ewego-record.target is up.
+HEAVY_TESTS = {
+    "check": "ewego-check reads whole recordings (every IMU CSV) from the card the recorders are writing",
+    "camrec": "the ewego-cam record test writes to the card the recorders are writing",
+}
+
+
+def recording_active():
+    return unit_busy("ewego-record.target")
 
 
 # ---------------------------------------------------------------------------
@@ -1837,6 +1889,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": f"unknown test {name}"}, 404)
             return
         fn, lock_name = TESTS[name]
+        heavy = HEAVY_TESTS.get(name)
+        if heavy and not (name == "check" and q.get("list")) and recording_active():
+            self.send_json({"error": f"refused while recording (ewego-record.target is up): {heavy}. "
+                                     "Stop recording first."}, 409)
+            return
         owners = device_owners(lock_name) if lock_name else []
         if owners:
             self.send_json({"error": owners_message(lock_name, owners)}, 409)
@@ -1864,6 +1921,13 @@ class Handler(BaseHTTPRequestHandler):
         n = min(int(q.get("n", ["100"])[0]), 2000)
         if unit not in UNITS + list(PREVIEW_UNITS.values()) + ["ewego-webtest"]:
             self.send_json({"error": "unknown unit"}, 404)
+            return
+        if recording_active():
+            self.send_bytes(b"Journal dumps are refused while recording (ewego-record.target is up): "
+                            b"journalctl reads the persistent journal on the SD card the recorders are "
+                            b"writing to. The live page shows each recorder's state; stop recording to "
+                            b"read the journal here, or use journalctl over SSH.\n",
+                            "text/plain; charset=utf-8", 409)
             return
         rc, out = sh(["journalctl", "-u", unit, "-n", str(n), "--no-pager", "-o", "short-precise"])
         self.send_bytes(out.encode(), "text/plain; charset=utf-8")
@@ -2547,7 +2611,7 @@ function update(s) {
   st.textContent = s.recording ? s.recording_label : s.preview.running ? 'PREVIEW' : 'IDLE';
   const recs = Object.entries(s.recorders).map(([n, r]) => '<span class="' + (r.ok ? 'ok' : 'bad') + '">' + n + (r.ok ? '' : ': ' + esc(r.problem)) + '</span>').join(' · ');
   $('pv').textContent = s.preview.running ? 'Stop preview' : 'Preview (no recording)'; $('pv').classList.toggle('on', s.preview.running);
-  $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>' : 'battery ' + s.battery.voltage + ' V · <span class="' + (s.battery.soc < 15 ? 'bad' : s.battery.soc < 30 ? 'warn' : '') + '">' + s.battery.soc.toFixed(0) + ' %</span>';
+  $('batt').innerHTML = s.battery.error ? '<span class="bad">fuel gauge: ' + s.battery.error + '</span>' : 'battery ' + s.battery.voltage + ' V · <span class="' + (s.battery.soc < 15 ? 'bad' : s.battery.soc < 30 ? 'warn' : '') + '">' + s.battery.soc.toFixed(0) + ' %</span>' + (s.battery.stale ? ' <span class="warn">(fuel log ' + Math.round(s.battery.age_s) + ' s old)</span>' : '');
   $('disk').textContent = 'free ' + s.disk.free_gb + ' / ' + s.disk.total_gb + ' GB';
   $('load').textContent = 'load ' + s.load.toFixed(2) + (s.temp_c != null ? ' · ' + s.temp_c.toFixed(0) + ' °C' : '');
   $('link').textContent = 'views ' + (s.view_bytes_per_s / 1024).toFixed(0) + ' kB/s sent';

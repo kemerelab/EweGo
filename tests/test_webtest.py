@@ -439,6 +439,103 @@ class Streams(Base):
         self.assertEqual(len(self.fake.ran("systemctl")), 2)
 
 
+class HeavyWorkAndBattery(Base):
+    """R24: check/camrec/journal refused while recording; battery from the
+    fuel logger's CSV while it runs."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_conf = W.CONF_DIR
+        W.CONF_DIR = W.EWEGO / "etc"          # no fuel.conf: default OUT_DIR
+
+    def tearDown(self):
+        W.CONF_DIR = self._orig_conf
+        super().tearDown()
+
+    def get(self, path):
+        h = make_handler("GET", path, {"X-EweGo": "1"})
+        h.do_GET()
+        return reply(h)
+
+    def test_heavy_work_refused_while_recording(self):
+        self.fake.states = {"ewego-record.target": "active"}
+        for path in ("/api/run/check", "/api/run/camrec?seconds=1"):
+            code, body = self.get(path)
+            self.assertEqual(code, 409, path)
+            self.assertIn("while recording", body["error"])
+        code, body = self.get("/api/journal?unit=ewego-cam@camera1")
+        self.assertEqual(code, 409)
+        self.assertIn("while recording", body)
+        self.assertEqual(self.fake.ran("journalctl"), [])
+
+    def test_journal_allowed_when_idle(self):
+        code, body = self.get("/api/journal?unit=ewego-preview@camera1")
+        self.assertEqual(code, 200)
+        self.assertTrue(self.fake.ran("journalctl", "-u", "ewego-preview@camera1"))
+
+    def write_csv(self, stamp, rows, age=1.0):
+        d = W.EWEGO / "recordings" / "fuel" / stamp
+        d.mkdir(parents=True)
+        p = d / "fuel_gauge.csv"
+        lines = ["Timestamp,Datetime,Elapsed_Seconds,Voltage_V,SOC_Percent,Alert"]
+        t = time.time() - age
+        for v, soc in rows:
+            lines.append(f"{t},2026-11-18 12:00:00.000,10.00,{v},{soc},NO")
+        p.write_text("\n".join(lines) + "\n")
+        return p
+
+    def test_battery_from_fuel_csv_while_logger_runs(self):
+        old = self.write_csv("20261117_090000", [("3.5000", "20.000")])
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        self.write_csv("20261118_120000", [("3.9000", "70.000"), ("3.8765", "64.250"), ("ERROR", "ERROR")])
+        self.fake.states = {"ewego-fuel": "active"}
+        b = W.battery()
+        self.assertEqual(b["voltage"], 3.877)
+        self.assertEqual(b["soc"], 64.25)
+        self.assertIn("20261118_120000", b["source"])
+        self.assertFalse(b["stale"])
+
+    def test_stale_csv_flagged(self):
+        self.write_csv("20261118_120000", [("3.8", "60")], age=120)
+        self.fake.states = {"ewego-fuel": "active"}
+        self.assertTrue(W.battery()["stale"])
+
+    def test_logger_running_without_rows_does_not_touch_the_bus(self):
+        self.fake.states = {"ewego-fuel": "active"}
+        import builtins
+        real_import = builtins.__import__
+
+        def no_smbus(name, *a, **k):
+            if name == "smbus2":
+                raise AssertionError("opened the I2C bus while ewego-fuel runs")
+            return real_import(name, *a, **k)
+        builtins.__import__ = no_smbus
+        try:
+            b = W.battery()
+        finally:
+            builtins.__import__ = real_import
+        self.assertIn("error", b)
+
+    def test_bus_used_when_logger_stopped(self):
+        self.write_csv("20261118_120000", [("3.8", "60")])
+        seen = []
+        import builtins
+        real_import = builtins.__import__
+
+        def spy(name, *a, **k):
+            if name == "smbus2":
+                seen.append(name)
+                raise ImportError("no smbus2 here")
+            return real_import(name, *a, **k)
+        builtins.__import__ = spy
+        try:
+            b = W.battery()
+        finally:
+            builtins.__import__ = real_import
+        self.assertEqual(seen, ["smbus2"])
+        self.assertIn("error", b)
+
+
 # ---------------------------------------------------------------------------
 # a Handler without a socket: enough to call do_GET/do_POST and read the reply
 # ---------------------------------------------------------------------------

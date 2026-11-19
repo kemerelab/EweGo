@@ -265,9 +265,10 @@ static void usage(FILE *f)
 {
 	fprintf(f, "ewego-imu-usb %s — log the hub_imu USB IMU\n"
 		   "usage: ewego-imu-usb --out DIR [--device /dev/hidrawN] [--name imu] [--seconds N]\n"
-		   "       [--stats N] [--stall N] [--no-session-dir] [--rt] [--live DIR] [--quiet] [--list]\n"
+		   "       [--stats N] [--stall N] [--wait N] [--no-session-dir] [--rt] [--live DIR] [--quiet] [--list]\n"
 		   "       ewego-imu-usb --preview --live DIR     stream to the live file only, record nothing\n"
 		   "  --device   default: the single hidraw node with VID:PID %04x:%04x\n"
+		   "  --wait N   without --device, wait up to N seconds for that node to appear (default 30)\n"
 		   "  --rt       SCHED_FIFO priority 10 and mlockall for the reader thread (needs root)\n"
 		   "  --live DIR write DIR/<name>.json (counters + recent samples) ten times a second\n",
 		VERSION, USB_VID, USB_PID);
@@ -277,11 +278,12 @@ int main(int argc, char **argv)
 {
 	const char *dev = NULL, *out = NULL, *name = "imu", *live = NULL;
 	int seconds = 0, stats_interval = 5, stall = 5, session_dir = 1, quiet = 0, realtime = 0, preview = 0;
+	int wait_secs = 30;
 	static const struct option lo[] = {
 		{"device", 1, 0, 'd'}, {"out", 1, 0, 'o'}, {"name", 1, 0, 'n'}, {"seconds", 1, 0, 't'},
 		{"stats", 1, 0, 'S'}, {"stall", 1, 0, 'x'}, {"no-session-dir", 0, 0, 'N'},
 		{"rt", 0, 0, 'r'}, {"live", 1, 0, 'L'}, {"preview", 0, 0, 'P'},
-		{"quiet", 0, 0, 'q'}, {"list", 0, 0, 'l'}, {"help", 0, 0, 'h'}, {0, 0, 0, 0},
+		{"quiet", 0, 0, 'q'}, {"list", 0, 0, 'l'}, {"help", 0, 0, 'h'}, {"wait", 1, 0, 'w'}, {0, 0, 0, 0},
 	};
 	int opt;
 	char devpath[PATH_MAX];
@@ -290,7 +292,7 @@ int main(int argc, char **argv)
 	int fd, exit_code = 0;
 	int64_t t_last_rpt, t_bad_msg = 0;
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:t:S:x:NrL:Pqlh", lo, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:t:S:x:NrL:Pqlhw:", lo, NULL)) != -1) {
 		switch (opt) {
 		case 'd': dev = optarg; break;
 		case 'o': out = optarg; break;
@@ -303,6 +305,7 @@ int main(int argc, char **argv)
 		case 'L': live = optarg; break;
 		case 'P': preview = 1; break;
 		case 'q': quiet = 1; break;
+		case 'w': wait_secs = atoi(optarg); break;
 		case 'l': {
 			int r = find_device(devpath, sizeof(devpath));
 			printf("%s\n", r == 0 ? devpath : r == -2 ? "more than one hub_imu device" : "no hub_imu device");
@@ -325,19 +328,21 @@ int main(int argc, char **argv)
 	if (dev) {
 		snprintf(devpath, sizeof(devpath), "%s", dev);
 	} else {
-		/* wait up to 30 s: after a hub reset the module re-enumerates late */
-		int r, tries = 0;
+		/* wait up to --wait s (30): after a hub reset the module re-enumerates
+		 * late; tries every 500 ms, at least once (same rule as ewego-cam) */
+		int r, tries = 0, limit = wait_secs * 2 > 1 ? wait_secs * 2 : 1;
 		while ((r = find_device(devpath, sizeof(devpath))) == -1) {
 			if (rec_stop) {
 				fprintf(stderr, "ewego-imu-usb: stopped while waiting for the device\n");
 				return 0;
 			}
-			if (++tries >= 60) {
-				fprintf(stderr, "ewego-imu-usb: no hub_imu device after 30 s (plugged in, firmware >= v0.3.0?)\n");
+			if (++tries >= limit) {
+				fprintf(stderr, "ewego-imu-usb: no hub_imu device after %d s (plugged in, firmware >= v0.3.0?)\n",
+					wait_secs);
 				return 1;
 			}
 			if (tries == 1)
-				fprintf(stderr, "ewego-imu-usb: waiting up to 30 s for the hub_imu device ...\n");
+				fprintf(stderr, "ewego-imu-usb: waiting up to %d s for the hub_imu device ...\n", wait_secs);
 			usleep(500000);
 		}
 		if (r == -2) {

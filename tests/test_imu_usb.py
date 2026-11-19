@@ -208,6 +208,36 @@ class TestUsbCli(UsbBase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("no hub_imu device", r.stdout)
 
+    def no_hub_imu_here(self):
+        r = run([self.exe, "--list"], timeout=10)
+        if r.returncode == 0:
+            self.skipTest(f"a hub_imu is attached here ({r.stdout.strip()}); the search would find it")
+
+    def test_wait_search_path_gives_up_exit_1(self):
+        """[R40] Without --device the recorder searches /sys/class/hidraw for
+        VID:PID 1209:0001 every 500 ms for --wait s (default 30, as ewego-cam),
+        then exits 1 without creating a session directory."""
+        self.no_hub_imu_here()
+        self.assertIn("--wait N", run([self.exe, "--help"], timeout=10).stdout)
+        out = self.tmp / "out"
+        t0 = time.monotonic()
+        r = run([self.exe, "--out", out, "--wait", "1", "--seconds", "1"], timeout=15)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("waiting up to 1 s for the hub_imu device", r.stderr)
+        self.assertIn("no hub_imu device after 1 s", r.stderr)
+        self.assertTrue(0.4 <= took < 5, f"took {took:.2f} s")
+        self.assertFalse(out.exists() and any(out.iterdir()), "no session directory for a device never found")
+
+    def test_wait_0_tries_once(self):
+        self.no_hub_imu_here()
+        t0 = time.monotonic()
+        r = run([self.exe, "--out", self.tmp / "out", "--wait", "0"], timeout=10)
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertNotIn("waiting up to", r.stderr)
+        self.assertIn("no hub_imu device after 0 s", r.stderr)
+        self.assertLess(time.monotonic() - t0, 2)
+
     def test_missing_device_exit_1(self):
         r = run([self.exe, "--device", self.tmp / "no-such-hidraw", "--out", self.tmp / "out", "--seconds", "1"],
                 timeout=10)

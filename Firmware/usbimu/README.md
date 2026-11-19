@@ -103,8 +103,11 @@ is removed at exit.
 `ewego-imu-usb.service`, installed on the image and not enabled, reads
 `/etc/ewego/imu-usb.conf` (OUT_DIR, NAME, DEVICE_ARG, EXTRA_ARGS; the
 default EXTRA_ARGS is `--stats 5 --rt --live /run/ewego`). Signal handlers
-are installed before the 30 s wait for the module, so a stop during the
-wait ends it at once (exit 0, nothing created).
+are installed before the wait for the module, so a stop during the
+wait ends it at once (exit 0, nothing created). Without `--device` the
+recorder looks for the VID:PID every 500 ms for `--wait N` seconds
+(default 30, same meaning as ewego-cam's `--wait`), then exits 1 without
+creating a session directory.
 
 ## Build
 

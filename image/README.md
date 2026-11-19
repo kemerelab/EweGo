@@ -18,6 +18,7 @@ hostname / user / Wi-Fi / SSH customisation, all offline).
 | `/etc/ewego/*.conf` | per-unit settings: `cam-camera1.conf` / `cam-camera2.conf` (hub port, size, fps), `imu-usb.conf`, `imu-uart.conf`, `gps.conf` (NTRIP, off by default), `audio.conf`, `fuel.conf` |
 | `/usr/local/bin/ewego-cam`, `ewego-imu-usb`, `ewego-imu-uart` | static C recorders, cross-compiled in CI |
 | `/etc/modules-load.d/ewego.conf` | `i2c-dev` |
+| `/etc/systemd/journald.conf.d/ewego.conf` | journal bounded: persistent (previous boots stay readable for post-mortems, `journalctl -b -1`), `SystemMaxUse=100M`, `RuntimeMaxUse=50M`, rate limit 1000 lines per 30 s per unit. The recorders print stats every 30 s (`--stats 30` in the confs), the fuel logger one line a minute, the GPS logger a status line every 30 s, so the card is not written continuously by logging. |
 | `/lib/modules/<ver>/updates/uvcvideo.ko`, `/etc/modprobe.d/ewego-uvc.conf` | patched UVC driver with a `max_payload=2048` cap so two MJPEG cameras fit on the CM4's single USB 2.0 bus; built in the chroot at image build time (see `uvcvideo/README.md`) |
 | `/etc/ewego-image-release` | version tag and build date |
 | `config.txt` | `dtparam=ant2` at the top (external antenna); the hardware block appended (UART console on GPIO 14/15, no CSI camera overlays, audio, GPS UART4 with GPIO 4/5 left as unpulled inputs, GPS PPS on GPIO 6 as `/dev/pps0`, IMU UART5, I2C); `[cm4] otg_mode=1` verified (USB host mode, for webcams) |

@@ -29,6 +29,8 @@
 #                                                when /boot/firmware/ewego-record
 #                                                exists)
 #           /etc/modules-load.d/ewego.conf       i2c-dev
+#           /etc/systemd/journald.conf.d/ewego.conf  persistent journal capped at
+#                                                100M, rate-limited
 #           /etc/ewego-image-release             version + build date
 #           apt packages from apt-packages.txt   installed inside the image
 #                                                through an emulated chroot
@@ -183,8 +185,16 @@ else
 fi
 install -d "$ROOT_MNT/etc/ewego"
 for f in "$IMAGE_DIR"/ewego/*.conf; do
+    case $(basename "$f") in journald-*) continue ;; esac   # installed below
     install -m 644 "$f" "$ROOT_MNT/etc/ewego/$(basename "$f")"
 done
+
+# --- rootfs: bounded, persistent journal ------------------------------------
+# The journal shares the SD card with the recordings: cap it and rate-limit
+# chatty units, but keep it persistent for post-mortems.
+log "Installing /etc/systemd/journald.conf.d/ewego.conf"
+install -d "$ROOT_MNT/etc/systemd/journald.conf.d"
+install -m 644 "$IMAGE_DIR/ewego/journald-ewego.conf" "$ROOT_MNT/etc/systemd/journald.conf.d/ewego.conf"
 
 # --- rootfs: units (installed, deliberately not enabled) ------------------
 log "Installing systemd units"

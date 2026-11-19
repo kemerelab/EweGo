@@ -326,8 +326,14 @@ def status():
         "devices": devs,
         "audio_card": {"index": card[0], "name": card[1]} if card else None,
         "video": video_devices(),
-        "units": [unit_status(u) for u in UNITS + ["ewego-webtest"]],
+        "units": units_table(UNITS + ["ewego-webtest"]),
     }
+
+
+def units_table(units):
+    """[{unit, active, enabled}] in two systemctl calls (the page polls every 5 s)."""
+    act, ena = units_state(units), units_state(units, "is-enabled")
+    return [{"unit": u, "active": act[u], "enabled": ena[u]} for u in units]
 
 
 def open_serial_raw(port, baud, writable=False):
@@ -867,7 +873,7 @@ def test_camrec(write, q):
             with lock:
                 try:
                     write(f"[{name}] ".encode() + raw.replace(b"\r", b"\n"))
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     return
 
     threads = [threading.Thread(target=pump, args=(n,), daemon=True) for n in procs]
@@ -1567,8 +1573,19 @@ def mjpeg_frames(proc):
 # HTTP
 # ---------------------------------------------------------------------------
 
+# Long-lived responses (SSE, camera views): a phone that walks out of Wi-Fi
+# range sends no FIN, so its threads only end when a write times out. Cap
+# how many can exist at once; beyond that, 503 (EventSource retries itself).
+STREAM_MAX = 6
+STREAM_SEND_TIMEOUT_S = 20
+_STREAMS = threading.BoundedSemaphore(STREAM_MAX)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ewego-webtest/1"
+    # socket timeout for every connection (StreamRequestHandler applies it):
+    # a stalled read or write raises instead of blocking a thread for ~15 min
+    timeout = 30
 
     def log_message(self, fmt, *args):
         sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
@@ -1589,6 +1606,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
+
+    def take_stream_slot(self):
+        """One of STREAM_MAX long-lived response slots, or a 503 and False.
+        The caller releases _STREAMS when its loop ends."""
+        if _STREAMS.acquire(blocking=False):
+            try:
+                self.connection.settimeout(STREAM_SEND_TIMEOUT_S)
+            except OSError:
+                pass
+            return True
+        body = json.dumps({"error": f"too many live streams open (max {STREAM_MAX}); "
+                                    "close other live-view tabs or wait a few seconds"}).encode()
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Retry-After", "5")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def streaming(self, fn, *args):
+        """Run a long-lived response in one of the STREAM_MAX slots."""
+        if not self.take_stream_slot():
+            return
+        try:
+            fn(*args)
+        finally:
+            _STREAMS.release()
+
+    def client_gone(self):
+        """The browser never sends on a stream connection again: readable means closed."""
+        r, _, _ = select.select([self.connection], [], [], 0)
+        return bool(r) and not self.connection.recv(1, socket.MSG_PEEK)
 
     def write_flush(self, data):
         self.wfile.write(data)
@@ -1613,9 +1663,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/live":
                 self.send_bytes(LIVE_PAGE.encode(), "text/html; charset=utf-8")
             elif path == "/api/live/events":
-                self.live_events(q)
+                self.streaming(self.live_events, q)
             elif path.startswith("/api/live/cam/"):
-                self.live_cam(q, path[len("/api/live/cam/"):])
+                self.streaming(self.live_cam, q, path[len("/api/live/cam/"):])
             elif path == "/api/status":
                 self.send_json(status())
             elif path == "/api/sessions":
@@ -1628,7 +1678,7 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/snapshot":
                 self.snapshot(q)
             elif path == "/api/stream":
-                self.stream(q)
+                self.streaming(self.stream, q)
             elif path == "/api/audio/last":
                 wav = RUN_DIR / "audio.wav"
                 if wav.exists():
@@ -1637,7 +1687,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "no recording yet"}, 404)
             else:
                 self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
     def has_token(self):
@@ -1650,7 +1700,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_json({"error": "forbidden: request lacks the X-EweGo: 1 header "
                                      "(the console's own pages send it)"}, 403)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         return False
 
@@ -1699,7 +1749,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": ok, "message": msg, "status": BRIDGE.status()})
             else:
                 self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
     # -- endpoints --
@@ -1714,7 +1764,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         last_n = {"imu": -1, "imu_uart": -1}
         try:
-            while True:
+            while not self.client_gone():
                 PREVIEW.touch()
                 snap = live_snapshot()
                 for key in last_n:
@@ -1750,11 +1800,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         last_mtime, last_sent = None, 0.0
         try:
-            while True:
-                # the browser never sends on this connection again: readable means closed
-                r, _, _ = select.select([self.connection], [], [], 0)
-                if r and not self.connection.recv(1, socket.MSG_PEEK):
-                    return
+            while not self.client_gone():
                 try:
                     st = p.stat()
                 except OSError:
@@ -1802,12 +1848,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.send_text_stream_headers()
             fn(self.write_flush, q)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception as e:  # show the error in the pane rather than dropping the connection
             try:
                 self.write_flush(f"\n[error] {type(e).__name__}: {e}\n".encode())
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
         finally:
             if lock:
@@ -1865,7 +1911,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
                                  + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         finally:
             if proc and proc.poll() is None:
@@ -2342,6 +2388,9 @@ function streamCam(name) {
   const img = $('img-' + name);
   if (paused) { img.removeAttribute('src'); return; }
   img.onload = () => { cams[name].shown = (cams[name].shown || 0) + 1; cams[name].lastFrame = Date.now(); };
+  // refused (503: too many streams) or dropped: try again in a few seconds
+  clearTimeout(cams[name].retry);
+  img.onerror = () => { clearTimeout(cams[name].retry); if (!paused) cams[name].retry = setTimeout(() => streamCam(name), 5000); };
   img.src = '/api/live/cam/' + name + '?fps=' + $('rate').value + '&t=' + Date.now();
 }
 function restartCams() { for (const n in cams) streamCam(n); }
@@ -2511,7 +2560,8 @@ function update(s) {
 function connect() {
   const es = new EventSource('/api/live/events');
   es.onmessage = e => { try { update(JSON.parse(e.data)); } catch (err) { $('msg').textContent = 'bad update: ' + err; } };
-  es.onerror = () => { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; };
+  // a refused connection (503) closes the EventSource for good: reconnect by hand
+  es.onerror = () => { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; if (es.readyState === EventSource.CLOSED) setTimeout(connect, 5000); };
 }
 setInterval(() => { if (Date.now() - lastSnap > 5000) { $('state').textContent = 'NO LINK'; $('state').className = 'badge'; } }, 2000);
 

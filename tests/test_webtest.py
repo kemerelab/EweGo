@@ -371,6 +371,74 @@ class Badge(Base):
         self.assertFalse(s["recording_ok"])
 
 
+class Streams(Base):
+    """R23: socket timeout, capped stream connections, cheap status()."""
+
+    def setUp(self):
+        super().setUp()
+        from http.server import ThreadingHTTPServer
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), W.Handler)
+        self.srv.daemon_threads = True
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.socks = []
+
+    def tearDown(self):
+        for s in self.socks:
+            s.close()
+        self.srv.shutdown()
+        self.srv.server_close()
+        # every stream thread gives its slot back once its client is gone
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and W._STREAMS._value < W.STREAM_MAX:
+            time.sleep(0.05)
+        super().tearDown()
+
+    def open_stream(self, path="/api/live/cam/camera1"):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        s.sendall(f"GET {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        self.socks.append(s)
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        return int(head.split(b" ", 2)[1])
+
+    def test_handler_timeout(self):
+        self.assertEqual(W.Handler.timeout, 30)
+
+    def test_cap_then_503_then_slot_freed(self):
+        codes = [self.open_stream() for _ in range(W.STREAM_MAX)]
+        self.assertEqual(codes, [200] * W.STREAM_MAX)
+        self.assertEqual(self.open_stream("/api/live/events"), 503)
+        # the client closes one: its thread notices and frees the slot
+        self.socks.pop(0).close()
+        deadline = time.monotonic() + 3
+        code = 503
+        while time.monotonic() < deadline and code == 503:
+            time.sleep(0.1)
+            code = self.open_stream()
+        self.assertEqual(code, 200)
+
+    def test_sse_sends_a_snapshot(self):
+        import socket
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.socks.append(s)
+        s.sendall(b"GET /api/live/events HTTP/1.1\r\nHost: x\r\n\r\n")
+        buf = b""
+        while b"\n\ndata: " not in buf and b"}\n\n" not in buf:
+            buf += s.recv(65536)
+        body = buf.split(b"data: ", 1)[1].split(b"\n\n", 1)[0]
+        self.assertIn("recording_label", json.loads(body))
+
+    def test_status_uses_two_systemctl_calls(self):
+        W.status()
+        self.assertEqual(len(self.fake.ran("systemctl")), 2)
+
+
 # ---------------------------------------------------------------------------
 # a Handler without a socket: enough to call do_GET/do_POST and read the reply
 # ---------------------------------------------------------------------------

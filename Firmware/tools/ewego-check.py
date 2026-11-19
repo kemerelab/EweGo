@@ -8,9 +8,27 @@ Each recorder writes its own timestamped session directory:
   <root>/recordings/audio/<stamp>/audio.wav (audio-01.wav, audio-02.wav ... past 2 GiB)
   <root>/recordings/fuel/<stamp>/fuel_gauge.csv
   <root>/gps-logs/gps_log_<stamp>.ubx, _timesync.csv
-This tool groups the sessions that started within a minute of each other
-into one run (the latest by default), checks each stream and prints a
-verdict, then shows how far apart the streams started.
+This tool groups sessions into runs (the latest by default), checks each
+stream and prints a verdict, then shows how far apart the streams started.
+
+Grouping rule: sessions are taken in stamp order; a session belongs to the
+newest run when it started within GROUP_WINDOW_S (60 s) of that run's first
+session, or before the run's last session ended (each session's length comes
+from its summary, or from its timestamps / CSV / WAV when there is none). So
+a recorder restarted by systemd 30 s or 30 min into a run stays in that run
+as a restart (a second session of the same stream, reported on its own line,
+WARN) instead of becoming a run of its own. Directories with a `-2`, `-3`
+suffix (a stamp collision after a quick restart) group the same way.
+
+Summaries: the recorders rewrite <name>_summary.json every stats interval
+with "in_progress": true and "exit_code": null, and once more at exit with
+"in_progress": false and the exit code. An in-progress summary means the
+recorder is still running, or was killed / lost power: its counters are
+reported, the run is called not complete, and the stream is at least WARN.
+Recorder exit codes: 0 ok, 1 setup/device, 2 lost/flagged/overruns,
+3 stalled or device gone, 4 output error (card full / I/O) -> FAIL.
+
+Exit status: 0 PASS, 1 WARN, 2 FAIL, 3 no recordings or no such run.
 
 Standard library only; runs on the wearable or on a copy of /opt/ewego.
 
@@ -28,12 +46,26 @@ import os
 import re
 import struct
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 STAMP_RE = re.compile(r"(\d{8}_\d{6})")
 UNITS = ["camera1", "camera2", "imu", "imu-uart", "audio", "fuel"]
 GROUP_WINDOW_S = 60
+EXIT_MEANING = {0: "ok", 1: "setup or device error", 2: "samples lost, flagged or overrun",
+                3: "stalled or device gone", 4: "output error (card full / I/O)"}
+IN_PROGRESS_NOTE = ("summary is a periodic one (in_progress): still recording, or the recorder was killed or "
+                    "lost power; the final summary is missing, counters are as of the last stats interval")
+EXIT = {"PASS": 0, "WARN": 1, "FAIL": 2}
+EXIT_NO_RUN = 3
+
+
+def exit_note(code):
+    return f"recorder exit code {code} ({EXIT_MEANING.get(code, 'unknown')})"
+
+
+def at_least_warn(v):
+    return "WARN" if v == "PASS" else v
 
 
 def stamp_of(name):
@@ -76,17 +108,86 @@ def sessions(root):
     return out
 
 
+def _csv_first_last(path):
+    """First data line and last line of a CSV, cheaply (seek to the end)."""
+    with path.open("rb") as f:
+        f.readline()
+        first = f.readline()
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 4096))
+        tail = f.read().splitlines()
+    last = tail[-1] if tail else b""
+    return first.decode(errors="replace"), last.decode(errors="replace")
+
+
+def session_span(unit, p):
+    """How long a session recorded, in seconds (0 when it cannot be told).
+    Used only to group sessions into runs; cheap reads only."""
+    try:
+        if unit in ("camera1", "camera2"):
+            s = load_json(p / f"{unit}_summary.json")
+            if s and s.get("frames", 0) > 1:
+                return max(0.0, (s["last_ts_us"] - s["first_ts_us"]) / 1e6)
+            ts = p / f"{unit}_timestamps.bin"
+            if ts.exists() and ts.stat().st_size >= 16:
+                with ts.open("rb") as f:
+                    a = struct.unpack("<q", f.read(8))[0]
+                    f.seek(-8, os.SEEK_END)
+                    b = struct.unpack("<q", f.read(8))[0]
+                return max(0.0, (b - a) / 1e6)
+        elif unit in ("imu", "imu-uart"):
+            s = load_json(p / f"{unit}_summary.json")
+            if s and s.get("effective_hz"):
+                return s["samples"] / s["effective_hz"]
+            c = p / f"{unit}.csv"
+            if c.exists():
+                first, last = _csv_first_last(c)
+                a = datetime.fromisoformat(first.split(",")[0])
+                b = datetime.fromisoformat(last.split(",")[0])
+                return max(0.0, (b - a).total_seconds())
+        elif unit == "audio":
+            dur = 0.0
+            for w in audio_parts(p):
+                info = wav_info(w)
+                if info and info[0]:
+                    rate, ch, bits, nbytes = info[:4]
+                    dur += nbytes / (rate * ch * bits // 8)
+            return dur
+        elif unit == "fuel":
+            c = p / "fuel_gauge.csv"
+            if c.exists():
+                first, last = _csv_first_last(c)
+                return max(0.0, float(last.split(",")[0]) - float(first.split(",")[0]))
+    except (OSError, ValueError, KeyError, IndexError, TypeError, struct.error, ZeroDivisionError):
+        pass
+    return 0.0
+
+
 def runs(root):
-    """Group sessions whose stamps fall within GROUP_WINDOW_S into runs, newest first."""
-    ss = sorted(sessions(root), key=lambda s: s[1])
+    """Group sessions into runs, newest first (rule in the module docstring).
+
+    Each run: t0 (first stamp), stamp, end (latest session end), units
+    {unit: first session}, stamps {unit: its stamp}, restarts {unit: [(stamp,
+    path) of later sessions of the same stream]}, spans {path: seconds}."""
+    ss = sorted(sessions(root), key=lambda s: (s[1], s[2].name))
     groups = []
     for unit, st, p in ss:
         t = stamp_time(st)
-        if groups and (t - groups[-1]["t0"]).total_seconds() <= GROUP_WINDOW_S and unit not in groups[-1]["units"]:
-            groups[-1]["units"][unit] = p
-            groups[-1]["stamps"][unit] = st
+        span = session_span(unit, p)
+        g = groups[-1] if groups else None
+        if g and ((t - g["t0"]).total_seconds() <= GROUP_WINDOW_S or t <= g["end"]):
+            if unit in g["units"]:
+                g["restarts"].setdefault(unit, []).append((st, p))
+            else:
+                g["units"][unit] = p
+                g["stamps"][unit] = st
+            g["spans"][p] = span
         else:
-            groups.append({"t0": t, "stamp": st, "units": {unit: p}, "stamps": {unit: st}})
+            g = {"t0": t, "stamp": st, "end": t, "units": {unit: p}, "stamps": {unit: st}, "restarts": {},
+                 "spans": {p: span}}
+            groups.append(g)
+        g["end"] = max(g["end"], t + timedelta(seconds=span))
     return list(reversed(groups))
 
 
@@ -121,7 +222,13 @@ def check_camera(d, name):
     dur = (s["last_ts_us"] - s["first_ts_us"]) / 1e6 if s["frames"] > 1 else 0
     fps = s.get("effective_fps", 0)
     want = s["requested"]["fps"]
+    in_progress = s.get("in_progress") is True
     verdict = "PASS"
+    w = s["writer"]
+    if w.get("error") or s.get("exit_code") == 4:
+        verdict = "FAIL"
+        notes.append("output error: " + (w.get("error_msg") or "card full or I/O error (no message)") +
+                     (f"; {w['discarded']} frames discarded after it" if w.get("discarded") else ""))
     if s["lost"]:
         verdict = "FAIL"
         notes.append(f"{s['lost']} frames lost in {s['gaps']} gaps at seq {s.get('gap_list', '')}")
@@ -142,11 +249,14 @@ def check_camera(d, name):
     iv = s["interval_us"]
     if iv["max"] > 2.5e6 / want:
         notes.append(f"max frame interval {iv['max'] / 1000:.0f} ms (nominal {1000 / want:.1f})")
-    if s["exit_code"] not in (0,):
-        notes.append(f"recorder exit code {s['exit_code']}")
+    if in_progress:
+        verdict = at_least_warn(verdict)
+        notes.append(IN_PROGRESS_NOTE)
+    elif s["exit_code"] not in (0,):
+        notes.append(exit_note(s["exit_code"]))
     mb = s["bytes"] / 1e6
     start_wall = s["first_ts_us"] + s["realtime_minus_monotonic_us"]
-    line = (f"{s['frames']} frames, {fmt_dur(dur)}, {fps:.2f} fps, {mb:.0f} MB, lost {s['lost']}, "
+    line = ("so far: " if in_progress else "") + (f"{s['frames']} frames, {fmt_dur(dur)}, {fps:.2f} fps, {mb:.0f} MB, lost {s['lost']}, "
             f"overruns {s['writer']['overruns']}, write max {s['writer']['write_max_ms']:.0f} ms  [{s['device'].split('/')[-1]}]")
     return verdict, line, notes, start_wall
 
@@ -165,7 +275,12 @@ def check_imu(d, name="imu"):
         notes.append("no summary.json: still recording, or killed")
         return ("WARN" if n else "FAIL"), f"{n} samples so far", notes, None
     dur = s["samples"] / s["effective_hz"] if s.get("effective_hz") else 0
+    in_progress = s.get("in_progress") is True
     verdict = "PASS"
+    if s.get("writer_error") or s.get("exit_code") == 4:
+        verdict = "FAIL"
+        notes.append("output error: " + (s.get("writer_error_msg") or "card full or I/O error (no message)") +
+                     (f" ({s['writer_error']} failed writes)" if s.get("writer_error") else ""))
     if s["lost"]:
         pct = 100.0 * s["lost"] / max(1, s["samples"] + s["lost"])
         verdict = "WARN" if pct < 0.5 else "FAIL"
@@ -186,12 +301,22 @@ def check_imu(d, name="imu"):
         verdict = "WARN" if verdict == "PASS" else verdict
         notes.append(f"module I2C burst up to {s['i2c_us_max'] / 1000:.1f} ms of the 10 ms period (normal 5 ms): the BNO055 "
                      "is stretching the clock; a module reset restores it (seen 2026-11-14 at 9.5 ms, every other sample lost on hubimu-v0.3.0)")
+    if s.get("fusion_stalls") or s.get("fusion_reinits"):
+        verdict = at_least_warn(verdict)
+        notes.append(f"BNO055 fusion stalled {s.get('fusion_stalls', 0)} time(s), re-initialised "
+                     f"{s.get('fusion_reinits', 0)} time(s) (sensor reset into CONFIG mode, or frozen data); "
+                     f"{s.get('fusion_invalid', 0)} samples with an all-zero quaternion (CSV flags bit 0x02)")
     expected = s.get("rate_hz", 100)
     if abs(s["effective_hz"] - expected) > 1:
         verdict = "WARN" if verdict == "PASS" else verdict
         notes.append(f"rate {s['effective_hz']:.2f} Hz (expected {expected})")
+    if in_progress:
+        verdict = at_least_warn(verdict)
+        notes.append(IN_PROGRESS_NOTE)
+    elif s.get("exit_code") not in (0, None):
+        notes.append(exit_note(s["exit_code"]))
     start_wall = s["first_host_mono_us"] + s["realtime_minus_monotonic_us"]
-    line = (f"{s['samples']} samples, {fmt_dur(dur)}, {s['effective_hz']:.2f} Hz, lost {s['lost']}, "
+    line = ("so far: " if in_progress else "") + (f"{s['samples']} samples, {fmt_dur(dur)}, {s['effective_hz']:.2f} Hz, lost {s['lost']}, "
             f"interval {s['interval_us']['min']:.0f}-{s['interval_us']['max']:.0f} us")
     if "device_minus_host_drift_ppm" in s:
         line += f", drift {s['device_minus_host_drift_ppm']:.1f} ppm"
@@ -410,10 +535,33 @@ def check_gps(ubx):
 
 # --------------------------------------------------------------------------
 
+def check_stream(unit, p):
+    """(verdict, line, notes, start_wall) of one session of one stream."""
+    try:
+        if unit in ("camera1", "camera2"):
+            return check_camera(p, unit)
+        if unit in ("imu", "imu-uart"):
+            return check_imu(p, unit)
+        if unit == "audio":
+            return check_audio(p)
+        if unit == "fuel":
+            return check_fuel(p)
+        return check_gps(p)
+    except Exception as e:  # a half-written file should not hide the other streams
+        return "FAIL", f"could not read: {type(e).__name__}: {e}", [], None
+
+
+def unfinished(notes):
+    """True when the notes say the session has no final summary."""
+    return any(n == IN_PROGRESS_NOTE or n.startswith("no summary.json") for n in notes)
+
+
 def report(run, root):
     worst = "PASS"
     order = {"PASS": 0, "WARN": 1, "FAIL": 2}
     starts = {}
+    incomplete = []
+    restarts = run.get("restarts", {})
     print(f"run {run['stamp']}  ({run['t0']:%Y-%m-%d %H:%M:%S})  root {root}")
     print()
     for unit in UNITS + ["gps"]:
@@ -421,19 +569,13 @@ def report(run, root):
         if p is None:
             v, line, notes, start = "MISSING", "no session for this run", [], None
         else:
-            try:
-                if unit in ("camera1", "camera2"):
-                    v, line, notes, start = check_camera(p, unit)
-                elif unit in ("imu", "imu-uart"):
-                    v, line, notes, start = check_imu(p, unit)
-                elif unit == "audio":
-                    v, line, notes, start = check_audio(p)
-                elif unit == "fuel":
-                    v, line, notes, start = check_fuel(p)
-                else:
-                    v, line, notes, start = check_gps(p)
-            except Exception as e:  # a half-written file should not hide the other streams
-                v, line, notes, start = "FAIL", f"could not read: {type(e).__name__}: {e}", [], None
+            v, line, notes, start = check_stream(unit, p)
+            if unfinished(notes):
+                incomplete.append(unit)
+            if restarts.get(unit):
+                v = at_least_warn(v)
+                notes.append(f"recorder restarted: {len(restarts[unit])} more session(s) of {unit} in this run "
+                             "(data gap between them; listed below, check the journal for why)")
         if v == "MISSING":
             if unit in ("camera1", "camera2", "imu", "imu-uart"):
                 worst = "FAIL"
@@ -447,6 +589,20 @@ def report(run, root):
         print(f"{unit:8s} {v:7s} {line}{where}")
         for nt in notes:
             print(f"{'':8s} {'':7s} - {nt}")
+        prev = (run["stamps"].get(unit), p)
+        for st, rp in restarts.get(unit, []):
+            rv, rline, rnotes, _ = check_stream(unit, rp)
+            if unfinished(rnotes):
+                incomplete.append(f"{unit} ({rp.name})")
+            worst = max(worst, rv, key=lambda k: order[k])
+            t_prev = stamp_time(prev[0])
+            gap = (stamp_time(st) - t_prev).total_seconds() - run.get("spans", {}).get(prev[1], 0)
+            rnotes.insert(0, f"restart: began {(stamp_time(st) - run['t0']).total_seconds():.0f} s into the run, "
+                             f"about {max(0, gap):.0f} s after the previous {unit} session ended")
+            print(f"{unit:8s} {rv:7s} {rline}  ({rp.relative_to(root)})")
+            for nt in rnotes:
+                print(f"{'':8s} {'':7s} - {nt}")
+            prev = (st, rp)
     if len(starts) > 1:
         ref = min(starts.values())
         print()
@@ -455,6 +611,9 @@ def report(run, root):
         print("(camera timestamps are CLOCK_MONOTONIC; summary.json's realtime_minus_monotonic_us maps them to wall time)")
     print()
     print(f"overall: {worst}")
+    if incomplete:
+        print(f"run not complete: no final summary for {', '.join(incomplete)} (still recording, or killed / "
+              "power lost; the counters above are as of the last periodic summary)")
     return worst
 
 
@@ -502,6 +661,8 @@ def collect(run, dest):
         if sync.exists():
             link(sync, dest / sync.name)
         n += 1
+    for unit, extra in run.get("restarts", {}).items():
+        print(f"{unit}: restart session(s) not linked (same file names): " + ", ".join(str(p) for _, p in extra))
     print(f"{n} files linked under {dest}")
     print(f"play:   python3 Firmware/dualcam/play_with_timestamps.py --dir {dest}")
     print(f"export: python3 Firmware/dualcam/play_with_timestamps.py --dir {dest} --export {dest}/dual.mp4")
@@ -520,26 +681,29 @@ def main():
     rs = runs(root)
     if not rs:
         print(f"no recordings under {root}")
-        return 1
+        return EXIT_NO_RUN
     if a.list:
         for r in rs:
-            print(f"{r['stamp']}  {', '.join(sorted(r['units']))}")
+            names = [u + (f" x{1 + len(r['restarts'][u])}" if r["restarts"].get(u) else "") for u in sorted(r["units"])]
+            print(f"{r['stamp']}  {', '.join(names)}")
         return 0
     run = rs[0]
     if a.run:
-        m = [r for r in rs if any(st.startswith(a.run) for st in r["stamps"].values())]
+        m = [r for r in rs if any(st.startswith(a.run) for st in r["stamps"].values())
+             or any(p.name.startswith(a.run) for ex in r["restarts"].values() for _, p in ex)]
         if not m:
             print(f"no run matching {a.run}; --list shows them")
-            return 1
+            return EXIT_NO_RUN
         run = m[0]
     if a.json:
-        print(json.dumps({"stamp": run["stamp"], "files": {u: str(p) for u, p in run["units"].items()}}, indent=1))
+        print(json.dumps({"stamp": run["stamp"], "files": {u: str(p) for u, p in run["units"].items()},
+                          "restarts": {u: [str(p) for _, p in ex] for u, ex in run["restarts"].items()}}, indent=1))
         return 0
     worst = report(run, root)
     if a.collect:
         print()
         collect(run, a.collect)
-    return {"PASS": 0, "WARN": 0, "FAIL": 2}[worst]
+    return EXIT[worst]
 
 
 if __name__ == "__main__":

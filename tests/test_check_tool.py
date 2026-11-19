@@ -5,8 +5,8 @@ gps-logs/gps_log_<stamp>.ubx) with files shaped like the recorders' real
 outputs, then runs the tool as a program (verdict lines, overall verdict,
 exit code) and, for finer checks, calls its per-stream functions directly.
 
-Exit codes (from the tool): 0 PASS or WARN, 2 FAIL, 1 no recordings / no
-such run. Pure Python: runs on every platform.
+Exit codes (from the tool, R38): 0 PASS, 1 WARN, 2 FAIL, 3 no recordings /
+no such run. Pure Python: runs on every platform.
 """
 
 import importlib.util
@@ -219,15 +219,15 @@ class TestCheckRuns(CheckToolBase):
                                                   "overall"]}, r.stdout)
         self.assertIn("start offsets", r.stdout)
 
-    def test_no_recordings_exit_1(self):
-        r = self.check(expect_rc=1)
+    def test_no_recordings_exit_3(self):
+        r = self.check(expect_rc=3)
         self.assertIn("no recordings", r.stdout)
 
     def test_missing_streams(self):
         """A missing camera/IMU stream fails the run; missing audio/fuel/gps only warns."""
         self.root.full_run()
         shutil.rmtree(self.root.rec / "audio")
-        r = self.check(expect_rc=0)
+        r = self.check(expect_rc=1)
         v = self.verdicts(r.stdout)
         self.assertEqual((v["audio"], v["overall"]), ("MISSING", "WARN"))
         shutil.rmtree(self.root.rec / "camera2")
@@ -245,22 +245,54 @@ class TestCheckRuns(CheckToolBase):
         self.assertIn("run 20261118_120000", r.stdout)
         r = self.check("--run", "20261118_09", expect_rc=0)
         self.assertIn("run 20261118_090000", r.stdout)
-        r = self.check("--run", "1999", expect_rc=1)
+        r = self.check("--run", "1999", expect_rc=3)
         self.assertIn("no run matching", r.stdout)
 
-    def test_unit_restart_splits_the_run(self):
-        """CURRENT BEHAVIOUR, documented: a recorder restarted by systemd 30 s into
-        a run gets a new session directory; the grouping puts it in a run of its
-        own, which is then "the latest run", so the default check reports the
-        other streams MISSING and FAILs. ROBUSTNESS.md "Later" (one session id
-        per target start) would change this; update the expectations then."""
+    def test_unit_restart_stays_in_the_run(self):
+        """R38: a recorder restarted by systemd 30 s into a run gets a new
+        session directory; it stays in the run (started within 60 s of the
+        run, or before the run's last session ended) as a restart: both
+        sessions are reported, the stream WARNs, nothing is MISSING."""
         self.root.full_run()
         self.root.camera("camera1", STAMP[:-2] + "30")
-        r = self.check(expect_rc=2)
+        r = self.check(expect_rc=1)
         v = self.verdicts(r.stdout)
-        self.assertEqual((v["camera1"], v["camera2"], v["overall"]), ("PASS", "MISSING", "FAIL"), r.stdout)
+        self.assertEqual((v["camera2"], v["overall"]), ("PASS", "WARN"), r.stdout)
+        self.assertNotIn("MISSING", r.stdout)
+        self.assertIn("recorder restarted: 1 more session(s) of camera1", r.stdout)
+        self.assertRegex(r.stdout, r"restart: began 30 s into the run")
+        self.assertEqual(len(re.findall(r"^camera1 ", r.stdout, re.M)), 2, r.stdout)
         r = self.check("--list", expect_rc=0)
-        self.assertEqual(len(r.stdout.strip().splitlines()), 2, r.stdout)
+        self.assertEqual(r.stdout.strip().splitlines(), [f"{STAMP}  audio, camera1 x2, camera2, fuel, gps, imu, imu-uart"])
+        js = json.loads(self.check("--json", expect_rc=0).stdout)
+        self.assertEqual([Path(p).name for p in js["restarts"]["camera1"]], [STAMP[:-2] + "30"])
+
+    def test_restart_long_into_a_run_stays_in_it(self):
+        """A restart 10 min into a 20 min run is past the 60 s window but before
+        the run ended (the other sessions' summaries say how long they ran)."""
+        self.root.full_run()
+        self.root.imu("imu-uart", STAMP[:-2] + "02", rows=120_000)          # 20 min at 100 Hz
+        self.root.imu("imu-uart", "20261118_121000", rows=60_000)
+        r = self.check(expect_rc=1)
+        self.assertIn(f"run {STAMP}", r.stdout)
+        self.assertIn("restart: began 600 s into the run", r.stdout)
+        self.assertEqual(len(self.check("--list", expect_rc=0).stdout.strip().splitlines()), 1)
+        # and a session after the run ended starts a new run
+        self.root.imu("imu", "20261118_123000")
+        lines = self.check("--list", expect_rc=0).stdout.strip().splitlines()
+        self.assertEqual([ln.split()[0] for ln in lines], ["20261118_123000", STAMP])
+
+    def test_suffixed_session_dir_groups_with_its_run(self):
+        """A `-2` directory (stamp collision after a quick restart) parses and
+        joins its run as a restart of that stream."""
+        self.root.full_run()
+        self.root.imu("imu", STAMP[:-2] + "01-2", rows=500)
+        r = self.check(expect_rc=1)
+        self.assertNotIn("MISSING", r.stdout)
+        self.assertIn(f"recordings/imu/{STAMP[:-2]}01-2", r.stdout)
+        self.assertIn("recorder restarted", r.stdout)
+        r = self.check("--run", STAMP[:-2] + "01-2", expect_rc=1)
+        self.assertIn(f"run {STAMP}", r.stdout)
 
     def test_json_listing(self):
         self.root.full_run()
@@ -285,13 +317,13 @@ class TestCheckStreams(CheckToolBase):
     def test_imu_slow_i2c_burst_warns(self):
         self.root.full_run()
         self.root.imu("imu", STAMP[:-2] + "01", i2c_us_max=9000)
-        # WARN exits 0, like PASS
-        self.run_with("imu", "WARN", "WARN", 0, r"I2C burst up to 9\.0 ms")
+        # WARN exits 1 (PASS 0, FAIL 2)
+        self.run_with("imu", "WARN", "WARN", 1, r"I2C burst up to 9\.0 ms")
 
     def test_imu_few_lost_warns_many_lost_fail(self):
         self.root.full_run()
         self.root.imu("imu", STAMP[:-2] + "01", rows=10000, lost=3, gaps=2)
-        self.run_with("imu", "WARN", "WARN", 0, r"3 samples lost in 2 gaps")
+        self.run_with("imu", "WARN", "WARN", 1, r"3 samples lost in 2 gaps")
         self.root.imu("imu", STAMP[:-2] + "01", rows=1000, lost=200, gaps=20)
         self.run_with("imu", "FAIL", "FAIL", 2)
 
@@ -308,7 +340,7 @@ class TestCheckStreams(CheckToolBase):
     def test_imu_rate_off_warns(self):
         self.root.full_run()
         self.root.imu("imu", STAMP[:-2] + "01", effective_hz=50.0)
-        self.run_with("imu", "WARN", "WARN", 0, r"rate 50\.00 Hz")
+        self.run_with("imu", "WARN", "WARN", 1, r"rate 50\.00 Hz")
 
     def test_camera_lost_frames_fail(self):
         self.root.full_run()
@@ -323,20 +355,20 @@ class TestCheckStreams(CheckToolBase):
     def test_camera_low_fps_warns(self):
         self.root.full_run()
         self.root.camera("camera1", STAMP, fps=24.4)
-        self.run_with("camera1", "WARN", "WARN", 0, r"effective 24\.40 fps")
+        self.run_with("camera1", "WARN", "WARN", 1, r"effective 24\.40 fps")
 
     def test_camera_without_summary(self):
         """No summary: still recording or killed. Frames on disk -> WARN, none -> FAIL."""
         self.root.full_run()
         (self.root.rec / "camera1" / STAMP / "camera1_summary.json").unlink()
-        self.run_with("camera1", "WARN", "WARN", 0, r"no summary\.json: still recording, or the recorder was killed")
+        self.run_with("camera1", "WARN", "WARN", 1, r"no summary\.json: still recording, or the recorder was killed")
         (self.root.rec / "camera1" / STAMP / "camera1_timestamps.bin").write_bytes(b"")
         self.run_with("camera1", "FAIL", "FAIL", 2)
 
     def test_imu_without_summary(self):
         self.root.full_run()
         (self.root.rec / "imu" / (STAMP[:-2] + "01") / "imu_summary.json").unlink()
-        self.run_with("imu", "WARN", "WARN", 0, r"1000 samples so far")
+        self.run_with("imu", "WARN", "WARN", 1, r"1000 samples so far")
         (self.root.rec / "imu" / (STAMP[:-2] + "01") / "imu.csv").unlink()
         self.run_with("imu", "FAIL", "FAIL", 2)
 
@@ -345,7 +377,7 @@ class TestCheckStreams(CheckToolBase):
         self.root.full_run()
         text = json.dumps(imu_usb_summary())
         self.root.imu("imu", STAMP[:-2] + "01", summary=text[: len(text) // 2])
-        self.run_with("imu", "WARN", "WARN", 0, r"no summary\.json")
+        self.run_with("imu", "WARN", "WARN", 1, r"no summary\.json")
 
     def test_summary_missing_keys_does_not_crash(self):
         """An older/foreign summary without the expected keys gives FAIL 'could not read', not a traceback."""
@@ -356,30 +388,69 @@ class TestCheckStreams(CheckToolBase):
         r = self.run_with("camera1", "FAIL", "FAIL", 2, r"could not read: KeyError")
         self.assertNotIn("Traceback", r.stderr)
 
-    def test_in_progress_summary_current_behaviour(self):
-        """Periodic summaries (R4/R13) carry "in_progress": true while a recorder runs.
-
-        CURRENT BEHAVIOUR, documented, not desired: ewego-check ignores the
-        key and judges the partial summary as if it were final (PASS here,
-        no note). When the tool learns the key (e.g. WARN "still
-        recording"), change these expectations."""
+    def test_in_progress_summary(self):
+        """R38: periodic summaries (R4/R13) carry "in_progress": true and
+        "exit_code": null while a recorder runs, or after it was killed /
+        lost power. The counters are reported ("so far"), the stream WARNs
+        (never FAILs for this alone) and the run is called not complete."""
         self.root.full_run()
-        self.root.imu("imu", STAMP[:-2] + "01", in_progress=True, exit_code=0)
-        self.root.camera("camera1", STAMP, in_progress=True)
-        r = self.check(expect_rc=0)
+        self.root.imu("imu", STAMP[:-2] + "01", in_progress=True, exit_code=None)
+        self.root.camera("camera1", STAMP, in_progress=True, exit_code=None)
+        r = self.check(expect_rc=1)
         v = self.verdicts(r.stdout)
-        self.assertEqual((v["imu"], v["camera1"], v["overall"]), ("PASS", "PASS", "PASS"), r.stdout)
-        self.assertNotRegex(r.stdout.lower(), r"in.progress")
+        self.assertEqual((v["imu"], v["camera1"], v["overall"]), ("WARN", "WARN", "WARN"), r.stdout)
+        self.assertRegex(r.stdout, r"imu\s+WARN\s+so far: 1000 samples")
+        self.assertRegex(r.stdout, r"camera1\s+WARN\s+so far: 300 frames")
+        self.assertIn("final summary is missing", r.stdout)
+        self.assertIn("run not complete: no final summary for camera1, imu", r.stdout)
+        self.assertNotIn("exit code None", r.stdout)
+
+    def test_final_summary_after_in_progress_is_complete(self):
+        self.root.full_run()
+        self.root.imu("imu", STAMP[:-2] + "01", in_progress=False, exit_code=0)
+        r = self.check(expect_rc=0)
+        self.assertNotIn("not complete", r.stdout)
+
+    def test_output_error_exit_4_fails_with_message(self):
+        """R38: exit code 4 / writer_error (card full, I/O) FAILs, naming the error."""
+        self.root.full_run()
+        self.root.imu("imu-uart", STAMP[:-2] + "02", exit_code=4, writer_error=3,
+                      writer_error_msg="write imu-uart.csv: No space left on device")
+        r = self.run_with("imu-uart", "FAIL", "FAIL", 2, r"output error: write imu-uart\.csv: No space left on device")
+        self.assertIn("exit code 4 (output error (card full / I/O))", r.stdout)
+        self.root.imu("imu-uart", STAMP[:-2] + "02")
+        self.root.camera("camera2", STAMP[:-2] + "01", exit_code=4,
+                         writer={"error": 1, "error_msg": "write camera2.mjpeg: Input/output error", "discarded": 12})
+        self.run_with("camera2", "FAIL", "FAIL", 2,
+                      r"output error: write camera2\.mjpeg: Input/output error; 12 frames discarded")
+
+    def test_writer_error_alone_fails(self):
+        """writer_error > 0 in a periodic summary (no exit code yet) still FAILs."""
+        self.root.full_run()
+        self.root.imu("imu", STAMP[:-2] + "01", in_progress=True, exit_code=None, writer_error=1,
+                      writer_error_msg="fdatasync imu.csv: Input/output error")
+        self.run_with("imu", "FAIL", "FAIL", 2, r"output error: fdatasync imu\.csv")
+
+    def test_uart_fusion_stalls_warn(self):
+        self.root.full_run()
+        self.root.imu("imu-uart", STAMP[:-2] + "02", fusion_stalls=2, fusion_reinits=1, fusion_invalid=40)
+        self.run_with("imu-uart", "WARN", "WARN", 1, r"fusion stalled 2 time\(s\), re-initialised 1 time\(s\)")
+
+    def test_other_exit_codes_explained(self):
+        self.root.full_run()
+        self.root.imu("imu", STAMP[:-2] + "01", exit_code=3)
+        r = self.check(expect_rc=0)
+        self.assertIn("recorder exit code 3 (stalled or device gone)", r.stdout)
 
     def test_audio_header_not_final_warns(self):
         self.root.full_run()
         self.root.audio(STAMP[:-2] + "02", final_header=False)
-        self.run_with("audio", "WARN", "WARN", 0, r"WAV header length not final")
+        self.run_with("audio", "WARN", "WARN", 1, r"WAV header length not final")
 
     def test_audio_silence_warns(self):
         self.root.full_run()
         self.root.audio(STAMP[:-2] + "02", amp=0.0)
-        self.run_with("audio", "WARN", "WARN", 0, r"near silence")
+        self.run_with("audio", "WARN", "WARN", 1, r"near silence")
 
     def test_audio_not_a_wav_fails(self):
         self.root.full_run()
@@ -389,14 +460,14 @@ class TestCheckStreams(CheckToolBase):
     def test_fuel_low_battery_warns(self):
         self.root.full_run()
         self.root.fuel(STAMP[:-2] + "03", volts=3.4)
-        self.run_with("fuel", "WARN", "WARN", 0, r"battery at 3\.4")
+        self.run_with("fuel", "WARN", "WARN", 1, r"battery at 3\.4")
 
     def test_gps_without_fix(self):
         self.root.full_run()
         self.root.gps(STAMP, n=50, nofix=50)
         self.run_with("gps", "FAIL", "FAIL", 2, r"50 of 50 epochs without a position fix")
         self.root.gps(STAMP, n=50, nofix=10)
-        self.run_with("gps", "WARN", "WARN", 0)
+        self.run_with("gps", "WARN", "WARN", 1)
 
 
 class TestCheckFunctions(unittest.TestCase):
@@ -433,14 +504,31 @@ class TestCheckFunctions(unittest.TestCase):
                 self.assertEqual(self.tool.check_imu(d, "imu")[0], want)
 
     def test_runs_grouping_window(self):
-        """Sessions within 60 s of the first one form a run; a unit seen twice starts a new run."""
-        self.root.imu("imu", "20261118_120000")
+        """R38 rule: a session joins the newest run when it starts within 60 s
+        of the run's first session or before the run's last session ended; a
+        unit seen twice in a run is a restart, not a new run."""
+        self.root.imu("imu", "20261118_120000")         # 10 s each (1000 rows at 100 Hz)
         self.root.imu("imu-uart", "20261118_120059")
-        self.root.imu("imu", "20261118_120030")    # imu again -> new run
+        self.root.imu("imu", "20261118_120030")         # imu again within 60 s -> restart in the same run
         rs = self.tool.runs(self.root.path)
-        self.assertEqual([sorted(r["units"]) for r in rs], [["imu", "imu-uart"], ["imu"]])
-        self.root.camera("camera1", "20261118_120200")  # > 60 s after 12:00:30
-        self.assertEqual(len(self.tool.runs(self.root.path)), 3)
+        self.assertEqual([sorted(r["units"]) for r in rs], [["imu", "imu-uart"]])
+        self.assertEqual([p.name for _, p in rs[0]["restarts"]["imu"]], ["20261118_120030"])
+        self.root.camera("camera1", "20261118_120200")  # > 60 s after 12:00:00 and after 12:01:09 (last end)
+        self.assertEqual(len(self.tool.runs(self.root.path)), 2)
+        self.root.camera("camera2", "20261118_120205")
+        self.assertEqual([sorted(r["units"]) for r in self.tool.runs(self.root.path)][0], ["camera1", "camera2"])
+
+    def test_session_span_without_summary(self):
+        """Grouping uses the summary, or the timestamps / CSV / WAV when there is none."""
+        d = self.root.camera("camera1", STAMP, summary=None, frames=301)
+        self.assertAlmostEqual(self.tool.session_span("camera1", d), 10.0, places=1)
+        d = self.root.imu("imu", STAMP, summary=None, rows=1000)
+        self.assertAlmostEqual(self.tool.session_span("imu", d), 9.99, places=2)
+        d = self.root.audio(STAMP, seconds=1.0)
+        self.assertAlmostEqual(self.tool.session_span("audio", d), 1.0, places=3)
+        d = self.root.fuel(STAMP, n=30)
+        self.assertAlmostEqual(self.tool.session_span("fuel", d), 58.0)
+        self.assertEqual(self.tool.session_span("camera2", self.root.session("camera2", STAMP)), 0.0)
 
 
 if __name__ == "__main__":

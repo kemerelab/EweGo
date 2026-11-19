@@ -62,23 +62,23 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` merged.
 
 ## Lane B1: console (`Firmware/webtest/`, new `image/units/ewego-preview*.service`)
 
-- [ ] **R19** Preview becomes systemd units (`ewego-preview@camera1/2`,
+- [x] **R19** Preview becomes systemd units (`ewego-preview@camera1/2`,
   `ewego-preview-imu-usb`, `ewego-preview-imu-uart`) with `Conflicts=` on their
   recorders; the console starts/stops them with `systemctl` and never spawns a
   recorder itself. The idle reaper stays (stop the units after 90 s without a
   live client).
-- [ ] **R20** Device tests are refused while the owning recorder is `active`,
+- [x] **R20** Device tests are refused while the owning recorder is `active`,
   `activating`, `reloading` or `deactivating`, or while the serial bridge or a
   preview unit holds the device; unit start refuses while a test or the bridge
   holds a device.
-- [ ] **R21** Every POST requires the header `X-EweGo: 1` (defeats cross-site simple
+- [x] **R21** Every POST requires the header `X-EweGo: 1` (defeats cross-site simple
   requests); the live page and console JS send it.
-- [ ] **R22** RECORDING badge means every recorder unit is active *and* its live
+- [x] **R22** RECORDING badge means every recorder unit is active *and* its live
   JSON is fresh (< 2 s) and reports no `writer_error`; otherwise show which
   recorder is down.
-- [ ] **R23** Handler socket timeout (30 s) and a cap on concurrent stream
+- [x] **R23** Handler socket timeout (30 s) and a cap on concurrent stream
   connections; `status()` uses the single-call `units_active()`.
-- [ ] **R24** Heavy work (`check`, `camrec`, journal dumps) refused while the target
+- [x] **R24** Heavy work (`check`, `camrec`, journal dumps) refused while the target
   is active; battery read from the fuel logger's CSV when the fuel unit is
   running instead of opening the I2C bus.
 

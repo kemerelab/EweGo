@@ -16,9 +16,12 @@ EnvironmentFile=-/etc/ewego/gps.conf
 # Exit 1 = could not open the port / log file, 3 = 5 s of nothing but
 # read/write errors; both restart. A dropped NTRIP stream does not exit
 # (it reconnects every 30 s).
+# Free-space guard: below 500 MB the start is skipped (exit 75; not a
+# failure, no restart loop) and /run/ewego/space.json says why.
+ExecCondition=/usr/local/bin/ewego-check-space /opt/ewego/gps-logs
 ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs $NTRIP_ARGS
-# gps_logger.py stops cleanly on KeyboardInterrupt
 OOMScoreAdjust=-500
+# gps_logger.py stops cleanly on KeyboardInterrupt
 KillSignal=SIGINT
 TimeoutStopSec=15
 Restart=on-failure

@@ -15,6 +15,9 @@ EnvironmentFile=-/etc/ewego/fuel.conf
 Environment=PYTHONUNBUFFERED=1
 # The logger is also the low-battery guard: it runs `systemctl poweroff`
 # when SOC and voltage stay below the thresholds (see fuel.conf).
+# Records the free space in /run/ewego/space.json but never blocks: the
+# low-battery guard must run even on a full card (its CSV is ~4 MB a day).
+ExecStartPre=-/usr/local/bin/ewego-check-space ${OUT_DIR} 0
 ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/fuel_gauge/log_fuel_gauge.py --out ${OUT_DIR} --interval ${INTERVAL} --shutdown ${SHUTDOWN} --shutdown-soc ${SHUTDOWN_SOC} --shutdown-voltage ${SHUTDOWN_VOLTAGE} --shutdown-samples ${SHUTDOWN_SAMPLES}
 # the low-battery guard is the last thing the OOM killer may take
 OOMScoreAdjust=-900

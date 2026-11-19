@@ -15,9 +15,12 @@ EnvironmentFile=-/etc/ewego/audio.conf
 # audio-02.wav ... past 2 GiB). ewego-audio-record finds the voicehat card by
 # name unless DEVICE is set, then execs arecord, so arecord is the main
 # process and receives SIGINT directly.
+# Free-space guard: below 500 MB the start is skipped (exit 75; not a
+# failure, no restart loop) and /run/ewego/space.json says why.
+ExecCondition=/usr/local/bin/ewego-check-space ${OUT_DIR}
 ExecStart=/usr/local/bin/ewego-audio-record ${OUT_DIR} $DEVICE
-# arecord finishes the WAV header on SIGINT
 OOMScoreAdjust=-500
+# arecord finishes the WAV header on SIGINT
 KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure

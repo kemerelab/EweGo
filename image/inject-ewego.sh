@@ -28,7 +28,8 @@
 #                                                latter starts ewego-record.target
 #                                                when /boot/firmware/ewego-record
 #                                                exists)
-#           /usr/local/bin/ewego-audio-record    helper scripts from image/ewego/*.sh
+#           /usr/local/bin/ewego-audio-record,   helper scripts from image/ewego/*.sh
+#                          ewego-check-space
 #           /etc/modules-load.d/ewego.conf       i2c-dev
 #           /etc/systemd/journald.conf.d/ewego.conf  persistent journal capped at
 #                                                100M, rate-limited
@@ -73,7 +74,7 @@ while [ $# -gt 0 ]; do
         --no-apt) DO_APT=0; shift ;;
         --no-uvc) DO_UVC=0; shift ;;
         --grow)   GROW=$2; shift 2 ;;
-        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
         -*)       die "unknown option $1" ;;
         *)        [ -z "$TARGET" ] || die "unexpected argument $1"; TARGET=$1; shift ;;
     esac

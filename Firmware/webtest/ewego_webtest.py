@@ -1574,6 +1574,9 @@ HEAVY_TESTS = {
 }
 
 
+JOURNAL_MAX_LINES = 200   # journal tails stay bounded; they are allowed while recording
+
+
 def recording_active():
     return unit_busy("ewego-record.target")
 
@@ -1918,17 +1921,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def journal(self, q):
         unit = q.get("unit", ["ewego-cam@camera1"])[0]
-        n = min(int(q.get("n", ["100"])[0]), 2000)
+        try:
+            n = min(max(int(q.get("n", ["100"])[0]), 1), JOURNAL_MAX_LINES)
+        except ValueError:
+            n = 100
         if unit not in UNITS + list(PREVIEW_UNITS.values()) + ["ewego-webtest"]:
             self.send_json({"error": "unknown unit"}, 404)
             return
-        if recording_active():
-            self.send_bytes(b"Journal dumps are refused while recording (ewego-record.target is up): "
-                            b"journalctl reads the persistent journal on the SD card the recorders are "
-                            b"writing to. The live page shows each recorder's state; stop recording to "
-                            b"read the journal here, or use journalctl over SSH.\n",
-                            "text/plain; charset=utf-8", 409)
-            return
+        # allowed while recording: a bounded tail is a small read, and it is the
+        # diagnostic for a recorder misbehaving during a live run
         rc, out = sh(["journalctl", "-u", unit, "-n", str(n), "--no-pager", "-o", "short-precise"])
         self.send_bytes(out.encode(), "text/plain; charset=utf-8")
 

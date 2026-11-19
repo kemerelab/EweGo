@@ -463,10 +463,16 @@ class HeavyWorkAndBattery(Base):
             code, body = self.get(path)
             self.assertEqual(code, 409, path)
             self.assertIn("while recording", body["error"])
-        code, body = self.get("/api/journal?unit=ewego-cam@camera1")
-        self.assertEqual(code, 409)
-        self.assertIn("while recording", body)
-        self.assertEqual(self.fake.ran("journalctl"), [])
+
+    def test_journal_tail_allowed_while_recording_and_capped(self):
+        self.fake.states = {"ewego-record.target": "active"}
+        code, body = self.get("/api/journal?unit=ewego-cam@camera1&n=5000")
+        self.assertEqual(code, 200)
+        calls = self.fake.ran("journalctl", "-u", "ewego-cam@camera1")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[argv.index("-n") + 1], "200")
+        self.assertIn("--no-pager", argv)
 
     def test_journal_allowed_when_idle(self):
         code, body = self.get("/api/journal?unit=ewego-preview@camera1")

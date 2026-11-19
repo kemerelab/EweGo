@@ -53,9 +53,12 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
   camera and IMU journals, recording directories, **Check last run** (runs
   `Firmware/tools/ewego-check.py`: a PASS/WARN/FAIL line per stream of the
   latest run, and how far apart the streams started) and **List runs**.
-  Check last run, the ewego-cam record test and journal tails are refused
-  while `ewego-record.target` is up: they read or write the SD card the
-  recorders are writing to. Stop recording first, or use SSH.
+  Check last run and the ewego-cam record test are refused while
+  `ewego-record.target` is up: they read or write a lot on the SD card the
+  recorders are writing to. Stop recording first, or use SSH. Journal
+  tails stay available while recording (at most 200 lines,
+  `journalctl -u <unit> -n N --no-pager`): they are the diagnostic for a
+  recorder misbehaving during a live run.
 - **Shut down / Reboot**: stops `ewego-record.target` first so every
   recorder writes its summary, runs `sync`, then powers off or reboots.
   Use it instead of the power switch after a recording: cutting power

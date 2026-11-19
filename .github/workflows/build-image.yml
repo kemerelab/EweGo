@@ -74,6 +74,12 @@ jobs:
           make -C Firmware/uvccam CC=gcc && ./Firmware/uvccam/ewego-cam --help | head -3 && make -C Firmware/uvccam clean
           make -C Firmware/usbimu CC=gcc && ./Firmware/usbimu/ewego-imu-usb --help | head -3 && make -C Firmware/usbimu clean
           make -C Firmware/imuuart CC=gcc && ./Firmware/imuuart/ewego-imu-uart --help | head -3 && make -C Firmware/imuuart clean
+      - name: Tests
+        # stdlib unittest, no hardware (tests/README.md); builds the C tools
+        # it needs in a temp dir. unittest exits non-zero on any failure,
+        # error or unexpected success, which fails the job.
+        timeout-minutes: 10
+        run: python3 -m unittest discover -s tests -v
       - name: Cross-compile C tools (static arm64)
         run: |
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu

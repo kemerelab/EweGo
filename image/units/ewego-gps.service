@@ -1,10 +1,10 @@
 [Unit]
 Description=EweGo GPS logger (raw UBX + time sync CSV)
-Documentation=file:///opt/ewego/Firmware/gps-test/GPS_SERVICE_SETUP.md
+Documentation=file:///opt/ewego/Firmware/gps-test/README.md
 After=local-fs.target
 PartOf=ewego-record.target
-StartLimitIntervalSec=200
-StartLimitBurst=5
+# keep retrying (RestartSec apart) for as long as the target runs
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -13,6 +13,9 @@ Environment=PYTHONPATH=/opt/ewego/pylib
 Environment=PYTHONUNBUFFERED=1
 # NTRIP_ARGS (e.g. --ntrip 192.168.1.213:2101/sheep) comes from /etc/ewego/gps.conf; empty = no RTK corrections
 EnvironmentFile=-/etc/ewego/gps.conf
+# Exit 1 = could not open the port / log file, 3 = 5 s of nothing but
+# read/write errors; both restart. A dropped NTRIP stream does not exit
+# (it reconnects every 30 s).
 ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs $NTRIP_ARGS
 # gps_logger.py stops cleanly on KeyboardInterrupt
 KillSignal=SIGINT

@@ -2,6 +2,12 @@
 """
 GPS Logger with Time Synchronization Tracking
 Logs GPS data and maintains correlation between GPS time and system time
+
+Exit status (unit ewego-gps restarts on failure):
+  0  stopped by SIGINT / Ctrl+C
+  1  could not start (serial port or log file)
+  3  READ_ERROR_LIMIT_S seconds of nothing but read/write errors, or the
+     read thread ended on its own
 """
 
 import serial
@@ -10,10 +16,52 @@ import time
 import sys
 import os
 import base64
+import fcntl
+import termios
 from datetime import datetime, timezone
 from pyubx2 import UBXReader
 import socket
 import csv
+
+EXIT_START_FAILED = 1
+EXIT_READ_ERRORS = 3
+READ_ERROR_LIMIT_S = 5.0   # consecutive read/write errors for this long -> exit 3
+FLUSH_EVERY_S = 1.0        # .ubx buffer pushed to the kernel
+FSYNC_EVERY_S = 5.0        # .ubx and _timesync.csv pushed to the card
+STATUS_EVERY_S = 30.0      # status line in the journal
+NTRIP_RETRY_S = 30.0       # wait between NTRIP reconnect attempts
+
+
+class ErrorStreak:
+    """Consecutive read/write errors in the read loop.
+
+    error(now) returns "first" for the first error of a streak (print it),
+    "continue" while the streak is younger than limit_s, and "give_up" once
+    errors alone have lasted limit_s seconds. ok() ends the streak and
+    returns how many errors it had (0 if none)."""
+
+    def __init__(self, limit_s=READ_ERROR_LIMIT_S):
+        self.limit_s = limit_s
+        self.first = None
+        self.count = 0
+
+    def error(self, now):
+        self.count += 1
+        if self.first is None:
+            self.first = now
+            return "give_up" if self.limit_s <= 0 else "first"
+        if now - self.first >= self.limit_s:
+            return "give_up"
+        return "continue"
+
+    def ok(self):
+        n = self.count
+        self.first = None
+        self.count = 0
+        return n
+
+    def duration(self, now):
+        return 0.0 if self.first is None else now - self.first
 
 class TimeSync:
     """Track GPS time vs system time correlation"""
@@ -51,7 +99,13 @@ class TimeSync:
                 num_sv
             ])
             self.sync_file.flush()
-    
+
+    def fsync(self):
+        """Push the time sync rows to the card."""
+        if self.sync_file:
+            self.sync_file.flush()
+            os.fsync(self.sync_file.fileno())
+
     def close(self):
         """Close time sync log"""
         if self.sync_file:
@@ -71,7 +125,7 @@ class NTRIPClient:
         self.socket = None
         self.running = False
         
-    def connect(self):
+    def connect(self, verbose=True):
         """Connect to NTRIP caster"""
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -106,11 +160,25 @@ class NTRIPClient:
             return True
             
         except Exception as e:
-            print(f"✗ NTRIP connection failed: {e}")
+            if verbose:
+                print(f"✗ NTRIP connection failed: {e}")
+            self.disconnect()
             return False
-    
+
+    def disconnect(self):
+        """Drop the socket (the worker reconnects later)"""
+        if self.socket:
+            try:
+                self.socket.close()
+            except OSError:
+                pass
+        self.socket = None
+
     def read_corrections(self):
-        """Read RTCM corrections from NTRIP stream"""
+        """Read RTCM corrections from NTRIP stream.
+
+        Returns the bytes read, b'' when the caster closed the stream, or
+        None on a socket error or 10 s without data."""
         if self.socket:
             try:
                 data = self.socket.recv(1024)
@@ -122,15 +190,19 @@ class NTRIPClient:
     def close(self):
         """Close NTRIP connection"""
         if self.socket:
-            self.socket.close()
+            self.disconnect()
             print("✓ NTRIP connection closed")
 
 
 class GPSLogger:
     """Main GPS logger class with time synchronization"""
     
-    def __init__(self, serial_port, baudrate=230400, ntrip_config=None, log_dir=None):
+    def __init__(self, serial_port, baudrate=230400, ntrip_config=None, log_dir=None,
+                 status_every=STATUS_EVERY_S):
         self.serial_port = serial_port
+        self.status_every = status_every
+        self.errors = ErrorStreak(READ_ERROR_LIMIT_S)
+        self.exit_code = 0
         self.baudrate = baudrate
         self.ntrip_config = ntrip_config
         
@@ -182,6 +254,12 @@ class GPSLogger:
                 self.baudrate,
                 timeout=1
             )
+            # Exclusive open: a second logger or a console test opening the
+            # same port would otherwise steal bytes from the .ubx stream.
+            try:
+                fcntl.ioctl(self.ser.fileno(), termios.TIOCEXCL)
+            except (OSError, AttributeError, ValueError) as e:
+                print(f"⚠ Could not get exclusive access to {self.serial_port}: {e}")
             self.ubr = UBXReader(self.ser)
             print(f"✓ Connected to GPS: {self.serial_port} @ {self.baudrate} baud")
             return True
@@ -215,46 +293,70 @@ class GPSLogger:
             print(f"✗ Failed to open log file: {e}")
             return False
     
+    def _sleep_while_running(self, seconds):
+        """Sleep up to seconds, returning early (False) when stopping."""
+        t_end = time.monotonic() + seconds
+        while self.running and time.monotonic() < t_end:
+            time.sleep(0.5)
+        return self.running
+
     def ntrip_worker(self):
-        """Thread worker to read NTRIP corrections and send to GPS"""
+        """Thread worker to read NTRIP corrections and send to GPS.
+
+        If the caster is unreachable or the stream drops, it retries every
+        NTRIP_RETRY_S seconds; the .ubx logging carries on without
+        corrections meanwhile (degraded, not fatal)."""
         print("⚡ NTRIP correction thread started")
-        
-        rtcm_count = 0
-        last_rtcm_time = time.time()
-        
+
+        down_reported = False
+        last_rtcm_print = time.monotonic()
+        rtcm_since_print = 0
+
         while self.running and self.ntrip:
+            if self.ntrip.socket is None:
+                if not down_reported:
+                    print(f"⚠ NTRIP not connected; retrying every {NTRIP_RETRY_S:.0f} s "
+                          "(logging continues without corrections)")
+                    down_reported = True
+                if not self._sleep_while_running(NTRIP_RETRY_S):
+                    break
+                if self.ntrip.connect(verbose=False):
+                    down_reported = False
+                continue
+
+            corrections = self.ntrip.read_corrections()
+            if not corrections:  # b'' = caster closed the stream, None = error / 10 s silence
+                print("⚠ NTRIP stream dropped" + (" (closed by caster)" if corrections == b"" else ""))
+                self.ntrip.disconnect()
+                continue
             try:
-                corrections = self.ntrip.read_corrections()
-                if corrections and len(corrections) > 0:
-                    # Send RTCM corrections to GPS module
-                    bytes_written = self.ser.write(corrections)
-                    self.ser.flush()  # Ensure data is sent immediately
-                    self.stats['rtcm_bytes'] += len(corrections)
-                    rtcm_count += 1
-                    
-                    # Debug output every 10 RTCM messages
-                    if rtcm_count % 10 == 0:
-                        elapsed = time.time() - last_rtcm_time
-                        rate = 10.0 / elapsed if elapsed > 0 else 0
-                        print(f"\n[RTCM] Sent {len(corrections)} bytes (rate: {rate:.1f} msg/s, total: {self.stats['rtcm_bytes']} bytes)")
-                        last_rtcm_time = time.time()
-                else:
-                    time.sleep(0.1)  # Small delay if no data
-                    
+                # Send RTCM corrections to GPS module
+                self.ser.write(corrections)
+                self.ser.flush()  # Ensure data is sent immediately
             except Exception as e:
-                print(f"⚠ NTRIP error: {e}")
+                print(f"⚠ NTRIP: sending corrections to the receiver failed: {e}")
                 time.sleep(1)
-        
+                continue
+            self.stats['rtcm_bytes'] += len(corrections)
+            rtcm_since_print += 1
+            now = time.monotonic()
+            if now - last_rtcm_print >= self.status_every:
+                print(f"[RTCM] {rtcm_since_print} blocks in {now - last_rtcm_print:.0f} s, "
+                      f"total {self.stats['rtcm_bytes']} bytes")
+                last_rtcm_print = now
+                rtcm_since_print = 0
+
         print("⚡ NTRIP correction thread stopped")
-    
+
     def read_worker(self):
         """Thread worker to read GPS data and log it"""
         print("⚡ GPS read thread started")
         
         last_status_time = time.time()
+        last_flush = last_fsync = time.monotonic()
         parse_errors = 0
         total_reads = 0
-        
+
         while self.running:
             try:
                 # Record system time
@@ -329,16 +431,43 @@ class GPSLogger:
                             error_rate = (parse_errors / total_reads) * 100
                             print(f"\n⚠ Parse error rate: {error_rate:.1f}% ({parse_errors}/{total_reads})")
                     
-                    # Print status every 2 seconds
-                    if time.time() - last_status_time >= 2.0:
+                    # Print status every status_every seconds
+                    if time.time() - last_status_time >= self.status_every:
                         self.print_status()
                         last_status_time = time.time()
-                        
+
+                # The .ubx goes through a buffered file: hand it to the kernel
+                # every second and to the card every few seconds, so a power
+                # cut loses seconds of data, not the buffer.
+                now_m = time.monotonic()
+                if now_m - last_flush >= FLUSH_EVERY_S:
+                    self.logfile.flush()
+                    last_flush = now_m
+                    if now_m - last_fsync >= FSYNC_EVERY_S:
+                        os.fsync(self.logfile.fileno())
+                        self.timesync.fsync()
+                        last_fsync = now_m
+
+                n = self.errors.ok()
+                if n:
+                    print(f"✓ Reading again after {n} read/write error(s)")
+
             except Exception as e:
-                if self.running:  # Only print if not shutting down
-                    print(f"\n⚠ Read error: {e}")
-                    time.sleep(0.1)
-        
+                if not self.running:  # shutting down: the port was closed under us
+                    break
+                now_m = time.monotonic()
+                state = self.errors.error(now_m)
+                if state == "first":
+                    print(f"⚠ Read/write error: {e} (exiting with status {EXIT_READ_ERRORS} "
+                          f"if errors continue for {self.errors.limit_s:g} s)")
+                elif state == "give_up":
+                    print(f"✗ {self.errors.count} consecutive read/write errors over "
+                          f"{self.errors.duration(now_m):.1f} s (last: {e}); exiting with status {EXIT_READ_ERRORS}")
+                    self.exit_code = EXIT_READ_ERRORS
+                    self.running = False
+                    break
+                time.sleep(0.1)
+
         print("⚡ GPS read thread stopped")
     
     def print_status(self):
@@ -374,7 +503,7 @@ class GPSLogger:
         else:
             msg_rate = 0
         
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] "
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] "
               f"Fix: {fix_str:15s} | "
               f"Sats: {self.stats['last_num_sv']:2d} | "
               f"Lat: {self.stats['last_lat']:11.7f} | "
@@ -384,7 +513,7 @@ class GPSLogger:
               f"Msgs: {self.stats['messages']:5d} ({msg_rate:.1f} Hz) | "
               f"Logged: {self.stats['bytes_logged']/1024:.1f} KB | "
               f"RTCM: {self.stats['rtcm_bytes']/1024:.1f} KB{' !!' if self.ntrip else ''}",
-              end='', flush=True)
+              flush=True)
     
     def start(self):
         """Start logging"""
@@ -418,7 +547,7 @@ class GPSLogger:
         self.read_thread.start()
         
         print("\n✓ Logging started - Press Ctrl+C to stop\n")
-        print("Status display updates every 2 seconds:")
+        print(f"Status display updates every {self.status_every:g} seconds:")
         print("Time offset shows (System Time - GPS Time)")
         print("-" * 80)
         
@@ -440,6 +569,11 @@ class GPSLogger:
         
         # Close connections
         if self.logfile:
+            try:
+                self.logfile.flush()
+                os.fsync(self.logfile.fileno())
+            except (OSError, ValueError) as e:
+                print(f"⚠ Could not sync {self.log_filename}: {e}")
             self.logfile.close()
             print(f"✓ Log file closed: {self.log_filename}")
         
@@ -479,6 +613,8 @@ def main():
                              '192.168.1.213:2101/sheep (the lab Sparkfun caster). '
                              'Default: $EWEGO_NTRIP, or disabled.')
     parser.add_argument('--no-ntrip', action='store_true', help='Disable RTK corrections')
+    parser.add_argument('--status-every', type=float, default=STATUS_EVERY_S,
+                        help=f'seconds between status lines (default {STATUS_EVERY_S:g})')
     args = parser.parse_args()
 
     # ========== CONFIGURATION ==========
@@ -512,20 +648,30 @@ def main():
         serial_port=SERIAL_PORT,
         baudrate=BAUDRATE,
         ntrip_config=NTRIP_CONFIG,
-        log_dir=args.log_dir
+        log_dir=args.log_dir,
+        status_every=args.status_every
     )
-    
-    # Start logging
-    if logger.start():
-        try:
-            # Run until Ctrl+C
-            while True:
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            pass
-    
+
+    # Start logging; a failed start must exit non-zero so the unit's
+    # Restart=on-failure tries again
+    if not logger.start():
+        logger.stop()
+        sys.exit(EXIT_START_FAILED)
+
+    # Run until Ctrl+C / SIGINT, or until the read thread gives up
+    interrupted = False
+    try:
+        while logger.read_thread.is_alive():
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        interrupted = True
+    if not interrupted and logger.exit_code == 0:
+        print("✗ GPS read thread ended unexpectedly")
+        logger.exit_code = EXIT_READ_ERRORS
+
     # Stop logging
     logger.stop()
+    sys.exit(logger.exit_code)
 
 
 if __name__ == '__main__':

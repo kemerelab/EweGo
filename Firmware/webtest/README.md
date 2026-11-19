@@ -11,17 +11,22 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
 
 - **Status strip**, refreshed every 5 s: image version, uptime, clock
   synchronized or not, battery voltage and state of charge, free space,
-  load and temperature, IP addresses.
+  load and temperature, IP addresses. While `ewego-fuel` runs, the battery
+  comes from the newest row of its `fuel_gauge.csv` (the console does not
+  open the I2C bus the logger is using); otherwise from the MAX17048
+  directly.
 - **Devices**: whether `/dev/ttyAMA4`, `/dev/ttyAMA5`, `/dev/i2c-1`, the
   voicehat sound card and any cameras exist, plus buttons for serial port
   mapping, `i2cdetect`, USB tree, ALSA cards, the effective `config.txt`,
   and a `dmesg` tail.
 - **Units**: state of `ewego-record.target` and its members (`ewego-cam@camera1/2`,
   `ewego-imu-usb`, `ewego-gps`, `ewego-audio`, `ewego-fuel`), with
-  start/stop, journal tail, and a listing of recording directories.
+  start/stop, journal tail (also of the preview units), and a listing of
+  recording directories. Starting a unit is refused while a console test
+  or the GPS serial bridge holds its device.
 - **Fuel gauge**: read voltage, SOC, IC version.
 - **IMU**: run `log_imu_data.py` for N seconds and watch it (refused while
-  `ewego-imu-uart` or the live preview owns the port).
+  `ewego-imu-uart` or `ewego-preview-imu-uart` owns the port).
 - **GPS**: raw read of the port at a chosen baud rate (counts UBX sync
   words, NMEA sentences, RTCM headers), and start/stop/journal of the logger
   unit. The raw read refuses to run while the logger owns the port.
@@ -48,6 +53,9 @@ Open `http://<hostname>.local:8080/` on any device on the same network.
   camera and IMU journals, recording directories, **Check last run** (runs
   `Firmware/tools/ewego-check.py`: a PASS/WARN/FAIL line per stream of the
   latest run, and how far apart the streams started) and **List runs**.
+  Check last run, the ewego-cam record test and journal tails are refused
+  while `ewego-record.target` is up: they read or write the SD card the
+  recorders are writing to. Stop recording first, or use SSH.
 - **Shut down / Reboot**: stops `ewego-record.target` first so every
   recorder writes its summary, runs `sync`, then powers off or reboots.
   Use it instead of the power switch after a recording: cutting power
@@ -78,15 +86,31 @@ A dashboard for the field, built for a phone on the wearable's Wi-Fi:
   file, so it is live only while `ewego-gps` runs and a few seconds behind
   the receiver; PPS from the kernel directly.
 - **Wearable**: battery, free space, load and temperature, unit states.
-- **Controls**: *Preview (no recording)* starts `ewego-cam --preview` for
-  both cameras and both IMU recorders in `--preview` so you can aim the cameras and
-  check the IMU before recording; it writes nothing to the card and stops
-  itself after 90 s without a viewer. *Start recording* stops the preview
-  first (the recorders need the cameras). *Shut down* and *Reboot* as on
-  the console.
+- **Badge**: *RECORDING* (solid red) only when every recorder
+  (`ewego-cam@camera1/2`, `ewego-imu-usb`, `ewego-imu-uart`) is active,
+  its live file in `/run/ewego` is less than 2 s old, and it reports no
+  `writer_error`. Otherwise the badge has a red outline and names the
+  ones that are not, e.g. *RECORDING (camera2 down, imu-uart starting)*,
+  and the Wearable card says why for each (failed, no live data, stale,
+  writer error). `ewego-record.target` alone is not enough: it stays
+  active while its members fail. *PREVIEW*, *IDLE* and *NO LINK* as before.
+- **Controls**: *Preview (no recording)* starts the preview units
+  `ewego-preview@camera1`, `ewego-preview@camera2`,
+  `ewego-preview-imu-usb` and `ewego-preview-imu-uart` (the recorders in
+  `--preview`) so you can aim the cameras and check the IMUs before
+  recording; they write nothing to the card. The console stops them after
+  90 s without a viewer (and each unit stops itself after an hour if the
+  console is gone). A preview refuses to start while its recorder is up;
+  starting a recorder, from the page, from SSH or at boot, stops its
+  preview first, so the two never share a device. Their output is in the
+  journal (`journalctl -u 'ewego-preview*'`, or the Units card on the
+  console). *Shut down* and *Reboot* as on the console.
 
 The page is a single server-sent-events stream (4 updates a second) plus
 one multipart image stream per camera; nothing is decoded on the wearable.
+At most 6 such streams are open at once (one page uses 3); beyond that the
+wearable answers 503 and the page retries after 5 s. A phone that walks
+out of range frees its streams within about 20 s (send timeout).
 (A first version read the image streams with a JavaScript fetch so the
 browser could count bytes; it showed nothing in the field browser, so the
 images are plain `<img>` elements and the wearable counts what it sends.)
@@ -99,13 +123,25 @@ To run it by hand somewhere else:
     sudo python3 ewego_webtest.py --port 8080 --ewego-dir /path/to/EweGo
 
 Only one test may use a given device at a time; a second request gets
-HTTP 409 with a message.
+HTTP 409 with a message. A device test (and the GPS serial bridge, and the
+camera view) also gets 409 while the unit that owns the device is
+`active`, `activating`, `reloading` or `deactivating`, naming the unit and
+its state; a serial open that fails with EBUSY reads "port owned by the
+recorder".
+
+The preview units live in `image/units/` next to the recorders. When
+iterating without an image rebuild, copy them too (see below).
 
 ## Security
 
 There is no authentication and it runs as root. Use it only on networks you
-control (bench, lab, phone hotspot). Disable it on a wearable that will sit
-on a network you do not control:
+control (bench, lab, phone hotspot). Every POST and every `/api/run/` test
+must carry the header `X-EweGo: 1` (the pages send it; anything else gets
+403). A page on another site can only make "simple" cross-site requests,
+which cannot carry custom headers, so it cannot drive the console through
+your browser. That is not authentication: anyone on the network can still
+send the header. Disable the console on a wearable that will sit on a
+network you do not control:
 
     sudo systemctl disable --now ewego-webtest
 
@@ -115,3 +151,11 @@ Copy the file straight to the wearable and restart the unit:
 
     scp Firmware/webtest/ewego_webtest.py user@ewe.local:/tmp/ && \
       ssh user@ewe.local 'sudo install -m 644 /tmp/ewego_webtest.py /opt/ewego/Firmware/webtest/ && sudo systemctl restart ewego-webtest'
+
+On an image older than the preview units, copy those once as well:
+
+    scp image/units/ewego-preview*.service user@ewe.local:/tmp/ && \
+      ssh user@ewe.local 'sudo install -m 644 /tmp/ewego-preview*.service /etc/systemd/system/ && sudo systemctl daemon-reload'
+
+Tests (no hardware needed): `python3 -m unittest discover -s tests -v`
+from the repository root.

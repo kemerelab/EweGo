@@ -2239,7 +2239,7 @@ async function run(name, paneId, extra) {
 
 async function unit(name, action) {
   const r = await (await fetch('/api/unit/' + name + '/' + action, {method: 'POST', headers: TOKEN})).json();
-  $('out-units').textContent = 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output + '\n' + JSON.stringify(r.status);
+  $('out-units').textContent = (r.ok === false ? 'refused: ' + r.message : 'systemctl ' + action + ' ' + name + ' → rc ' + r.rc + '\n' + r.output) + '\n' + JSON.stringify(r.status);
   refresh();
 }
 
@@ -2641,7 +2641,7 @@ async function preview() {
 async function rec(action) {
   $('msg').textContent = action + 'ing recorder…';
   const r = await post('/api/unit/ewego-record.target/' + action);
-  $('msg').textContent = 'systemctl ' + action + ' ewego-record.target → rc ' + r.rc + (r.output ? ' ' + r.output.trim() : '');
+  $('msg').textContent = r.ok === false ? r.message : 'systemctl ' + action + ' ewego-record.target → rc ' + r.rc + (r.output ? ' ' + r.output.trim() : '');
   setTimeout(restartCams, 3000);
 }
 async function power(action) {

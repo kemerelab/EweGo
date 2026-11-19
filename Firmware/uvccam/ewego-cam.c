@@ -168,6 +168,7 @@ struct writer {
 	int64_t t_last_stats, t_last_live, t_last_summary;
 	uint64_t live_frames0;
 	int summary_written, summary_failed;
+	int64_t wd_last_us, extend_last_us;   /* last WATCHDOG=1 / EXTEND_TIMEOUT_USEC= */
 };
 
 #define WB_MAX_INTERVAL_US 2000000   /* writeback step at least this often */
@@ -624,7 +625,7 @@ static void *writer_main(void *arg)
 	for (;;) {
 		struct frame *f;
 		int64_t t0, t1, now;
-		int done;
+		int done, ok;
 
 		pthread_mutex_lock(&q->m);
 		if (!q->head && !q->done) {
@@ -675,9 +676,11 @@ static void *writer_main(void *arg)
 			w->live_last_ts = f->ts_us;
 		}
 
+		ok = 0;
 		if (w->vid_fd < 0) {
 			w->written_frames++;           /* --preview: nothing to write */
 			w->written_bytes += f->len;
+			ok = 1;
 		} else if (w->error) {
 			w->discarded++;                /* output failed: drain, do not write */
 		} else {
@@ -685,6 +688,7 @@ static void *writer_main(void *arg)
 			if (writer_put(w, f) == 0) {
 				w->written_frames++;
 				w->written_bytes += f->len;
+				ok = 1;
 			} else {
 				w->discarded++;
 			}
@@ -694,6 +698,23 @@ static void *writer_main(void *arg)
 		}
 		free(f->data);
 		free(f);
+
+		/* systemd watchdog (WatchdogSec= in the unit): fed only here, right
+		 * after a frame actually reached the files, so a writer stuck on a
+		 * dead card, a stuck capture thread or a camera that stopped
+		 * delivering all end in a restart. While draining the queue at
+		 * stop, keep pushing the stop timeout out as long as writes progress. */
+		if (ok) {
+			now = now_mono_us();
+			if (now - w->wd_last_us >= 2000000) {
+				sd_notify("WATCHDOG=1");
+				w->wd_last_us = now;
+			}
+			if (done && now - w->extend_last_us >= 5000000) {
+				sd_notify("EXTEND_TIMEOUT_USEC=30000000");
+				w->extend_last_us = now;
+			}
+		}
 
 		/* Steady writeback: kick each chunk out to the card as soon as it
 		 * is complete, check the one before it, and drop that from the page
@@ -1321,6 +1342,7 @@ int main(int argc, char **argv)
 			}
 			if (++tries == 1)
 				fprintf(stderr, "ewego-cam: waiting up to %d s for %s ...\n", c.wait_secs, c.device);
+			sd_notify("WATCHDOG=1");   /* a bounded, legitimate wait */
 			usleep(500000);
 		}
 		if (strncmp(c.device, "auto:", 5) == 0)

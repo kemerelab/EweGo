@@ -26,7 +26,9 @@
  * streams the camera into the live files only and records nothing.
  *
  * Exit status: 0 clean and no frames lost; 2 frames lost, error-flagged, or
- * dropped by a full write queue; 3 camera stalled; 1 usage or device error.
+ * dropped by a full write queue; 3 camera stalled; 1 usage or device error;
+ * 4 output error (cannot create or write the files: card full, I/O error),
+ * which stops the recording at once instead of running on unrecorded.
  *
  * Build: gcc -O2 -Wall -Wextra -static -o ewego-cam ewego-cam.c
  * No dependencies beyond libc and the kernel headers.
@@ -52,13 +54,14 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <linux/videodev2.h>
 
-#define VERSION "0.5.2"
+#define VERSION "0.6.0"
 #define MAX_BUFFERS 32
 
 struct idx_rec {
@@ -123,17 +126,38 @@ struct queue {
 	int done;
 };
 
+/*
+ * One output file's writeback state. Every step waits for (and checks) the
+ * pages kicked out by the previous step, then kicks out what was appended
+ * since; so the wait is for data already on its way to the card and does not
+ * stall, and an I/O error on the card is reported (SYNC_FILE_RANGE_WRITE
+ * alone never reports one).
+ */
+struct wbfile {
+	int fd;
+	uint64_t size;      /* bytes written to this file (= last good boundary) */
+	uint64_t kicked;    /* writeback started up to here */
+	uint64_t waited;    /* written back and checked up to here (page aligned) */
+	int unsupported;    /* sync_file_range not available on this file */
+};
+
 struct writer {
 	struct queue *q;
 	int vid_fd, ts_fd, idx_fd;   /* -1 in --preview: nothing is recorded */
+	struct wbfile wb[3];         /* video, timestamps, index */
 	size_t wb_chunk;
+	int64_t wb_last_us;          /* time of the last writeback step */
 	const char *live, *name;     /* live frame: <live>/<name>.jpg */
 	int64_t live_last_ts;        /* -1 until the first live frame is written */
 	/* results */
 	uint64_t written_frames, written_bytes;
+	uint64_t discarded;          /* frames dropped after an output error */
 	double write_max_ms;
-	int error;
+	int error;                   /* errno of the first output error, 0 = none */
+	char error_what[96];         /* which call failed */
 };
+
+#define WB_MAX_INTERVAL_US 2000000   /* writeback step at least this often */
 
 static volatile sig_atomic_t g_stop;
 
@@ -188,6 +212,16 @@ static int64_t now_real_us(void)
 	return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+/* Free space for the recorder (f_bavail) on the filesystem holding dir, MB; -1 if unknown. */
+static double free_mb(const char *dir)
+{
+	struct statvfs v;
+
+	if (!dir || !dir[0] || statvfs(dir, &v))
+		return -1.0;
+	return (double)v.f_bavail * (double)v.f_frsize / 1e6;
+}
+
 /* Minimal sd_notify(3) so `systemctl status` shows a live line; no libsystemd. */
 static void sd_notify(const char *msg)
 {
@@ -230,12 +264,113 @@ static int write_all(int fd, const void *buf, size_t len)
 	return 0;
 }
 
+/* First output error wins; the capture loop stops and the process exits 4. */
+static void writer_fail(struct writer *w, int err, const char *what)
+{
+	if (w->error)
+		return;
+	w->error = err ? err : EIO;
+	snprintf(w->error_what, sizeof(w->error_what), "%s", what);
+	fprintf(stderr, "ewego-cam: output error: %s: %s; stopping (exit 4)\n", what, strerror(w->error));
+	g_stop = 1;
+}
+
+/* One writeback step for one file (see struct wbfile). Returns 0 or -1 with errno. */
+static int wb_step(struct wbfile *f, int drop_cache)
+{
+	static uint64_t page;
+	uint64_t wend;
+
+	if (f->fd < 0 || f->unsupported)
+		return 0;
+	if (!page)
+		page = (uint64_t)sysconf(_SC_PAGESIZE);
+	/* the last, partial page is still being appended to: leave it for the next step */
+	wend = f->kicked & ~(page - 1);
+	if (wend > f->waited) {
+		if (sync_file_range(f->fd, (off64_t)f->waited, (off64_t)(wend - f->waited),
+				    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER)) {
+			if (errno == ESPIPE || errno == EINVAL || errno == ENOSYS) {
+				f->unsupported = 1;
+				return 0;
+			}
+			return -1;
+		}
+		f->waited = wend;
+		/* written back and clean: drop it from the page cache */
+		if (drop_cache)
+			posix_fadvise(f->fd, 0, (off_t)wend, POSIX_FADV_DONTNEED);
+	}
+	if (f->size > f->kicked) {
+		if (sync_file_range(f->fd, (off64_t)f->kicked, (off64_t)(f->size - f->kicked), SYNC_FILE_RANGE_WRITE)) {
+			if (errno == ESPIPE || errno == EINVAL || errno == ENOSYS) {
+				f->unsupported = 1;
+				return 0;
+			}
+			return -1;
+		}
+		f->kicked = f->size;
+	}
+	return 0;
+}
+
+/*
+ * Steady writeback of all three files at the same cadence (every --wb MB of
+ * video or WB_MAX_INTERVAL_US, whichever comes first), so the index and the
+ * timestamps lag the video on the card by the same few seconds instead of
+ * sitting in the page cache until dirty_expire (~30 s).
+ */
+static void writer_writeback(struct writer *w, int64_t now)
+{
+	static const char *const what[3] = {"writeback .mjpeg", "writeback _timestamps.bin", "writeback _index.bin"};
+	int i;
+
+	w->wb_last_us = now;
+	for (i = 0; i < 3 && !w->error; i++)
+		if (wb_step(&w->wb[i], i == 0))
+			writer_fail(w, errno, what[i]);
+}
+
+/*
+ * Append one frame to the three files. On a failed or short write every file
+ * is cut back to the last good frame boundary, so the files stay consistent
+ * (every index record points at a whole frame) whatever the card did.
+ */
+static int writer_put(struct writer *w, const struct frame *f)
+{
+	struct idx_rec rec = {
+		.offset = w->wb[0].size, .ts_us = f->ts_us, .seq = f->seq,
+		.bytes = (uint32_t)f->len, .flags = f->flags, .reserved = 0,
+	};
+	int64_t ts_le = f->ts_us;
+	const char *what = NULL;
+	int err, i;
+
+	if (write_all(w->vid_fd, f->data, f->len))
+		what = "write .mjpeg";
+	else if (write_all(w->ts_fd, &ts_le, sizeof(ts_le)))
+		what = "write _timestamps.bin";
+	else if (write_all(w->idx_fd, &rec, sizeof(rec)))
+		what = "write _index.bin";
+	if (!what) {
+		w->wb[0].size += f->len;
+		w->wb[1].size += sizeof(ts_le);
+		w->wb[2].size += sizeof(rec);
+		return 0;
+	}
+	err = errno;
+	for (i = 0; i < 3; i++)
+		if (ftruncate(w->wb[i].fd, (off_t)w->wb[i].size) == 0)
+			lseek(w->wb[i].fd, (off_t)w->wb[i].size, SEEK_SET);
+	writer_fail(w, err, what);
+	return -1;
+}
+
 static void *writer_main(void *arg)
 {
 	struct writer *w = arg;
 	struct queue *q = w->q;
-	uint64_t offset = 0;
-	uint64_t chunk_start = 0;
+	int i;
 
 	for (;;) {
 		struct frame *f;
@@ -271,46 +406,43 @@ static void *writer_main(void *arg)
 			w->live_last_ts = f->ts_us;
 		}
 
-		if (w->vid_fd >= 0) {
-			struct idx_rec rec = {
-				.offset = offset, .ts_us = f->ts_us, .seq = f->seq,
-				.bytes = (uint32_t)f->len, .flags = f->flags, .reserved = 0,
-			};
-			int64_t ts_le = f->ts_us;
-
+		if (w->vid_fd < 0) {
+			w->written_frames++;           /* --preview: nothing to write */
+			w->written_bytes += f->len;
+		} else if (w->error) {
+			w->discarded++;                /* output failed: drain, do not write */
+		} else {
 			t0 = now_mono_us();
-			if (write_all(w->vid_fd, f->data, f->len) ||
-			    write_all(w->ts_fd, &ts_le, sizeof(ts_le)) ||
-			    write_all(w->idx_fd, &rec, sizeof(rec))) {
-				if (!w->error)
-					fprintf(stderr, "write failed: %s (disk full?)\n", strerror(errno));
-				w->error = 1;
+			if (writer_put(w, f) == 0) {
+				w->written_frames++;
+				w->written_bytes += f->len;
+			} else {
+				w->discarded++;
 			}
 			t1 = now_mono_us();
 			if ((double)(t1 - t0) / 1000.0 > w->write_max_ms)
 				w->write_max_ms = (double)(t1 - t0) / 1000.0;
 		}
-		offset += f->len;
-		w->written_frames++;
-		w->written_bytes += f->len;
 		free(f->data);
 		free(f);
 
-		/* Steady writeback: kick the last chunk out to the card as soon as
-		 * it is complete, and drop the chunk before it from the page cache,
-		 * so dirty data never piles up into a multi-hundred-ms flush. */
-		if (w->vid_fd >= 0 && offset - chunk_start >= w->wb_chunk) {
-			sync_file_range(w->vid_fd, (off64_t)chunk_start, (off64_t)(offset - chunk_start),
-					SYNC_FILE_RANGE_WRITE);
-			if (chunk_start >= w->wb_chunk)
-				posix_fadvise(w->vid_fd, 0, (off_t)(chunk_start - w->wb_chunk), POSIX_FADV_DONTNEED);
-			chunk_start = offset;
+		/* Steady writeback: kick each chunk out to the card as soon as it
+		 * is complete, check the one before it, and drop that from the page
+		 * cache, so dirty data never piles up into a multi-hundred-ms flush
+		 * and a failing card is noticed within one chunk. */
+		if (w->vid_fd >= 0 && !w->error) {
+			int64_t now = now_mono_us();
+			if (w->wb[0].size - w->wb[0].kicked >= w->wb_chunk ||
+			    now - w->wb_last_us >= WB_MAX_INTERVAL_US)
+				writer_writeback(w, now);
 		}
 	}
-	if (w->vid_fd >= 0) {
-		fdatasync(w->vid_fd);
-		fdatasync(w->ts_fd);
-		fdatasync(w->idx_fd);
+	if (w->vid_fd >= 0 && !w->error) {
+		static const char *const what[3] = {"fdatasync .mjpeg", "fdatasync _timestamps.bin",
+						    "fdatasync _index.bin"};
+		for (i = 0; i < 3 && !w->error; i++)
+			if (fdatasync(w->wb[i].fd))
+				writer_fail(w, errno, what[i]);
 	}
 	return NULL;
 }
@@ -501,9 +633,11 @@ static void stats_add_interval(struct stats *st, double dt)
 	st->i_dt_n++;
 }
 
-static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, struct writer *w, double elapsed)
+static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, struct writer *w,
+			const char *dir, double elapsed)
 {
-	char line[320];
+	char line[400];
+	double fmb = free_mb(dir);
 	double fps = st->i_dt_n ? 1e6 / (st->i_dt_sum / (double)st->i_dt_n) : 0.0;
 	size_t qbytes, qhw;
 	uint64_t qovr;
@@ -516,17 +650,18 @@ static void print_stats(const struct cfg *c, struct stats *st, struct queue *q, 
 
 	snprintf(line, sizeof(line),
 		 "%s: %" PRIu64 " frames, %" PRIu64 " lost, %" PRIu64 " err | %.2f fps, interval %.1f/%.1f/%.1f ms, "
-		 "%.1f MB/s | queue %.1f MB (peak %.1f), overruns %" PRIu64 ", write max %.0f ms",
+		 "%.1f MB/s | queue %.1f MB (peak %.1f), overruns %" PRIu64 ", write max %.0f ms | free %.0f MB%s%s",
 		 c->name, st->frames, st->lost, st->errors, fps,
 		 st->i_dt_n ? st->i_dt_min / 1000.0 : 0.0,
 		 st->i_dt_n ? st->i_dt_sum / (double)st->i_dt_n / 1000.0 : 0.0,
 		 st->i_dt_n ? st->i_dt_max / 1000.0 : 0.0,
 		 c->stats_interval > 0 ? (double)st->i_bytes / 1e6 / (double)c->stats_interval : 0.0,
-		 (double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms);
+		 (double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms, fmb < 0 ? 0.0 : fmb,
+		 w->error ? " | OUTPUT ERROR: " : "", w->error ? w->error_what : "");
 	if (!c->quiet)
 		printf("[%7.1fs] %s\n", elapsed, line);
 	{
-		char msg[360];
+		char msg[420];
 		snprintf(msg, sizeof(msg), "STATUS=%s", line);
 		sd_notify(msg);
 	}
@@ -565,11 +700,22 @@ static void write_live_json(const struct cfg *c, const struct stats *st, struct 
 		   "\"frames\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
 		   ",\"errors\":%" PRIu64 ",\"fps\":%.2f,\"queue_mb\":%.1f,\"queue_peak_mb\":%.1f,"
 		   "\"overruns\":%" PRIu64 ",\"write_max_ms\":%.0f,\"written_mb\":%.1f,"
-		   "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 "}\n",
+		   "\"updated_mono_us\":%" PRId64 ",\"updated_real_us\":%" PRId64 ",",
 		c->width, c->height, c->fps, (double)(now - t_start) / 1e6,
 		st->frames, st->bytes, st->lost, st->gaps, st->errors, fps_recent,
 		(double)qbytes / 1e6, (double)qhw / 1e6, qovr, w->write_max_ms, (double)w->written_bytes / 1e6,
 		now, now_real_us());
+	{
+		double fmb = free_mb(session);
+		if (fmb < 0)
+			fputs("\"free_mb\":null,", f);
+		else
+			fprintf(f, "\"free_mb\":%.0f,", fmb);
+	}
+	fprintf(f, "\"writer_error\":%d,\"writer_error_msg\":\"", w->error ? 1 : 0);
+	if (w->error)
+		fprintf(f, "%s: %s", w->error_what, strerror(w->error));
+	fprintf(f, "\",\"discarded\":%" PRIu64 "}\n", w->discarded);
 	fclose(f);
 	rename(tmp, fin);
 }
@@ -596,7 +742,8 @@ static int write_summary(const char *path, const struct cfg *c, const struct sta
 		"  \"error_frames\": %" PRIu64 ",\n"
 		"  \"stalls\": %" PRIu64 ",\n"
 		"  \"writer\": {\"frames\": %" PRIu64 ", \"bytes\": %" PRIu64 ", \"overruns\": %" PRIu64
-		", \"queue_peak_bytes\": %zu, \"queue_budget_bytes\": %zu, \"write_max_ms\": %.1f, \"error\": %d},\n"
+		", \"queue_peak_bytes\": %zu, \"queue_budget_bytes\": %zu, \"write_max_ms\": %.1f, \"error\": %d"
+		", \"error_msg\": \"%s%s%s\", \"discarded\": %" PRIu64 "},\n"
 		"  \"first_seq\": %u,\n"
 		"  \"last_seq\": %u,\n"
 		"  \"first_ts_us\": %" PRId64 ",\n"
@@ -613,7 +760,8 @@ static int write_summary(const char *path, const struct cfg *c, const struct sta
 		VERSION, c->name, devpath, c->width, c->height, c->fps,
 		st->frames, st->bytes, st->lost, st->gaps, st->gap_list, st->errors, st->stalls,
 		w->written_frames, w->written_bytes, q->overruns, q->high_water, q->max_bytes,
-		w->write_max_ms, w->error,
+		w->write_max_ms, w->error ? 1 : 0, w->error ? w->error_what : "", w->error ? ": " : "",
+		w->error ? strerror(w->error) : "", w->discarded,
 		st->have_seq ? st->first_seq : 0, st->have_seq ? st->last_seq : 0,
 		st->first_ts, st->last_ts,
 		st->dt_n ? st->dt_min : 0.0, st->dt_n ? st->dt_sum / (double)st->dt_n : 0.0,
@@ -889,8 +1037,12 @@ int main(int argc, char **argv)
 		w.ts_fd = open_out(dir, c.name, "_timestamps.bin");
 		w.idx_fd = open_out(dir, c.name, "_index.bin");
 		if (w.vid_fd < 0 || w.ts_fd < 0 || w.idx_fd < 0)
-			return 1;
+			return 4;
 	}
+	w.wb[0].fd = w.vid_fd;
+	w.wb[1].fd = w.ts_fd;
+	w.wb[2].fd = w.idx_fd;
+	w.wb_last_us = now_mono_us();
 	w.live = c.live;
 	w.name = c.name;
 	w.live_last_ts = -1;   /* not INT64_MIN: ts - INT64_MIN overflows and the frame is never written */
@@ -1067,7 +1219,7 @@ int main(int argc, char **argv)
 		}
 
 		if (c.stats_interval > 0 && now - t_last_stats >= (int64_t)c.stats_interval * 1000000) {
-			print_stats(&c, &st, &q, &w, (double)(now - t_start) / 1e6);
+			print_stats(&c, &st, &q, &w, c.preview ? NULL : dir, (double)(now - t_start) / 1e6);
 			t_last_stats = now;
 		}
 		if (c.live && now - t_last_live >= 1000000) {
@@ -1108,7 +1260,9 @@ int main(int argc, char **argv)
 		unlink(path);
 	}
 
-	if (exit_code == 0 && (st.lost || st.errors || q.overruns || w.error))
+	if (w.error)
+		exit_code = 4;
+	else if (exit_code == 0 && (st.lost || st.errors || q.overruns))
 		exit_code = 2;
 	if (!c.preview) {
 		int64_t mono1 = now_mono_us(), real1 = now_real_us();

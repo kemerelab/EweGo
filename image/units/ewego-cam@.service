@@ -3,17 +3,26 @@ Description=EweGo USB camera recorder (%i)
 Documentation=file:///opt/ewego/Firmware/uvccam/README.md
 After=local-fs.target
 PartOf=ewego-record.target
+# never give up restarting: an unattended wearable has no one to reset it
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 # One file per camera: /etc/ewego/cam-camera1.conf, /etc/ewego/cam-camera2.conf
 EnvironmentFile=/etc/ewego/cam-%i.conf
 ExecStart=/usr/local/bin/ewego-cam --device ${DEVICE} --size ${SIZE} --fps ${FPS} --out ${OUT_DIR} --name %i $EXTRA_ARGS
-# ewego-cam stops the stream, flushes and writes its summary on SIGINT/SIGTERM
+# ewego-cam stops the stream, drains its RAM queue (up to --ring MB, default
+# 64) to the card, fdatasyncs and writes its summary on SIGINT/SIGTERM; it
+# sends EXTEND_TIMEOUT_USEC while the drain makes progress
 KillSignal=SIGINT
-TimeoutStopSec=15
+TimeoutStopSec=90
+# fed by the writer thread only after a frame reached the files: a writer
+# stuck on the card or a capture thread that stopped ends in a restart
+WatchdogSec=30
 Restart=on-failure
 RestartSec=3
+# the RAM queue is the last thing that should be killed for memory
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target

@@ -97,6 +97,7 @@ struct cfg {
 	int preview;         /* live files only, no recording */
 	const char *source;  /* --source: replay this MJPEG file instead of a camera (testing) */
 	int source_lose;     /* --source-lose N: skip a sequence number every N frames */
+	int source_loop;     /* --source-loop: replay FILE again and again instead of once */
 };
 
 struct stats {
@@ -1136,8 +1137,11 @@ static void usage(FILE *f)
 		"                      (default /run/ewego; \"\" = off)\n"
 		"  --quiet             no per-interval statistics on stdout\n"
 		"  --list              list USB cameras and exit\n"
-		"  --source FILE       testing: replay the JPEG frames of FILE (e.g. an .mjpeg) at --fps with\n"
-		"                      synthetic timestamps instead of a camera; --device is not needed\n"
+		"  --source FILE       testing: replay the JPEG frames of FILE (e.g. an .mjpeg) once at --fps\n"
+		"                      with synthetic timestamps instead of a camera, then stop (exit 0);\n"
+		"                      --device is not needed\n"
+		"  --source-loop       testing: with --source, replay FILE in a loop (soak; stop with --seconds\n"
+		"                      or SIGINT)\n"
 		"  --source-lose N     testing: with --source, skip one sequence number every N frames\n",
 		VERSION, MAX_BUFFERS);
 }
@@ -1410,7 +1414,8 @@ static int capture_v4l2(const struct cfg *c, struct capture *cp, int fd, void **
  * --source FILE: a test input instead of a camera. FILE is read into RAM and
  * split into JPEG frames (SOI ff d8 ... EOI ff d9 followed by the next SOI
  * or the end of the file, e.g. an .mjpeg written by this program); they are
- * replayed in a loop at --fps with synthetic CLOCK_MONOTONIC timestamps
+ * replayed once (in a loop with --source-loop) at --fps with synthetic
+ * CLOCK_MONOTONIC timestamps
  * and consecutive sequence numbers (--source-lose N skips one every N
  * frames, as a lost frame), through the same queue, writer, live files and
  * summary as a camera. For testing the recording path without hardware.
@@ -1497,6 +1502,8 @@ static int capture_source(const struct cfg *c, struct capture *cp, const struct 
 		int64_t now, ts_us;
 		size_t i;
 
+		if (k >= src->n && !c->source_loop)
+			break;                      /* end of FILE: stop as on SIGINT */
 		next.tv_nsec += period_ns;
 		while (next.tv_nsec >= 1000000000L) {
 			next.tv_sec++;
@@ -1544,6 +1551,7 @@ int main(int argc, char **argv)
 		{"quiet", no_argument, 0, 'q'},        {"list", no_argument, 0, 'l'},
 		{"lock-dir", required_argument, 0, 'K'},
 		{"source", required_argument, 0, 'X'}, {"source-lose", required_argument, 0, 'Z'},
+		{"source-loop", no_argument, 0, 'O'},
 		{"help", no_argument, 0, 'h'},         {0, 0, 0, 0},
 	};
 	int opt;
@@ -1568,7 +1576,7 @@ int main(int argc, char **argv)
 	memset(&src, 0, sizeof(src));
 	setvbuf(stdout, NULL, _IOLBF, 0);   /* the stats line reaches the journal as it is printed */
 
-	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:PqlhK:X:Z:", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "d:o:n:s:f:b:R:W:t:S:y:x:NrAw:L:PqlhK:X:Z:O", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'd': c.device = optarg; break;
 		case 'o': c.out = optarg; break;
@@ -1597,6 +1605,7 @@ int main(int argc, char **argv)
 		case 'K': g_lock_dir = optarg; break;
 		case 'X': c.source = optarg; break;
 		case 'Z': c.source_lose = atoi(optarg); break;
+		case 'O': c.source_loop = 1; break;
 		case 'l': list_cameras(); return 0;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 1;

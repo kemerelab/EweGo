@@ -177,15 +177,20 @@ wait, so `systemctl stop` at any point ends cleanly.
 ## Testing without a camera
 
 `--source FILE` replays the JPEG frames found in FILE (for example an
-`.mjpeg` from an earlier recording) in a loop at `--fps`, with synthetic
+`.mjpeg` from an earlier recording) once at `--fps`, with synthetic
 `CLOCK_MONOTONIC` timestamps and consecutive sequence numbers, through the
-same queue, writer, live files and summary as a camera; `--device` is not
-needed. `--source-lose N` skips one sequence number every N frames, to
+same queue, writer, live files and summary as a camera, and stops at the end
+of the file as on SIGINT (exit 0 and the final summary; the recorded
+`.mjpeg` is byte-identical to FILE when FILE is a concatenation of
+SOI..EOI frames). `--device` is not needed. `--source-loop` replays the
+file over and over instead (a soak test; stop with `--seconds` or SIGINT);
+`--seconds` also cuts a single replay short. `--source-lose N` skips one sequence number every N frames, to
 exercise the loss accounting. For an output error, limit the file size:
 
-    ewego-cam --source old.mjpeg --out /tmp/t --seconds 10                 # exit 0
-    ewego-cam --source old.mjpeg --out /tmp/t --seconds 10 --source-lose 30  # exit 2
-    (trap '' XFSZ; ulimit -f 10000; ewego-cam --source old.mjpeg --out /tmp/t --seconds 10)  # exit 4
+    ewego-cam --source old.mjpeg --out /tmp/t                                  # one pass, exit 0
+    ewego-cam --source old.mjpeg --out /tmp/t --source-loop --seconds 600      # soak, exit 0
+    ewego-cam --source old.mjpeg --out /tmp/t --source-loop --seconds 10 --source-lose 30  # exit 2
+    (trap '' XFSZ; ulimit -f 10000; ewego-cam --source old.mjpeg --out /tmp/t --source-loop --seconds 10)  # exit 4
 
 ## Build
 

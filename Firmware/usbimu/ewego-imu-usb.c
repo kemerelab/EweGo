@@ -11,7 +11,9 @@
  *                         i2c_us, flags
  *   <name>_summary.json   samples, lost (sequence gaps), flagged samples,
  *                         device-clock interval statistics, host-vs-device
- *                         clock drift, queue overruns, exit code
+ *                         clock drift, queue overruns, write errors, exit
+ *                         code; rewritten every stats interval with
+ *                         "in_progress": true, final one at exit
  *
  * Two threads, like ewego-cam: the reader (the main thread, optionally
  * SCHED_FIFO with --rt) only polls the hidraw node, timestamps each report
@@ -27,8 +29,13 @@
  * console's live view. --preview streams the module without writing any
  * recording (live file only).
  *
+ * The CSV is fdatasync'd every 2 s (at most ~2 s lost on a power cut). Only
+ * valid reports count as liveness for --stall.
+ *
  * Exit: 0 clean and nothing lost; 2 lost or flagged samples or ring
- * overruns; 3 no reports for --stall seconds; 1 usage/device error.
+ * overruns; 3 no valid reports for --stall seconds, or the node went away;
+ * 4 the recording could not be written (ENOSPC, EIO, ...: write errors for
+ * 3 s, or at close); 1 usage/device error.
  *
  * Build: make (compiles ../common/ewego-rec.c in)
  */
@@ -48,7 +55,7 @@
 
 #include "../common/ewego-rec.h"
 
-#define VERSION "0.3.1"
+#define VERSION "0.4.0"
 #define USB_VID 0x1209
 #define USB_PID 0x0001
 

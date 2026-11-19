@@ -17,15 +17,25 @@
  *   <name>.csv            same 28 columns as log_imu_data.py, then
  *                         host_mono_us (arrival), tick_mono_us (the scheduled
  *                         sample time), seq, xfer_us (UART round trip), flags
- *                         (bit0 = read failed; sensor columns empty)
+ *                         (bit0 = read failed, sensor columns empty;
+ *                         bit1 = all-zero quaternion, the sensor is not fusing)
  *   <name>_summary.json   samples, read errors, late ticks, interval and
- *                         jitter statistics, queue overruns, exit code
+ *                         jitter statistics, queue overruns, fusion stalls,
+ *                         write errors, exit code; rewritten every stats
+ *                         interval with "in_progress": true
+ *
+ * Self-check: a BNO055 that browns out comes back in CONFIG mode and keeps
+ * answering with zeros; 20 all-zero quaternions in a row (or 3 s of
+ * identical data) make the reader check OPR_MODE and re-initialise it.
+ * The port is held with TIOCEXCL: other openers get EBUSY.
  *
  * --live DIR writes DIR/<name>.json ten times a second (counters + recent
  * samples); --preview streams into the live file only.
  *
- * Exit: 0 every tick produced a sample; 2 read errors or ring overruns;
- * 3 no sample for --stall seconds (sensor or UART gone); 1 usage/device error.
+ * Exit: 0 every tick produced a sample; 2 read errors, ring overruns or a
+ * fusion stall; 3 no sample for --stall seconds (sensor or UART gone);
+ * 4 the recording could not be written; 1 usage/device error (EBUSY: the
+ * port is held by another process).
  *
  * Build: make (compiles ../common/ewego-rec.c in)
  */
@@ -47,7 +57,7 @@
 
 #include "../common/ewego-rec.h"
 
-#define VERSION "0.2.1"
+#define VERSION "0.3.0"
 
 #define BNO_CHIP_ID   0xA0
 #define REG_CHIP_ID   0x00

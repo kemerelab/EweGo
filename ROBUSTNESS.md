@@ -130,22 +130,22 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` merged.
 
 ## Lane D: integration follow-ups (after the five lanes merged, 2026-11-18)
 
-- [ ] **R38** `ewego-check`: understand the periodic summary (`in_progress: true`,
+- [x] **R38** `ewego-check`: understand the periodic summary (`in_progress: true`,
   `exit_code: null` = still recording or killed/power cut; exit code 4 = output
   error, FAIL with the `writer_error_msg`), audio `audio-01.wav` parts (done in
   R28), the `-2` session suffix, and all `audio*.wav`; WARN should exit non-zero
   (distinct from PASS) so scripts can tell.
-- [ ] **R39** Console: map recorder exit 4 to "output error (card full / I/O)";
+- [x] **R39** Console: map recorder exit 4 to "output error (card full / I/O)";
   ignore `/run/ewego/port-*.lock` and `space.json` where it lists live files;
   show `writer_error`, `free_mb`, `fusion_stalls` on the live page; start the
   target with `systemctl start --no-block` (the recorders are `Type=notify`
   and READY can take up to 30 s) and let the badge report progress; show
   `space.json` when a recorder was skipped by the free-space condition.
-- [ ] **R40** Tests: `--wait N` flag for ewego-imu-usb so the VID:PID search path
+- [x] **R40** Tests: `--wait N` flag for ewego-imu-usb so the VID:PID search path
   is testable; UART counter for 0x07 overruns that succeeded on retry; sd_notify
   tests against an abstract `NOTIFY_SOCKET`; the preview units' ExecStartPre
   guard logic.
-- [ ] **R41** CI: shellcheck `image/ewego/*.sh` too (only `image/*.sh` today).
+- [x] **R41** CI: shellcheck `image/ewego/*.sh` too (only `image/*.sh` today).
 
 ## Later
 

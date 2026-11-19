@@ -27,8 +27,10 @@ device is touched.
 | `test_imu_uart.py` + `fake_bno055.py` | R33 | `ewego-imu-uart` against a fake BNO055 on a pty: init, 100 Hz bursts, 0x07 / 0x0A / garbage replies, silence (exit 3), power-cycle recovery, reset into CONFIG mode |
 | `test_imu_usb.py` | R34 | `ewego-imu-usb` fed hub_imu reports through a FIFO given as `--device`: clean stream with seq and clock wrap, gaps, flagged and malformed reports, stall, read error, writer closing |
 | `test_check_tool.py` | R35 | `ewego-check.py` on synthetic session directories: PASS / WARN / FAIL per stream, missing / truncated / in-progress summaries, run grouping |
-| `test_cam.py` | R37 | `ewego-cam` without a camera: CLI validation, `--list`, missing device; the replay test skips until a `--source` mode exists |
-| `test_webtest.py`, `test_loggers.py` | R36 and others | owned by other lanes |
+| `test_cam.py` | R37 | `ewego-cam` without a camera: CLI validation, `--list`, missing device; `--source FILE` replay through the writer/index path |
+| `test_units.py` | R40 | the systemd unit files: preview `ExecStartPre` guards (run against a fake `systemctl`), recorder preview-stop / space-check / notify / watchdog lines |
+| `test_webtest.py` | R36 | the web console with fixtures under `EWEGO_LIVE_DIR` and a faked `systemctl` |
+| `test_loggers.py` | R26, R29 | fuel-gauge low-battery logic, GPS logger error streaks, with `serial`/`pyubx2`/`smbus2` stubbed |
 
 `fake_bno055.py` also runs standalone (`python3 tests/fake_bno055.py --help`)
 and prints a pty path to give `ewego-imu-uart --port`.
@@ -84,11 +86,11 @@ written as the test of the *desired* behaviour, marked
 `@unittest.expectedFailure` with the item id in a comment. When the item
 lands the test starts to pass, unittest reports it as an "unexpected
 success" (which fails the run), and the marker must be removed in the same
-change. Current markers:
-
-- `test_imu_uart.TestUartResetIntoConfigMode.test_recorder_restores_ndof` (R14)
-- `test_imu_usb.TestUsbRecording.test_writer_closes_exit_3` (R16)
+change. There are no markers at the moment: the R14 and R16 tests became
+plain tests when those items landed (2026-11-18).
 
 Tests named `..._current_behaviour` (or with "CURRENT BEHAVIOUR" in the
 docstring) pin down something that is not obviously right but is how the
 program behaves today; change them deliberately when the behaviour changes.
+None remain after R38 (ewego-check now groups restarts and reads in-progress
+summaries).

@@ -228,7 +228,13 @@ https://claude.ai/code/artifact/828028de-6284-4f76-b3f8-3f5925ac1dfe
   TIOCEXCL is waived for root (all our processes), so unit state is the real
   exclusion. Not yet on hardware: needs an image tag (v0.7.0) and the bench
   list in ROBUSTNESS.md / the lane reports. Lane D (R38–R41) = check tool and
-  console integration of the new keys.
+  console integration of the new keys: merged the same day. ewego-check
+  exits 0 PASS / 1 WARN / 2 FAIL / 3 nothing to check, reads `in_progress`
+  summaries ("run not complete"), groups a restarted recorder into the same
+  run (within 60 s of the run start or before its last session ended), FAILs
+  on exit 4 / writer_error. Console starts the target with `--no-block` and
+  the badge follows progress; `ewego-imu-usb --wait N`; UART
+  `overruns_retried`. Image v0.7.0 tagged from fc29d13+lane D for the bench.
 - After that (Phase C): C port of GPS (with NAV-PVT validity flags and a
   configurable NTRIP host), fuel gauge with low-battery shutdown.
 - Known limits: NetworkManager still in use (SD corruption after power

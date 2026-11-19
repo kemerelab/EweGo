@@ -18,6 +18,7 @@ EnvironmentFile=-/etc/ewego/gps.conf
 # (it reconnects every 30 s).
 ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/gps-test/gps_logger.py --port /dev/ttyAMA4 --baud 460800 --log-dir /opt/ewego/gps-logs $NTRIP_ARGS
 # gps_logger.py stops cleanly on KeyboardInterrupt
+OOMScoreAdjust=-500
 KillSignal=SIGINT
 TimeoutStopSec=15
 Restart=on-failure

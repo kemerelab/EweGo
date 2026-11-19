@@ -10,6 +10,11 @@ ExecStart=/usr/bin/python3 -u /opt/ewego/Firmware/webtest/ewego_webtest.py --por
 Environment=PYTHONPATH=/opt/ewego/pylib
 Environment=EWEGO_DIR=/opt/ewego
 RuntimeDirectory=ewego-webtest
+# The console must never compete with the recorders: lower CPU priority and
+# share, and the first thing the OOM killer takes.
+Nice=10
+CPUWeight=30
+OOMScoreAdjust=500
 Restart=always
 RestartSec=3
 

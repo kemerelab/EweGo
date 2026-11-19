@@ -17,6 +17,7 @@ EnvironmentFile=-/etc/ewego/audio.conf
 # process and receives SIGINT directly.
 ExecStart=/usr/local/bin/ewego-audio-record ${OUT_DIR} $DEVICE
 # arecord finishes the WAV header on SIGINT
+OOMScoreAdjust=-500
 KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure

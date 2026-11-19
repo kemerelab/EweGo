@@ -13,12 +13,14 @@
  * because SD-card flush stalls of a few hundred ms were enough to lose USB
  * isochronous data on the CM4.
  *
- * Output, per run, in <out>/<session>/ (session = start time, or --no-session-dir):
+ * Output, per run, in <out>/<session>/ (session = start time, -2, -3 ... if that
+ * already holds a recording; or --out itself with --no-session-dir):
  *   <name>.mjpeg            concatenated JPEG frames (play_with_timestamps.py reads this)
  *   <name>_timestamps.bin   int64 little-endian, microseconds, CLOCK_MONOTONIC, one per frame
  *   <name>_index.bin        32-byte records: u64 byte offset in .mjpeg, i64 timestamp us,
  *                           u32 sequence, u32 bytes, u32 v4l2 flags, u32 reserved
- *   <name>_summary.json     counts, gaps, intervals, clock offsets, written at exit
+ *   <name>_summary.json     counts, gaps, intervals, clock offsets; rewritten every stats
+ *                           interval with "in_progress": true, and at exit with false
  *
  * --live DIR (meant for tmpfs, /run/ewego) keeps <name>.jpg = the newest
  * frame, replaced at most 5 times a second, and <name>.json = counters,

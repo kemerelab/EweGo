@@ -305,6 +305,7 @@ struct uart {
 	uint64_t late_ticks, err_by_code[16], err_total, reinits;
 	uint64_t fusion_stalls;     /* zero-quaternion or frozen-data runs that reached the threshold */
 	uint64_t fusion_reinits;    /* re-inits those runs caused (also counted in reinits) */
+	uint64_t overruns_retried;  /* EE 07 (bus overrun) answers whose one retry succeeded */
 };
 
 static double rate_hz(const struct uart *u)
@@ -345,10 +346,11 @@ static void live_counters(FILE *f, struct rec *r, const struct rec_snap *q)
 	fprintf(f, "\"samples\":%" PRIu64 ",\"lost\":%" PRIu64 ",\"gaps\":%" PRIu64
 		   ",\"flagged\":%" PRIu64 ",\"read_errors\":%" PRIu64 ",\"i2c_errors\":0,\"queue_overruns\":%" PRIu64
 		   ",\"queue_peak\":%u,\"hz\":%.2f,\"drift_ppm\":0,\"xfer_us_max\":%u,\"jitter_us_max\":%" PRId64 ","
-		   "\"fusion_invalid\":%" PRIu64 ",\"fusion_stalls\":%" PRIu64 ",\"reinits\":%" PRIu64 ",",
+		   "\"fusion_invalid\":%" PRIu64 ",\"fusion_stalls\":%" PRIu64 ",\"reinits\":%" PRIu64 ","
+		   "\"overruns_retried\":%" PRIu64 ",",
 		u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid, u->read_errors,
 		q->overruns, q->peak, rate_hz(u), u->xfer_us_max, u->jitter_us_max,
-		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->reinits));
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->reinits), A_LOAD(u->overruns_retried));
 }
 
 static void stats(char *buf, size_t len, struct rec *r, const struct rec_snap *q)
@@ -374,6 +376,7 @@ static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
 		    "  \"errors_by_code\": {\"timeout_or_garbage\": %" PRIu64 ", \"bus_overrun_07\": %" PRIu64
 		    ", \"receive_timeout_0a\": %" PRIu64 ", \"other\": %" PRIu64 "},\n  \"reinits\": %" PRIu64 ",\n"
 		    "  \"fusion_invalid\": %" PRIu64 ",\n  \"fusion_stalls\": %" PRIu64 ",\n  \"fusion_reinits\": %" PRIu64 ",\n"
+		    "  \"overruns_retried\": %" PRIu64 ",\n"
 		    "  \"queue\": {\"overruns\": %" PRIu64 ", \"peak\": %u, \"size\": %d},\n"
 		    "  \"realtime\": %d,\n"
 		    "  \"interval_us\": {\"min\": %.0f, \"mean\": %.1f, \"max\": %.0f, \"n\": %" PRIu64 "},\n"
@@ -382,7 +385,7 @@ static void summary(FILE *js, struct rec *r, const struct rec_snap *q)
 		u->baud, u->rate, u->valid, u->read_errors, u->error_runs, u->read_errors + u->fusion_invalid,
 		u->read_errors, u->error_runs, A_LOAD(u->late_ticks),
 		e0, e7, e10, A_LOAD(u->err_total) - e0 - e7 - e10, A_LOAD(u->reinits),
-		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->fusion_reinits),
+		u->fusion_invalid, A_LOAD(u->fusion_stalls), A_LOAD(u->fusion_reinits), A_LOAD(u->overruns_retried),
 		q->overruns, q->peak, REC_RING_N, r->realtime,
 		u->dt_n ? u->dt_min : 0.0, u->dt_n ? u->dt_sum / (double)u->dt_n : 0.0, u->dt_n ? u->dt_max : 0.0, u->dt_n,
 		rate_hz(u), u->xfer_us_max, u->jitter_us_max, u->first_host);
@@ -561,6 +564,8 @@ int main(int argc, char **argv)
 		if (r == 0x07) {     /* bus overrun: the sensor was mid-update; give it 2 ms and ask once more */
 			drain_quiet(fd, 2, 10);
 			r = bno_read(fd, REG_ACC_X_LSB, BURST_LEN, s.burst, 30);
+			if (r == 0)
+				A_INC(u.overruns_retried);
 		}
 		now = rec_mono_us();
 		s.host_mono = now;

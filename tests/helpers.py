@@ -108,13 +108,13 @@ def read_json(path):
 class Proc:
     """A started program; stdout/stderr go to files so no pipe can fill up and block it."""
 
-    def __init__(self, argv, workdir, label="proc"):
+    def __init__(self, argv, workdir, label="proc", env=None):
         self.argv = [str(a) for a in argv]
         self.out_path = Path(workdir) / f"{label}.stdout"
         self.err_path = Path(workdir) / f"{label}.stderr"
         self._out = open(self.out_path, "wb")
         self._err = open(self.err_path, "wb")
-        self.p = subprocess.Popen(self.argv, stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL)
+        self.p = subprocess.Popen(self.argv, stdout=self._out, stderr=self._err, stdin=subprocess.DEVNULL, env=env)
         self.killed = False      # set when wait() had to stop it
 
     def poll(self):
@@ -173,8 +173,8 @@ class RecorderTestCase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="ewego-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
-    def start(self, argv, label="proc"):
-        p = Proc(argv, self.tmp, label)
+    def start(self, argv, label="proc", env=None):
+        p = Proc(argv, self.tmp, label, env=env)
         self.addCleanup(p.cleanup)
         return p
 

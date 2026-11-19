@@ -11,7 +11,9 @@ open or init failure.
 """
 
 import json
+import os
 import shutil
+import socket
 import tempfile
 import time
 import unittest
@@ -30,11 +32,11 @@ CSV_HEADER = [
 SUMMARY_KEYS = ["program", "device", "rate_hz", "samples", "lost", "gaps", "flagged", "read_errors",
                 "error_runs", "late_ticks", "errors_by_code", "reinits", "queue", "interval_us",
                 "effective_hz", "xfer_us_max", "jitter_us_max", "first_host_mono_us",
-                "realtime_minus_monotonic_us", "exit_code"]
+                "realtime_minus_monotonic_us", "exit_code", "overruns_retried"]
 ERROR_CODE_KEYS = ["timeout_or_garbage", "bus_overrun_07", "receive_timeout_0a", "other"]
 LIVE_KEYS = ["program", "name", "device", "preview", "session", "elapsed_s", "samples", "lost", "gaps",
              "flagged", "read_errors", "queue_overruns", "queue_peak", "hz", "temp_c", "cal",
-             "updated_mono_us", "updated_real_us", "cols", "recent"]
+             "updated_mono_us", "updated_real_us", "cols", "recent", "overruns_retried"]
 NAME = "imu-uart"
 COL = {c: i for i, c in enumerate(CSV_HEADER)}
 
@@ -197,18 +199,27 @@ class TestUartRecording(UartBase):
 
     def test_bus_overrun_retried_once_is_clean(self):
         """EE 07 once: the program drains and asks again; the retry succeeds.
-
-        Documents current behaviour: such recovered overruns are not counted
-        anywhere (summary, live JSON or flags), so the summary cannot show
-        how often the sensor was busy."""
+        Not an error (no flag, exit 0), but counted as overruns_retried [R40]
+        in the summary and the live JSON, so a busy sensor shows."""
+        live = self.tmp / "live"
         with FakeBNO055(overrun_every=20) as fake:
-            rc, p, out = self.record(fake)
+            out = self.tmp / "out"
+            p = self.start([self.exe, "--port", fake.port, "--out", out, "--stats", "0", "--name", NAME,
+                            "--seconds", "2", "--no-session-dir", "--live", live], "imu-uart")
+            lf = live / f"{NAME}.json"
+            js = self.wait_for(lambda: lf.exists() and (json.loads(lf.read_text()).get("overruns_retried") or None)
+                               and json.loads(lf.read_text()), 5)
+            rc = p.wait(15)
         header, rows, s = self.outputs(out)
         self.assertGreaterEqual(fake.stats["overrun_07"], 5)
         self.assertEqual(rc, 0, self.diag(p))
         self.assertSummaryConsistent(s, rows, rc)
         self.assertEqual(s["read_errors"], 0)
         self.assertEqual(s["errors_by_code"]["bus_overrun_07"], 0)
+        self.assertAlmostEqual(s["overruns_retried"], fake.stats["overrun_07"], delta=1)
+        self.assertGreater(s["overruns_retried"], 0)
+        self.assertIsNotNone(js, "live JSON never showed overruns_retried > 0" + self.diag(p))
+        self.assertLessEqual(js["overruns_retried"], s["overruns_retried"])
 
     def test_bus_overrun_twice_flags_the_sample(self):
         """EE 07 on the read and on its retry: one flagged row (sensor columns empty), exit 2."""
@@ -221,6 +232,7 @@ class TestUartRecording(UartBase):
         self.assertGreaterEqual(events, 5)
         self.assertAlmostEqual(s["errors_by_code"]["bus_overrun_07"], events, delta=1)
         self.assertEqual(s["errors_by_code"]["bus_overrun_07"], s["read_errors"])
+        self.assertEqual(s["overruns_retried"], 0, "a retry that failed again is not counted as retried")
         for r in rows_with_flag(rows, 1):
             self.assertEqual(r[1:28], [""] * 27, "sensor columns of a failed read are empty")
             self.assertNotEqual(r[COL["host_mono_us"]], "")
@@ -284,6 +296,44 @@ class TestUartRecording(UartBase):
         self.assertTrue(all(r[COL["flags"]] == "0" and float(r[COL["quat_w"]]) != 0 for r in tail),
                         "fusion data flows again after the re-init")
         self.assertGreater(s["late_ticks"], 0, "the blocking re-init shows up as late ticks")
+
+
+class TestUartSdNotify(UartBase):
+    """[R40] sd_notify against an abstract NOTIFY_SOCKET (Type=notify,
+    WatchdogSec=30 in the unit): READY=1 once the port is open and the
+    recording runs, WATCHDOG=1 every 2 s while writes succeed, STOPPING=1 at
+    the end."""
+
+    def test_ready_watchdog_stopping(self):
+        name = f"ewego-test-notify-{os.getpid()}-{id(self)}"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(sock.close)
+        sock.bind("\0" + name)
+        sock.settimeout(0.2)
+        env = dict(os.environ, NOTIFY_SOCKET="@" + name)
+        msgs = []
+        with FakeBNO055() as fake:
+            p = self.start([self.exe, "--port", fake.port, "--out", self.tmp / "out", "--stats", "1",
+                            "--name", NAME, "--seconds", "5", "--no-session-dir"], "imu-uart", env=env)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                try:
+                    msgs.append(sock.recv(4096).decode())
+                except socket.timeout:
+                    if p.poll() is not None:
+                        break
+            rc = p.wait(10)
+        self.assertEqual(rc, 0, self.diag(p))
+        lines = [ln for m in msgs for ln in m.split("\n")]
+        self.assertIn("READY=1", lines, msgs)
+        self.assertIn("WATCHDOG=1", lines, msgs)
+        self.assertIn("STOPPING=1", lines, msgs)
+        first = {k: next(i for i, ln in enumerate(lines) if ln == k) for k in ("READY=1", "WATCHDOG=1", "STOPPING=1")}
+        self.assertLess(first["READY=1"], first["WATCHDOG=1"])
+        lifecycle = [ln for ln in lines if ln in ("READY=1", "WATCHDOG=1", "STOPPING=1")]
+        self.assertEqual(lifecycle[-1], "STOPPING=1")
+        self.assertEqual(lifecycle.count("READY=1"), 1)
+        self.assertTrue(any(ln.startswith("STATUS=recording") for ln in lines), msgs)
 
 
 class TestUartResetIntoConfigMode(UartBase):

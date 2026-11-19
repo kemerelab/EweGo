@@ -14,7 +14,8 @@ acceleration, gravity, temperature, calibration status) on a steady
 100 Hz timer, the BNO055's fusion output rate. The Python logger did nine
 separate reads per sample at 50 Hz. A BNO055 "buffer overrun" answer
 (error 0x07, the sensor was mid-update) is retried once within the same
-tick; any other failure marks the sample with flag bit 0 and leaves its
+tick (a retry that succeeds is no error, but counts in `overruns_retried`
+in the summary and the live JSON); any other failure marks the sample with flag bit 0 and leaves its
 sensor columns empty, so the row count still follows the clock.
 
 ## Sensor self-check (0.3)
@@ -52,7 +53,8 @@ the host jitter), `seq`, `xfer_us` (UART round trip, about 4.5 ms at
 (the reader fell a whole period behind and resynchronised), interval
 statistics between valid samples, effective rate, largest round trip and
 jitter, ring overruns, `fusion_invalid` / `fusion_stalls` /
-`fusion_reinits`, exit code. `lost`/`gaps` mirror read errors / error runs
+`fusion_reinits`, `overruns_retried` (0x07 answers whose retry worked),
+exit code. `lost`/`gaps` mirror read errors / error runs
 so `Firmware/tools/ewego-check.py` treats both IMUs alike; `flagged` is
 read errors plus zero-quaternion samples.
 
@@ -94,7 +96,8 @@ directory or CSV that cannot be created); 2 lost/flagged samples or ring
 overruns; 3 the device stopped (`--stall`) or went away; 4 the recording
 could not be written.
 
-The live JSON also carries `fusion_invalid`, `fusion_stalls` and `reinits`.
+The live JSON also carries `fusion_invalid`, `fusion_stalls`, `reinits`
+and `overruns_retried`.
 
 ## Live view
 

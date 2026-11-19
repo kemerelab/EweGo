@@ -84,26 +84,31 @@ Legend: `[ ]` open, `[~]` in progress, `[x]` merged.
 
 ## Lane B2: image, systemd, Python loggers (`image/`, `Firmware/audio|fuel_gauge|gps-test`)
 
-- [ ] **R25** `ewego-record.target` enabled at boot behind a boot-partition flag
-  (`ConditionPathExists=/boot/firmware/ewego-record`) so a field reboot
-  resumes recording and bench units stay quiet. Documented in `image/README.md`.
-- [ ] **R26** Low-battery shutdown in `log_fuel_gauge.py`: `systemctl poweroff`
+- [x] **R25** Recording at boot behind a boot-partition flag: a Condition on the
+  target does not stop its `Wants=` members (verified on systemd 259), so the
+  gate is `ewego-autostart.service` (oneshot, `ConditionPathExists=
+  /boot/firmware/ewego-record`, `systemctl start --no-block ewego-record.target`),
+  enabled in the image. Documented in `image/README.md`.
+- [x] **R26** Low-battery shutdown in `log_fuel_gauge.py`: `systemctl poweroff`
   after SOC and voltage are both below thresholds for 30 consecutive samples
   (configurable in `fuel.conf`), logged as a row and to the journal. Bench mode
   flag to disable.
-- [ ] **R27** journald bounded (`/etc/systemd/journald.conf.d/ewego.conf`:
+- [x] **R27** journald bounded (`/etc/systemd/journald.conf.d/ewego.conf`:
   `SystemMaxUse=100M`, rate limits); field confs use `--stats 30`; the fuel
   logger stops printing every reading.
-- [ ] **R28** `ewego-audio.service` runs `arecord` directly (no Python wrapper, no
+- [x] **R28** `ewego-audio.service` runs `arecord` directly (no Python wrapper, no
   250 ms SIGKILL of arecord); ALSA device named by card id, not `default`;
   `ewego-check` understands arecord's `audio-01.wav` rollover at 2 GiB.
-- [ ] **R29** `gps_logger.py`: exit 1 when start fails, exit 3 after N s of
+- [x] **R29** `gps_logger.py`: exit 1 when start fails, exit 3 after N s of
   consecutive read/write errors, flush + periodic fsync of the .ubx, status
   print rate reduced; `TIOCEXCL` on the port. (Full C port is Phase C.)
-- [ ] **R30** `ewego-webtest.service`: `Nice=10`, `CPUWeight=30`,
+- [x] **R30** `ewego-webtest.service`: `Nice=10`, `CPUWeight=30`,
   `OOMScoreAdjust=500`; `StartLimitIntervalSec=0` on audio/fuel/gps units.
-- [ ] **R31** Free-space guard: `ExecStartPre` check on every recorder unit (exit a
-  distinct code, `RestartPreventExitStatus=`), surfaced on the console.
+- [x] **R31** Free-space guard: `ewego-check-space DIR [MIN_MB]` as `ExecCondition=`
+  on the recorder units (an `ExecStartPre` failure is restarted regardless of
+  `RestartPreventExitStatus=`; `ExecCondition` skips the start cleanly), writes
+  `/run/ewego/space.json` for the console. The fuel unit is never gated. The
+  cam/imu units get their `ExecCondition` line when lanes A1/A2 merge.
 
 ## Lane C: tests (`tests/`, `.github/workflows/build-image.yml`)
 
